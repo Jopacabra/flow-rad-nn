@@ -48,7 +48,8 @@ class TrainingConfig:
     # Training
     batch_size: int = 256
     learning_rate: float = 1e-3
-    weight_decay: float = 1e-5
+    weight_decay: float = 1e-4
+    dropout_p: float = 0.1
     n_epochs: int = 200
     patience: int = 20  # Early stopping patience
 
@@ -181,6 +182,7 @@ class RadiationEmulator(nn.Module):
             hidden_dim: int = 256,
             n_layers: int = 5,
             activation: str = "silu",
+            dropout_p: float = 0.1,
     ):
         super().__init__()
 
@@ -204,9 +206,11 @@ class RadiationEmulator(nn.Module):
         # Hidden layers with skip connections
         self.hidden_layers = nn.ModuleList()
         self.hidden_acts = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
         for i in range(n_layers - 1):
             self.hidden_layers.append(nn.Linear(hidden_dim, hidden_dim))
             self.hidden_acts.append(act_fn())
+            self.dropouts.append(nn.Dropout(p=dropout_p))
 
         # Output layer
         self.output_layer = nn.Linear(hidden_dim, 1)
@@ -240,8 +244,8 @@ class RadiationEmulator(nn.Module):
         h = self.input_act(self.input_layer(x))
 
         # Hidden layers with skip connections every 2 layers
-        for i, (layer, act) in enumerate(zip(self.hidden_layers, self.hidden_acts)):
-            h_new = act(layer(h))
+        for i, (layer, act, drop) in enumerate(zip(self.hidden_layers, self.hidden_acts, self.dropouts)):
+            h_new = drop(act(layer(h)))
             if i % 2 == 1:  # Skip connection every 2 layers
                 h_new = h_new + h
             h = h_new
@@ -292,12 +296,17 @@ def compute_loss(
     # ky_symmetry = torch.relu((predictions - predictions_flipped).abs() - tolerance).mean()
 
     # Total loss
-    total_loss = mse + config.lambda_positivity * positivity + config.lambda_ky_symmetry * ky_symmetry
+    total_loss = (
+            mse
+            + config.lambda_positivity * positivity
+            + config.lambda_ky_symmetry * ky_symmetry
+    )
 
     # Return loss components for logging
     components = {
         'mse': mse.item(),
         'positivity': positivity.item(),
+        'ky_symmetry': ky_symmetry.item(),
         'total': total_loss.item(),
     }
 
@@ -406,6 +415,7 @@ def train_model(config: TrainingConfig):
         hidden_dim=config.hidden_dim,
         n_layers=config.n_layers,
         activation=config.activation,
+        dropout_p=config.dropout_p,
     ).to(config.device)
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -460,6 +470,7 @@ def train_model(config: TrainingConfig):
                     'n_layers': config.n_layers,
                     'activation': config.activation,
                     'input_dim': len(dataset.FEATURE_NAMES),
+                    'dropout_p': config.dropout_p,
                 },
                 'epoch': epoch,
                 'val_loss': best_val_loss,
@@ -536,6 +547,7 @@ class RadiationEmulatorInference:
             hidden_dim=model_config['hidden_dim'],
             n_layers=model_config['n_layers'],
             activation=model_config['activation'],
+            dropout_p=model_config.get('dropout_p', 0.0),  # backward compatible
         ).to(device)
 
         self.model.load_state_dict(checkpoint['model_state_dict'])
