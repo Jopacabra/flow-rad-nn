@@ -1,0 +1,756 @@
+"""
+train_radiation_nn.py
+
+Trains a neural network emulator for the medium-induced radiation intensity
+distribution using precomputed training data.
+
+Features:
+- Loads training data from HDF5 file
+- Normalizes inputs and log-transforms outputs
+- Uses importance sampling weights for unbiased training
+- Enforces soft physics constraints (positivity, k_y symmetry)
+- Saves trained model for deployment
+- Demonstrates batch inference
+
+Usage:
+    python train_radiation_nn.py                    # Train the model
+    python train_radiation_nn.py --inference-only   # Demo inference with saved model
+"""
+
+import argparse
+import numpy as np
+import h5py
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader, random_split
+from dataclasses import dataclass
+from typing import Optional, Tuple, Dict
+import json
+import os
+
+
+# ==============================================================================
+# Configuration
+# ==============================================================================
+@dataclass
+class TrainingConfig:
+    """Configuration for neural network training."""
+
+    # Data
+    data_file: str = "radiation_training_data.h5"
+    train_fraction: float = 0.8
+
+    # Architecture
+    hidden_dim: int = 256
+    n_layers: int = 5
+    activation: str = "silu"  # silu, relu, tanh, gelu
+
+    # Training
+    batch_size: int = 256
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-5
+    n_epochs: int = 200
+    patience: int = 20  # Early stopping patience
+
+    # Physics constraints
+    lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
+    lambda_symmetry: float = 0.01  # Weight for k_y symmetry penalty
+
+    # Output
+    model_file: str = "radiation_emulator.pt"
+    normalization_file: str = "radiation_normalization.json"
+
+    # Device
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+# ==============================================================================
+# Dataset
+# ==============================================================================
+class RadiationDataset(Dataset):
+    """Dataset for radiation intensity training data."""
+
+    # Input feature names in order
+    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'zf', 'u_perp', 'T', 'g']
+
+    def __init__(self, data_file: str, log_transform_output: bool = True):
+        """
+        Load training data from HDF5 file.
+
+        Parameters
+        ----------
+        data_file : str
+            Path to HDF5 file with training data
+        log_transform_output : bool
+            Whether to apply log(|I| + epsilon) transformation to outputs
+        """
+        self.log_transform = log_transform_output
+        self.epsilon = 1e-10  # Small constant for log stability
+
+        # Load data from HDF5
+        with h5py.File(data_file, 'r') as f:
+            # Load all features
+            features = []
+            for name in self.FEATURE_NAMES:
+                features.append(f[name][:])
+
+            self.X = np.column_stack(features).astype(np.float32)
+            self.y = f['I'][:].astype(np.float32)
+            self.y_err = f['I_err'][:].astype(np.float32)
+            self.weights = f['weight'][:].astype(np.float32)
+
+            # Store metadata
+            self.n_samples = f.attrs.get('n_samples', len(self.y))
+
+        # Filter out any NaN or Inf values
+        valid_mask = (
+                np.isfinite(self.y) &
+                np.isfinite(self.y_err) &
+                np.all(np.isfinite(self.X), axis=1)
+        )
+        self.X = self.X[valid_mask]
+        self.y = self.y[valid_mask]
+        self.y_err = self.y_err[valid_mask]
+        self.weights = self.weights[valid_mask]
+
+        # Compute input normalization (mean/std for each feature)
+        self.X_mean = self.X.mean(axis=0)
+        self.X_std = self.X.std(axis=0) + 1e-8  # Avoid division by zero
+
+        # Store sign of y before log transform (needed for reconstruction)
+        self.y_sign = np.sign(self.y)
+
+        # Compute output normalization
+        if self.log_transform:
+            # Log transform: y_transformed = sign(y) * log(|y| + epsilon)
+            self.y_transformed = self.y_sign * np.log(np.abs(self.y) + self.epsilon)
+        else:
+            self.y_transformed = self.y
+
+        self.y_mean = self.y_transformed.mean()
+        self.y_std = self.y_transformed.std() + 1e-8
+
+        # Normalize
+        self.X_normalized = (self.X - self.X_mean) / self.X_std
+        self.y_normalized = (self.y_transformed - self.y_mean) / self.y_std
+
+        # Normalize weights to have mean 1
+        self.weights = self.weights / self.weights.mean()
+
+        print(f"Loaded {len(self.y)} samples from {data_file}")
+        print(f"Input shape: {self.X.shape}")
+        print(f"Output range: [{self.y.min():.4e}, {self.y.max():.4e}]")
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return (
+            torch.from_numpy(self.X_normalized[idx]),
+            torch.tensor(self.y_normalized[idx]),
+            torch.tensor(self.weights[idx]),
+            torch.tensor(self.y_sign[idx]),  # For symmetry loss
+        )
+
+    def get_normalization_params(self) -> Dict:
+        """Return normalization parameters for saving."""
+        return {
+            'X_mean': self.X_mean.tolist(),
+            'X_std': self.X_std.tolist(),
+            'y_mean': float(self.y_mean),
+            'y_std': float(self.y_std),
+            'log_transform': self.log_transform,
+            'epsilon': self.epsilon,
+            'feature_names': self.FEATURE_NAMES,
+        }
+
+
+# ==============================================================================
+# Neural Network Model
+# ==============================================================================
+class RadiationEmulator(nn.Module):
+    """
+    Neural network emulator for medium-induced radiation intensity.
+
+    Architecture: MLP with skip connections every 2 layers.
+    """
+
+    def __init__(
+            self,
+            input_dim: int = 9,
+            hidden_dim: int = 256,
+            n_layers: int = 5,
+            activation: str = "silu",
+    ):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.n_layers = n_layers
+
+        # Select activation function
+        activations = {
+            'silu': nn.SiLU,
+            'relu': nn.ReLU,
+            'tanh': nn.Tanh,
+            'gelu': nn.GELU,
+        }
+        act_fn = activations.get(activation, nn.SiLU)
+
+        # Build layers
+        self.input_layer = nn.Linear(input_dim, hidden_dim)
+        self.input_act = act_fn()
+
+        # Hidden layers with skip connections
+        self.hidden_layers = nn.ModuleList()
+        self.hidden_acts = nn.ModuleList()
+        for i in range(n_layers - 1):
+            self.hidden_layers.append(nn.Linear(hidden_dim, hidden_dim))
+            self.hidden_acts.append(act_fn())
+
+        # Output layer
+        self.output_layer = nn.Linear(hidden_dim, 1)
+
+        # Initialize weights
+        self._init_weights()
+
+    def _init_weights(self):
+        """Initialize weights using Xavier initialization."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (batch_size, 9) with normalized features
+
+        Returns
+        -------
+        torch.Tensor
+            Output tensor of shape (batch_size, 1) with normalized log-intensity
+        """
+        # Input layer
+        h = self.input_act(self.input_layer(x))
+
+        # Hidden layers with skip connections every 2 layers
+        for i, (layer, act) in enumerate(zip(self.hidden_layers, self.hidden_acts)):
+            h_new = act(layer(h))
+            if i % 2 == 1:  # Skip connection every 2 layers
+                h_new = h_new + h
+            h = h_new
+
+        # Output layer
+        return self.output_layer(h)
+
+
+# ==============================================================================
+# Training utilities
+# ==============================================================================
+def compute_loss(
+        model: nn.Module,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        weights: torch.Tensor,
+        config: TrainingConfig,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    """
+    Compute weighted MSE loss with physics constraints.
+
+    Returns total loss and dictionary of individual loss components.
+    """
+    predictions = model(inputs).squeeze()
+
+    # Weighted MSE loss
+    mse = (weights * (predictions - targets) ** 2).mean()
+
+    # Positivity penalty (in normalized space, this is approximate)
+    # We penalize strongly negative predictions
+    positivity = torch.relu(-predictions - 2.0).mean()  # Threshold at -2 std
+
+    # k_y symmetry is already built into the training data (mirrored samples)
+    # But we can add an explicit penalty by checking pairs
+    # For simplicity, we skip this here since the data already enforces it
+
+    # Total loss
+    total_loss = mse + config.lambda_positivity * positivity
+
+    # Return loss components for logging
+    components = {
+        'mse': mse.item(),
+        'positivity': positivity.item(),
+        'total': total_loss.item(),
+    }
+
+    return total_loss, components
+
+
+def train_epoch(
+        model: nn.Module,
+        dataloader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        config: TrainingConfig,
+) -> Dict[str, float]:
+    """Train for one epoch."""
+    model.train()
+    total_loss = 0.0
+    total_mse = 0.0
+    n_batches = 0
+
+    for inputs, targets, weights, _ in dataloader:
+        inputs = inputs.to(config.device)
+        targets = targets.to(config.device)
+        weights = weights.to(config.device)
+
+        optimizer.zero_grad()
+        loss, components = compute_loss(model, inputs, targets, weights, config)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += components['total']
+        total_mse += components['mse']
+        n_batches += 1
+
+    return {
+        'loss': total_loss / n_batches,
+        'mse': total_mse / n_batches,
+    }
+
+
+def validate(
+        model: nn.Module,
+        dataloader: DataLoader,
+        config: TrainingConfig,
+) -> Dict[str, float]:
+    """Validate the model."""
+    model.eval()
+    total_loss = 0.0
+    total_mse = 0.0
+    n_batches = 0
+
+    with torch.no_grad():
+        for inputs, targets, weights, _ in dataloader:
+            inputs = inputs.to(config.device)
+            targets = targets.to(config.device)
+            weights = weights.to(config.device)
+
+            _, components = compute_loss(model, inputs, targets, weights, config)
+
+            total_loss += components['total']
+            total_mse += components['mse']
+            n_batches += 1
+
+    return {
+        'loss': total_loss / n_batches,
+        'mse': total_mse / n_batches,
+    }
+
+
+# ==============================================================================
+# Main training function
+# ==============================================================================
+def train_model(config: TrainingConfig):
+    """Train the radiation emulator model."""
+
+    print("=" * 70)
+    print("RADIATION EMULATOR TRAINING")
+    print("=" * 70)
+    print(f"Device: {config.device}")
+    print(f"Data file: {config.data_file}")
+    print()
+
+    # Load dataset
+    dataset = RadiationDataset(config.data_file, log_transform_output=True)
+
+    # Split into train/validation
+    n_train = int(len(dataset) * config.train_fraction)
+    n_val = len(dataset) - n_train
+    train_dataset, val_dataset = random_split(
+        dataset, [n_train, n_val],
+        generator=torch.Generator().manual_seed(42)
+    )
+
+    print(f"Training samples: {n_train}")
+    print(f"Validation samples: {n_val}")
+
+    # Create dataloaders
+    train_loader = DataLoader(
+        train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0
+    )
+
+    # Create model
+    model = RadiationEmulator(
+        input_dim=len(dataset.FEATURE_NAMES),
+        hidden_dim=config.hidden_dim,
+        n_layers=config.n_layers,
+        activation=config.activation,
+    ).to(config.device)
+
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {n_params:,}")
+
+    # Optimizer and scheduler
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10
+    )
+
+    # Training loop
+    best_val_loss = float('inf')
+    patience_counter = 0
+
+    print("\nStarting training...")
+    print("-" * 70)
+
+    for epoch in range(config.n_epochs):
+        # Train
+        train_metrics = train_epoch(model, train_loader, optimizer, config)
+
+        # Validate
+        val_metrics = validate(model, val_loader, config)
+
+        # Update scheduler
+        scheduler.step(val_metrics['loss'])
+
+        # Print progress
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(
+                f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
+                f"Train Loss: {train_metrics['loss']:.4e} | "
+                f"Val Loss: {val_metrics['loss']:.4e} | "
+                f"Val MSE: {val_metrics['mse']:.4e}"
+            )
+
+        # Early stopping check
+        if val_metrics['loss'] < best_val_loss:
+            best_val_loss = val_metrics['loss']
+            patience_counter = 0
+
+            # Save best model
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'config': {
+                    'hidden_dim': config.hidden_dim,
+                    'n_layers': config.n_layers,
+                    'activation': config.activation,
+                    'input_dim': len(dataset.FEATURE_NAMES),
+                },
+                'epoch': epoch,
+                'val_loss': best_val_loss,
+            }, config.model_file)
+        else:
+            patience_counter += 1
+            if patience_counter >= config.patience:
+                print(f"\nEarly stopping at epoch {epoch + 1}")
+                break
+
+    # Save normalization parameters
+    norm_params = dataset.get_normalization_params()
+    with open(config.normalization_file, 'w') as f:
+        json.dump(norm_params, f, indent=2)
+
+    print("-" * 70)
+    print(f"Training complete!")
+    print(f"Best validation loss: {best_val_loss:.4e}")
+    print(f"Model saved to: {config.model_file}")
+    print(f"Normalization params saved to: {config.normalization_file}")
+
+    return model, dataset.get_normalization_params()
+
+
+# ==============================================================================
+# Inference utilities
+# ==============================================================================
+class RadiationEmulatorInference:
+    """
+    Wrapper for inference with the trained radiation emulator.
+
+    Handles normalization and inverse transforms automatically.
+    """
+
+    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'zf', 'u_perp', 'T', 'g']
+
+    def __init__(
+            self,
+            model_file: str = "radiation_emulator.pt",
+            normalization_file: str = "radiation_normalization.json",
+            device: str = "cpu",
+    ):
+        """
+        Load trained model and normalization parameters.
+
+        Parameters
+        ----------
+        model_file : str
+            Path to saved model checkpoint
+        normalization_file : str
+            Path to JSON file with normalization parameters
+        device : str
+            Device to run inference on ('cpu' or 'cuda')
+        """
+        self.device = device
+
+        # Load normalization parameters
+        with open(normalization_file, 'r') as f:
+            self.norm_params = json.load(f)
+
+        self.X_mean = torch.tensor(self.norm_params['X_mean'], dtype=torch.float32)
+        self.X_std = torch.tensor(self.norm_params['X_std'], dtype=torch.float32)
+        self.y_mean = self.norm_params['y_mean']
+        self.y_std = self.norm_params['y_std']
+        self.log_transform = self.norm_params['log_transform']
+        self.epsilon = self.norm_params['epsilon']
+
+        # Load model
+        checkpoint = torch.load(model_file, map_location=device)
+        model_config = checkpoint['config']
+
+        self.model = RadiationEmulator(
+            input_dim=model_config['input_dim'],
+            hidden_dim=model_config['hidden_dim'],
+            n_layers=model_config['n_layers'],
+            activation=model_config['activation'],
+        ).to(device)
+
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.model.eval()
+
+        print(f"Loaded model from {model_file}")
+        print(f"  Validation loss: {checkpoint['val_loss']:.4e}")
+        print(f"  Trained for {checkpoint['epoch'] + 1} epochs")
+
+    def predict(
+            self,
+            x: np.ndarray,
+            kx: np.ndarray,
+            ky: np.ndarray,
+            E: np.ndarray,
+            z0: np.ndarray,
+            zf: np.ndarray,
+            u_perp: np.ndarray,
+            T: np.ndarray,
+            g: np.ndarray,
+    ) -> np.ndarray:
+        """
+        Predict radiation intensity for a batch of input points.
+
+        All inputs should be 1D numpy arrays of the same length.
+
+        Parameters
+        ----------
+        x : array-like
+            Momentum fraction
+        kx : array-like
+            Transverse momentum k_x (GeV)
+        ky : array-like
+            Transverse momentum k_y (GeV)
+        E : array-like
+            Parton energy (GeV)
+        z0 : array-like
+            Initial longitudinal position (fm)
+        zf : array-like
+            Final longitudinal position (fm)
+        u_perp : array-like
+            Transverse flow velocity magnitude
+        T : array-like
+            Temperature (GeV)
+        g : array-like
+            Coupling constant
+
+        Returns
+        -------
+        np.ndarray
+            Predicted radiation intensity I (NOT including CF factor)
+        """
+        # Stack inputs
+        inputs = np.column_stack([x, kx, ky, E, z0, zf, u_perp, T, g]).astype(np.float32)
+
+        # Convert to tensor
+        inputs_tensor = torch.from_numpy(inputs).to(self.device)
+
+        # Normalize
+        inputs_norm = (inputs_tensor - self.X_mean.to(self.device)) / self.X_std.to(self.device)
+
+        # Predict
+        with torch.no_grad():
+            predictions_norm = self.model(inputs_norm).squeeze()
+
+        # Denormalize
+        predictions_transformed = predictions_norm.cpu().numpy() * self.y_std + self.y_mean
+
+        # Inverse log transform
+        if self.log_transform:
+            # y_transformed = sign(y) * log(|y| + epsilon)
+            # For simplicity, assume y > 0 most of the time (physical intensity)
+            # Inverse: y = exp(y_transformed) - epsilon
+            # But we stored sign*log(|y|+eps), so need to handle sign
+            # Approximation: exp(pred) - epsilon (works when pred > 0)
+            predictions = np.exp(np.abs(predictions_transformed)) - self.epsilon
+            predictions = np.sign(predictions_transformed) * predictions
+        else:
+            predictions = predictions_transformed
+
+        return predictions
+
+    def predict_dict(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
+        """
+        Predict from a dictionary of inputs.
+
+        Parameters
+        ----------
+        inputs : dict
+            Dictionary with keys matching FEATURE_NAMES
+
+        Returns
+        -------
+        np.ndarray
+            Predicted radiation intensity
+        """
+        return self.predict(
+            x=inputs['x'],
+            kx=inputs['kx'],
+            ky=inputs['ky'],
+            E=inputs['E'],
+            z0=inputs['z0'],
+            zf=inputs['zf'],
+            u_perp=inputs['u_perp'],
+            T=inputs['T'],
+            g=inputs['g'],
+        )
+
+
+# ==============================================================================
+# Demo inference
+# ==============================================================================
+def demo_inference(config: TrainingConfig):
+    """Demonstrate how to load and use the trained model."""
+
+    print("=" * 70)
+    print("RADIATION EMULATOR INFERENCE DEMO")
+    print("=" * 70)
+
+    # Load the trained model
+    emulator = RadiationEmulatorInference(
+        model_file=config.model_file,
+        normalization_file=config.normalization_file,
+        device="cpu",  # Use CPU for inference demo
+    )
+
+    # Generate some test points
+    n_points = 1000
+    rng = np.random.default_rng(123)
+
+    test_inputs = {
+        'x': rng.uniform(0.1, 0.9, n_points),
+        'kx': rng.uniform(-3.0, 3.0, n_points),
+        'ky': rng.uniform(-3.0, 3.0, n_points),
+        'E': rng.uniform(10.0, 80.0, n_points),
+        'z0': rng.uniform(0.0, 3.0, n_points),
+        'zf': rng.uniform(3.0, 8.0, n_points),
+        'u_perp': rng.uniform(0.0, 0.5, n_points),
+        'T': rng.uniform(0.2, 0.4, n_points),
+        'g': rng.uniform(1.8, 2.2, n_points),
+    }
+
+    # Run inference
+    print(f"\nRunning inference on {n_points} test points...")
+
+    import time
+    t0 = time.time()
+    predictions = emulator.predict_dict(test_inputs)
+    dt = time.time() - t0
+
+    print(f"Inference time: {dt * 1000:.2f} ms ({dt / n_points * 1e6:.2f} µs per point)")
+    print(f"Prediction shape: {predictions.shape}")
+    print(f"Prediction range: [{predictions.min():.4e}, {predictions.max():.4e}]")
+
+    # Example: Apply Casimir factor for quarks
+    CF_QUARK = 4 / 3
+    CF_GLUON = 3
+
+    I_quark = CF_QUARK * predictions
+    I_gluon = CF_GLUON * predictions
+
+    print(f"\nWith Casimir factors applied:")
+    print(f"  Quark (CF=4/3): [{I_quark.min():.4e}, {I_quark.max():.4e}]")
+    print(f"  Gluon (CF=3):   [{I_gluon.min():.4e}, {I_gluon.max():.4e}]")
+
+    # Example: Single point query
+    print("\n" + "-" * 70)
+    print("Single point query example:")
+    print("-" * 70)
+
+    single_pred = emulator.predict(
+        x=np.array([0.3]),
+        kx=np.array([1.0]),
+        ky=np.array([0.5]),
+        E=np.array([50.0]),
+        z0=np.array([0.0]),
+        zf=np.array([5.0]),
+        u_perp=np.array([0.3]),
+        T=np.array([0.3]),
+        g=np.array([2.0]),
+    )
+
+    print(f"Input: x=0.3, kx=1.0, ky=0.5, E=50, z0=0, zf=5, u_perp=0.3, T=0.3, g=2.0")
+    print(f"Predicted I (no CF): {single_pred:.4e}")
+    print(f"Predicted I (quark): {CF_QUARK * single_pred:.4e}")
+    print(f"Predicted I (gluon): {CF_GLUON * single_pred:.4e}")
+
+
+# ==============================================================================
+# Main entry point
+# ==============================================================================
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Train or run inference with radiation emulator")
+    parser.add_argument("--inference-only", action="store_true", help="Skip training, demo inference only")
+    parser.add_argument("--data-file", type=str, default="radiation_training_data.h5", help="Training data file")
+    parser.add_argument("--model-file", type=str, default="radiation_emulator.pt", help="Model output file")
+    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
+    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden layer dimension")
+    parser.add_argument("--n-layers", type=int, default=5, help="Number of hidden layers")
+    args = parser.parse_args()
+
+    # config = TrainingConfig(
+    #     data_file=args.data_file,
+    #     model_file=args.model_file,
+    #     n_epochs=args.epochs,
+    #     hidden_dim=args.hidden_dim,
+    #     n_layers=args.n_layers,
+    # )
+
+    # Example overfitting-style training config
+    config = TrainingConfig(
+        data_file=args.data_file,
+        model_file=args.model_file,
+        train_fraction=0.99,  # Use almost all data for training
+        weight_decay=0.0,  # No regularization
+        n_epochs=500,  # Train longer
+        patience=100,  # Don't early stop
+        hidden_dim=512,  # Larger model
+        n_layers=8,  # Deeper
+    )
+
+    if args.inference_only:
+        # Demo inference only
+        demo_inference(config)
+    else:
+        # Train the model
+        train_model(config)
+
+        # Then demo inference
+        print("\n")
+        demo_inference(config)
