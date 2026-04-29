@@ -43,6 +43,7 @@ class TrainingConfig:
     # Data
     data_file: str = "radiation_training_data.h5"
     train_fraction: float = 0.8
+    log_transform: bool = True
 
     # Architecture
     hidden_dim: int = 256
@@ -396,7 +397,7 @@ def train_model(config: TrainingConfig):
     print()
 
     # Load dataset
-    dataset = RadiationDataset(config.data_file, log_transform_output=True)
+    dataset = RadiationDataset(config.data_file, log_transform_output=config.log_transform)
 
     # Split into train/validation
     n_train = int(len(dataset) * config.train_fraction)
@@ -907,6 +908,7 @@ if __name__ == "__main__":
     parser.add_argument("--inference-only", action="store_true", help="Skip training, demo inference only")
     parser.add_argument("--data-file", type=str, default="radiation_training_data.h5", help="Training data file")
     parser.add_argument("--model-file", type=str, default="radiation_emulator.pt", help="Model output file")
+    parser.add_argument("--log", type=bool, default=True, help="Whether to log transform data")
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden layer dimension")
     parser.add_argument("--n-layers", type=int, default=5, help="Number of hidden layers")
@@ -922,6 +924,7 @@ if __name__ == "__main__":
         n_layers=args.n_layers,
         learning_rate=args.learning_rate,
         run_lr_finder=args.find_lr,
+        log_transform=args.log,
     )
 
     # # Example overfitting-style training config
