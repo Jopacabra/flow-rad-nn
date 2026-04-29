@@ -245,10 +245,11 @@ class RadiationEmulator(nn.Module):
 
         # Hidden layers with skip connections every 2 layers
         for i, (layer, act, drop) in enumerate(zip(self.hidden_layers, self.hidden_acts, self.dropouts)):
-            h_new = drop(act(layer(h)))
-            if i % 2 == 1:  # Skip connection every 2 layers
-                h_new = h_new + h
-            h = h_new
+            if i % 2 == 0:
+                h_block_in = h  # Save block input at the start of each 2-layer block
+            h = drop(act(layer(h)))
+            if i % 2 == 1:  # End of block: add saved block input
+                h = h + h_block_in
 
         # Output layer
         return self.output_layer(h)
