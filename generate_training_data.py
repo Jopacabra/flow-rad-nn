@@ -469,6 +469,98 @@ class TrainingDataGenerator:
         self.all_errors = []
         self.all_weights = []
 
+        # Track starting round for resumption
+        self.starting_round = 0
+
+    def load_checkpoint(self, filename: str) -> int:
+        """
+        Load previously computed data from an HDF5 checkpoint file.
+
+        Parameters
+        ----------
+        filename : str
+            Path to the checkpoint HDF5 file
+
+        Returns
+        -------
+        int
+            The round number extracted from filename (for resumption),
+            or 0 if not determinable
+        """
+        print("=" * 70)
+        print(f"Loading checkpoint: {filename}")
+        print("=" * 70)
+
+        with h5py.File(filename, 'r') as f:
+            # Load all features - note: file contains mirrored ky data
+            x = f['x'][:]
+            kx = f['kx'][:]
+            ky = f['ky'][:]
+            E = f['E'][:]
+            z0 = f['z0'][:]
+            zf = f['zf'][:]
+            u_perp = f['u_perp'][:]
+            T = f['T'][:]
+            g = f['g'][:]
+
+            I = f['I'][:]
+            I_err = f['I_err'][:]
+            weights = f['weight'][:]
+
+            n_total = len(I)
+            n_original = f.attrs.get('n_original', n_total // 2)
+
+        # Only keep the original points (not the mirrored ky ones)
+        # The mirrored points are the second half of the array
+        x = x[:n_original]
+        kx = kx[:n_original]
+        ky = ky[:n_original]
+        E = E[:n_original]
+        z0 = z0[:n_original]
+        zf = zf[:n_original]
+        u_perp = u_perp[:n_original]
+        T = T[:n_original]
+        g = g[:n_original]
+        I = I[:n_original]
+        I_err = I_err[:n_original]
+        weights = weights[:n_original]
+
+        # Stack into points array
+        points = np.column_stack([x, kx, ky, E, z0, zf, u_perp, T, g])
+
+        # Filter out any NaN values
+        valid = np.isfinite(I) & np.isfinite(I_err)
+        points = points[valid]
+        I = I[valid]
+        I_err = I_err[valid]
+        weights = weights[valid]
+
+        # Store in our lists
+        for i in range(len(I)):
+            self.all_points.append(points[i])
+            self.all_values.append(I[i])
+            self.all_errors.append(I_err[i])
+            self.all_weights.append(weights[i])
+
+        # Add to importance sampler
+        self.sampler.add_samples(points, I, I_err)
+
+        print(f"  Loaded {len(I)} original samples (excluding mirrored ky)")
+        print(f"  Value range: [{I.min():.4e}, {I.max():.4e}]")
+        print(f"  Mean error: {I_err.mean():.4e}")
+
+        # Try to extract round number from filename
+        # Expected format: radiation_training_data_checkpoint_r96.h5
+        import re
+        match = re.search(r'_r(\d+)\.h5$', filename)
+        if match:
+            round_num = int(match.group(1))
+            print(f"  Detected round number: {round_num}")
+            return round_num
+        else:
+            print(f"  Could not detect round number from filename")
+            return 0
+
     def compute_batch(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """Compute intensity values for a batch of parameter points."""
         n = len(points)
@@ -647,8 +739,16 @@ class TrainingDataGenerator:
 
         print(f"  Saved {len(points_full)} samples to {filename}")
 
-    def run(self):
-        """Run the full data generation pipeline."""
+    def run(self, resume_from: Optional[str] = None):
+        """
+        Run the full data generation pipeline.
+
+        Parameters
+        ----------
+        resume_from : str, optional
+            Path to checkpoint file to resume from. If provided, skips
+            initial round and continues from the detected round number.
+        """
         print("\n" + "=" * 70)
         print("TRAINING DATA GENERATION FOR RADIATION PINN")
         print("=" * 70)
@@ -662,11 +762,17 @@ class TrainingDataGenerator:
         print(f"  Note: CF factor NOT included in output")
         print()
 
-        # Initial round
-        self.run_initial_round()
+        # Determine starting point
+        if resume_from is not None:
+            self.starting_round = self.load_checkpoint(resume_from)
+            print(f"\nResuming from round {self.starting_round + 1}")
+        else:
+            # Initial round
+            self.run_initial_round()
+            self.starting_round = 0
 
         # Adaptive rounds
-        for r in range(1, self.config.n_rounds + 1):
+        for r in range(self.starting_round + 1, self.config.n_rounds + 1):
             self.run_adaptive_round(r)
 
             # Checkpoint
@@ -688,6 +794,13 @@ class TrainingDataGenerator:
 # Main entry point
 # ==============================================================================
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Generate training data for radiation PINN")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint file to resume from")
+    args = parser.parse_args()
+
     # Configure the generation
     config = SamplingConfig(
         # Kinematic parameter ranges
@@ -712,7 +825,7 @@ if __name__ == "__main__":
         # Sampling
         n_initial=500,  # Start smaller for testing; increase for production
         n_per_round=200,
-        n_rounds=250,
+        n_rounds=500,  # Increase for more data
 
         # Importance weights
         weight_uncertainty=0.4,
@@ -726,4 +839,4 @@ if __name__ == "__main__":
 
     # Run generation
     generator = TrainingDataGenerator(config)
-    generator.run()
+    generator.run(resume_from=args.resume)
