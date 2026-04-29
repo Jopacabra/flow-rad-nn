@@ -36,8 +36,6 @@ import os
 class TrainingConfig:
     """
     Configuration for neural network training.
-
-    Note that the real defaults for some parameters are set via command line argument defaults...
     """
 
     # Data
@@ -904,15 +902,16 @@ def demo_inference(config: TrainingConfig):
 # Main entry point
 # ==============================================================================
 if __name__ == "__main__":
+    default_config = TrainingConfig()  # Load default values from class description
     parser = argparse.ArgumentParser(description="Train or run inference with radiation emulator")
     parser.add_argument("--inference-only", action="store_true", help="Skip training, demo inference only")
-    parser.add_argument("--data-file", type=str, default="radiation_training_data.h5", help="Training data file")
-    parser.add_argument("--model-file", type=str, default="radiation_emulator.pt", help="Model output file")
-    parser.add_argument("--log", type=bool, default=True, help="Whether to log transform data")
-    parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
-    parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden layer dimension")
-    parser.add_argument("--n-layers", type=int, default=5, help="Number of hidden layers")
-    parser.add_argument("--learning-rate", type=float, default=1e-3, help="Initial learning rate")
+    parser.add_argument("--data-file", type=str, default=default_config.data_file, help="Training data file")
+    parser.add_argument("--model-file", type=str, default=default_config.model_file, help="Model output file")
+    parser.add_argument("--log", type=bool, default=default_config.log_transform, help="Whether to log transform data")
+    parser.add_argument("--epochs", type=int, default=default_config.n_epochs, help="Number of training epochs")
+    parser.add_argument("--hidden-dim", type=int, default=default_config.hidden_dim, help="Hidden layer dimension")
+    parser.add_argument("--n-layers", type=int, default=default_config.n_layers, help="Number of hidden layers")
+    parser.add_argument("--learning-rate", type=float, default=default_config.learning_rate, help="Initial learning rate")
     parser.add_argument("--find-lr", action="store_true", help="Run LR range test and exit")
     args = parser.parse_args()
 
