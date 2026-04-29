@@ -422,14 +422,20 @@ def train_model(config: TrainingConfig):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
-    # Optimizer and scheduler
+    # Optimizer -- applies various strategies that change the way we use our neurons
+    # Controls usage of dropout and L2 regularization to encourage generalization instead of memorization
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=config.learning_rate,
         weight_decay=config.weight_decay,
     )
+
+    # Scheduler -- controls the variation of learning rate over training epochs
+    # ReduceLROnPlateau reduces learning rate when validation loss plateaus, helps prevent oscillation over local minima
+    #
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10
+        optimizer, mode='min', factor=0.5, patience=10,  # verbose deprecated -- prints LR later on
+        min_lr=1e-6,  # Minimum learning rate, so we don't go to negligibly small values and stagnate learning
     )
 
     # Training loop
@@ -451,11 +457,13 @@ def train_model(config: TrainingConfig):
 
         # Print progress
         if (epoch + 1) % 10 == 0 or epoch == 0:
+            current_lr = optimizer.param_groups[0]['lr']
             print(
                 f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
                 f"Train Loss: {train_metrics['loss']:.4e} | "
                 f"Val Loss: {val_metrics['loss']:.4e} | "
-                f"Val MSE: {val_metrics['mse']:.4e}"
+                f"Val MSE: {val_metrics['mse']:.4e} | "
+                f"LR: {current_lr:.2e}"
             )
 
         # Early stopping check
