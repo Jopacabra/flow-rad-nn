@@ -54,7 +54,7 @@ class TrainingConfig:
 
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
-    lambda_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
+    lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
 
     # Output
     model_file: str = "radiation_emulator.pt"
