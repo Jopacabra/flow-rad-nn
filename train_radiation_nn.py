@@ -737,25 +737,25 @@ if __name__ == "__main__":
     parser.add_argument("--n-layers", type=int, default=5, help="Number of hidden layers")
     args = parser.parse_args()
 
-    # config = TrainingConfig(
-    #     data_file=args.data_file,
-    #     model_file=args.model_file,
-    #     n_epochs=args.epochs,
-    #     hidden_dim=args.hidden_dim,
-    #     n_layers=args.n_layers,
-    # )
-
-    # Example overfitting-style training config
     config = TrainingConfig(
         data_file=args.data_file,
         model_file=args.model_file,
-        train_fraction=0.99,  # Use almost all data for training
-        weight_decay=0.0,  # No regularization
-        n_epochs=500,  # Train longer
-        patience=100,  # Don't early stop
-        hidden_dim=512,  # Larger model
-        n_layers=8,  # Deeper
+        n_epochs=args.epochs,
+        hidden_dim=args.hidden_dim,
+        n_layers=args.n_layers,
     )
+
+    # # Example overfitting-style training config
+    # config = TrainingConfig(
+    #     data_file=args.data_file,
+    #     model_file=args.model_file,
+    #     train_fraction=0.99,  # Use almost all data for training
+    #     weight_decay=0.0,  # No regularization
+    #     n_epochs=500,  # Train longer
+    #     patience=500,  # Don't early stop
+    #     hidden_dim=512,  # Larger model
+    #     n_layers=8,  # Deeper
+    # )
 
     if args.inference_only:
         # Demo inference only
