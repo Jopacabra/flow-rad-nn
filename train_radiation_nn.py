@@ -54,7 +54,7 @@ class TrainingConfig:
 
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
-    lambda_symmetry: float = 0.01  # Weight for k_y symmetry penalty
+    lambda_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
 
     # Output
     model_file: str = "radiation_emulator.pt"
@@ -275,11 +275,24 @@ def compute_loss(
     positivity = torch.relu(-predictions - 2.0).mean()  # Threshold at -2 std
 
     # k_y symmetry is already built into the training data (mirrored samples)
-    # But we can add an explicit penalty by checking pairs
-    # For simplicity, we skip this here since the data already enforces it
+    # k_y symmetry penalty: I(kx, ky) should equal I(kx, -ky)
+    # Create inputs with flipped k_y (index 2 in feature list)
+    inputs_ky_flipped = inputs.clone()
+    inputs_ky_flipped[:, 2] = -inputs_ky_flipped[:, 2]  # ky -> -ky
+
+    # Get predictions for flipped inputs
+    predictions_flipped = model(inputs_ky_flipped).squeeze()
+
+    # Penalize the squared difference
+    # Option A: Hard constraint (MSE-style)
+    ky_symmetry = ((predictions - predictions_flipped) ** 2).mean()
+
+    # Option B: Soft constraint with tolerance (only penalize large violations)
+    # tolerance = 0.1  # Allow small differences
+    # ky_symmetry = torch.relu((predictions - predictions_flipped).abs() - tolerance).mean()
 
     # Total loss
-    total_loss = mse + config.lambda_positivity * positivity
+    total_loss = mse + config.lambda_positivity * positivity + config.lambda_ky_symmetry * ky_symmetry
 
     # Return loss components for logging
     components = {
