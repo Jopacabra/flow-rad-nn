@@ -34,7 +34,11 @@ import os
 # ==============================================================================
 @dataclass
 class TrainingConfig:
-    """Configuration for neural network training."""
+    """
+    Configuration for neural network training.
+
+    Note that the real defaults for some parameters are set via command line argument defaults...
+    """
 
     # Data
     data_file: str = "radiation_training_data.h5"
@@ -63,6 +67,9 @@ class TrainingConfig:
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # Utilities
+    run_lr_finder: bool = False
 
 
 # ==============================================================================
@@ -430,6 +437,16 @@ def train_model(config: TrainingConfig):
         weight_decay=config.weight_decay,
     )
 
+    # LR finder -- to be run before the main training loop, finds optimal learning rate
+    # Looks for minima in the loss as function of learning rate, returns rate just before minima in loss function
+    if config.run_lr_finder:
+        print("\nRunning LR range test...")
+        print("-" * 70)
+        lrs, losses = find_learning_rate(model, train_loader, optimizer, config)
+        suggested_lr = plot_lr_finder(lrs, losses)
+        print(f"\nRe-run with --learning-rate {suggested_lr / 3:.2e} (1/3 of suggested)")
+        return model, dataset.get_normalization_params()
+
     # Scheduler -- controls the variation of learning rate over training epochs
     # ReduceLROnPlateau reduces learning rate when validation loss plateaus, helps prevent oscillation over local minima
     #
@@ -665,6 +682,143 @@ class RadiationEmulatorInference:
             g=inputs['g'],
         )
 
+# ==============================================================================
+# Optimization tools
+# ==============================================================================
+def find_learning_rate(
+        model: nn.Module,
+        dataloader: DataLoader,
+        optimizer: torch.optim.Optimizer,
+        config: TrainingConfig,
+        start_lr: float = 1e-5,
+        end_lr: float = 3e-2,
+        n_steps: int = 20,
+        smoothing: float = 0.3,
+) -> Tuple[list, list]:
+    """
+    Learning rate range test (Smith 2015).
+
+    Sweeps LR exponentially from start_lr to end_lr over n_steps batches,
+    recording the smoothed loss at each step.
+
+    Returns
+    -------
+    lrs : list of float
+        Learning rates tested
+    losses : list of float
+        Smoothed loss at each learning rate
+    """
+    # Save original model and optimizer state so we can restore after the test
+    import copy
+    original_model_state = copy.deepcopy(model.state_dict())
+    original_optimizer_state = copy.deepcopy(optimizer.state_dict())
+
+    # Set starting LR
+    for pg in optimizer.param_groups:
+        pg['lr'] = start_lr
+
+    lr_multiplier = (end_lr / start_lr) ** (1.0 / n_steps)
+
+    lrs = []
+    losses = []
+    smoothed_loss = None
+    best_loss = float('inf')
+
+    model.train()
+    data_iter = iter(dataloader)
+
+    for step in range(n_steps):
+        # Get next batch, cycling through dataloader if needed
+        try:
+            inputs, targets, weights, _ = next(data_iter)
+        except StopIteration:
+            data_iter = iter(dataloader)
+            inputs, targets, weights, _ = next(data_iter)
+
+        inputs = inputs.to(config.device)
+        targets = targets.to(config.device)
+        weights = weights.to(config.device)
+
+        optimizer.zero_grad()
+        loss, components = compute_loss(model, inputs, targets, weights, config)
+        loss.backward()
+        optimizer.step()
+
+        raw_loss = components['mse']
+
+        # Exponential smoothing to reduce noise
+        if smoothed_loss is None:
+            smoothed_loss = raw_loss
+        else:
+            smoothed_loss = smoothing * raw_loss + (1.0 - smoothing) * smoothed_loss
+
+        current_lr = optimizer.param_groups[0]['lr']
+        lrs.append(current_lr)
+        losses.append(smoothed_loss)
+
+        # Stop early if loss has exploded (5x best seen so far)
+        if smoothed_loss < best_loss:
+            best_loss = smoothed_loss
+        if smoothed_loss > 5.0 * best_loss:
+            print(f"  Loss diverged at LR={current_lr:.2e}, stopping early.")
+            break
+
+        # Increase LR for next step
+        for pg in optimizer.param_groups:
+            pg['lr'] *= lr_multiplier
+
+    # Restore model and optimizer to pre-test state
+    model.load_state_dict(original_model_state)
+    optimizer.load_state_dict(original_optimizer_state)
+
+    return lrs, losses
+
+
+def plot_lr_finder(lrs: list, losses: list):
+    """Plot the LR finder curve and print the suggested learning rate."""
+    import matplotlib.pyplot as plt
+    import numpy as np
+
+    lrs = np.array(lrs)
+    losses = np.array(losses)
+
+    # Only consider the region before the loss minimum (descending slope)
+    min_loss_idx = np.argmin(losses)
+    lrs_descending = lrs[:min_loss_idx + 1]
+    losses_descending = losses[:min_loss_idx + 1]
+
+    # Suggest the LR at the point of steepest negative gradient on the descending slope
+    if len(lrs_descending) > 1:
+        gradients = np.gradient(losses_descending, np.log10(lrs_descending))
+        suggested_idx = np.argmin(gradients)
+        suggested_lr = lrs_descending[suggested_idx]
+    else:
+        # Fallback: use the LR just before the minimum
+        suggested_idx = max(0, min_loss_idx - 1)
+        suggested_lr = lrs[suggested_idx]
+
+    print(f"\nLR Finder Results:")
+    print(f"  Suggested LR (steepest descent): {suggested_lr:.2e}")
+    print(f"  Loss at suggested LR:            {losses[suggested_idx]:.4e}")
+    print(f"  (Consider using ~1/3 to 1/10 of this as your starting LR)")
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(lrs, losses, linewidth=2)
+    ax.axvline(suggested_lr, color='red', linestyle='--',
+               label=f'Suggested LR: {suggested_lr:.2e}')
+    ax.set_xscale('log')
+    ax.set_xlabel('Learning Rate (log scale)')
+    ax.set_ylabel('Smoothed Loss')
+    ax.set_title('Learning Rate Range Test')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig('lr_finder.png', dpi=150)
+    print(f"  Plot saved to lr_finder.png")
+    plt.show()
+
+    return suggested_lr
+
 
 # ==============================================================================
 # Demo inference
@@ -756,6 +910,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=200, help="Number of training epochs")
     parser.add_argument("--hidden-dim", type=int, default=256, help="Hidden layer dimension")
     parser.add_argument("--n-layers", type=int, default=5, help="Number of hidden layers")
+    parser.add_argument("--learning-rate", type=float, default=1e-3, help="Initial learning rate")
+    parser.add_argument("--find-lr", action="store_true", help="Run LR range test and exit")
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -764,6 +920,8 @@ if __name__ == "__main__":
         n_epochs=args.epochs,
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
+        learning_rate=args.learning_rate,
+        run_lr_finder=args.find_lr,
     )
 
     # # Example overfitting-style training config
