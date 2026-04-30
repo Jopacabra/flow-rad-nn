@@ -55,8 +55,8 @@ class SamplingConfig:
     kx_range: Tuple[float, float] = (-5.0, 5.0)
     ky_range: Tuple[float, float] = (0.0, 5.0)  # Only ky >= 0 due to symmetry
     E_range: Tuple[float, float] = (5.0, 100.0)
-    z0_range: Tuple[float, float] = (0.0, 2.0)
-    zf_range: Tuple[float, float] = (2.0, 10.0)
+    z0_range: Tuple[float, float] = (0.0, 10.0)
+    zf_range: Tuple[float, float] = (0.0, 10.0)
     u_perp_range: Tuple[float, float] = (0.0, 0.7)
 
     # Medium parameters (now sampled)
