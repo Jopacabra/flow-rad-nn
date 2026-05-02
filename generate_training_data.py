@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, List
 import time
 import sys
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import vegas
 import h5py
@@ -233,6 +234,17 @@ def integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf, config: SamplingConfig):
     result = integ(integrand, nitn=config.nitn, neval=config.neval)
 
     return result.mean, result.sdev
+
+
+def _integrate_one(task):
+    """Top-level worker function for parallel integration. Must be module-level for pickling."""
+    idx, x, kx, ky, E, z0, zf, u_perp, T, g, config = task
+    try:
+        mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf, config)
+        return idx, mean, sdev
+    except Exception as e:
+        print(f"  Warning: Integration failed at index {idx}: {e}")
+        return idx, np.nan, np.nan
 
 
 # ==============================================================================
@@ -459,8 +471,9 @@ class ImportanceSampler:
 class TrainingDataGenerator:
     """Main class for generating training data with adaptive importance sampling."""
 
-    def __init__(self, config: SamplingConfig):
+    def __init__(self, config: SamplingConfig, n_workers: int = None):
         self.config = config
+        self.n_workers = n_workers  # None → os.cpu_count()
         self.sampler = ImportanceSampler(config)
 
         # Results storage
@@ -562,28 +575,35 @@ class TrainingDataGenerator:
             return 0
 
     def compute_batch(self, points: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """Compute intensity values for a batch of parameter points."""
+        """Compute intensity values for a batch of parameter points in parallel."""
         n = len(points)
-        values = np.zeros(n)
-        errors = np.zeros(n)
+        values = np.full(n, np.nan)
+        errors = np.full(n, np.nan)
 
-        for i, pt in enumerate(points):
-            x, kx, ky, E, z0, zf, u_perp, T, g = pt
+        tasks = [
+            (i, *points[i], self.config)  # (idx, x, kx, ky, E, z0, zf, u_perp, T, g, config)
+            for i in range(n)
+        ]
 
-            try:
-                mean, sdev = integrate_point(
-                    x, kx, ky, E, T, g, u_perp, z0, zf, self.config
-                )
-                values[i] = mean
-                errors[i] = sdev
-            except Exception as e:
-                print(f"  Warning: Integration failed at point {i}: {e}")
-                values[i] = np.nan
-                errors[i] = np.nan
+        print(f"  Computing {n} points on {self.n_workers or 'all available'} workers...")
+        t0 = time.time()
+        completed = 0
 
-            if (i + 1) % 50 == 0:
-                print(f"    Computed {i + 1}/{n} points...")
+        with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
+            futures = {pool.submit(_integrate_one, task): task for task in tasks}
+            for future in as_completed(futures):
+                idx, mean, sdev = future.result()
+                values[idx] = mean
+                errors[idx] = sdev
+                completed += 1
+                if completed % max(1, n // 10) == 0:
+                    elapsed = time.time() - t0
+                    eta = elapsed / completed * (n - completed)
+                    print(f"    {completed}/{n} done "
+                          f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
 
+        dt = time.time() - t0
+        print(f"  Batch complete in {dt:.1f}s ({dt / n:.2f}s per point)")
         return values, errors
 
     def run_initial_round(self):
@@ -813,7 +833,7 @@ if __name__ == "__main__":
         u_perp_range=(0.0, 0.9),
 
         # Medium parameter ranges
-        T_range=(0.150, 0.650),  # Temperature in GeV
+        T_range=(0.150, 0.650),  # Temperature range in GeV
         g_range=(1.5, 2.5),  # Coupling g = sqrt(4*pi*alpha_s)
 
         # Integration
@@ -824,8 +844,8 @@ if __name__ == "__main__":
 
         # Sampling
         n_initial=500,  # Start smaller for testing; increase for production
-        n_per_round=200,
-        n_rounds=500,  # Increase for more data
+        n_per_round=800,
+        n_rounds=2500,  # Increase for more data
 
         # Importance weights
         weight_uncertainty=0.4,
@@ -838,5 +858,5 @@ if __name__ == "__main__":
     )
 
     # Run generation
-    generator = TrainingDataGenerator(config)
+    generator = TrainingDataGenerator(config, n_workers=8)  # control number of workers here.
     generator.run(resume_from=args.resume)
