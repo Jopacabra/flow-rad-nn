@@ -74,11 +74,12 @@ class SamplingConfig:
     n_initial: int = 1000  # Initial LHS samples
     n_per_round: int = 500  # Samples per adaptive round
     n_rounds: int = 10  # Number of adaptive rounds
+    sobol_fraction: float = 0.2  # Fraction of each adaptive round drawn from Sobol
 
     # Importance sampling weights
-    weight_uncertainty: float = 0.4  # Weight for high MC uncertainty regions
-    weight_gradient: float = 0.3  # Weight for high gradient regions
-    weight_coverage: float = 0.3  # Weight for undersampled regions
+    weight_uncertainty: float = 0.1  # Weight for high MC uncertainty regions
+    weight_gradient: float = 0.4  # Weight for high gradient regions
+    weight_coverage: float = 0.5  # Weight for undersampled regions
 
     # Output
     output_file: str = "radiation_training_data.h5"
@@ -292,6 +293,19 @@ def generate_lhs_samples(n_samples: int, config: SamplingConfig) -> np.ndarray:
     return samples
 
 
+def generate_sobol_samples(n_samples: int, config: SamplingConfig,
+                            sobol_sampler: qmc.Sobol) -> np.ndarray:
+    """
+    Draw the next n_samples points from a persistent Sobol sequence.
+    Caller is responsible for maintaining the sampler state across rounds
+    so that points are never repeated.
+    """
+    ranges = get_ranges(config)
+    samples_unit = sobol_sampler.random(n=n_samples)
+    samples = denormalize_from_unit_cube(samples_unit, ranges)
+    return samples
+
+
 class ImportanceSampler:
     """
     Adaptive importance sampler that emphasizes regions based on:
@@ -426,7 +440,7 @@ class ImportanceSampler:
 
         return w_coverage
 
-    def generate_importance_samples(self, n_samples: int) -> np.ndarray:
+    def generate_importance_samples(self, n_samples: int, round_num: int = 1) -> np.ndarray:
         """
         Generate new samples using importance sampling.
         Samples are drawn near existing high-weight points with added noise.
@@ -443,8 +457,8 @@ class ImportanceSampler:
         # Generate new points by adding noise around selected points
         base_points = np.array([self.points[i] for i in indices])
 
-        # Noise scale: fraction of parameter range, decreasing with round
-        noise_scale = 0.1  # 10% of range
+        # Noise scale decreases with round: broad early, refined later
+        noise_scale = max(0.02, 0.15 * np.exp(-round_num / 50))
         ranges = np.array(self.ranges)
         range_widths = ranges[:, 1] - ranges[:, 0]
 
@@ -475,6 +489,13 @@ class TrainingDataGenerator:
         self.config = config
         self.n_workers = n_workers  # None → os.cpu_count()
         self.sampler = ImportanceSampler(config)
+
+        # Persistent Sobol sampler — advances across all rounds so points are never repeated.
+        # Seeded differently from the initial LHS sampler (seed=42) to avoid overlap.
+        self._sobol_sampler = qmc.Sobol(d=len(get_ranges(config)), seed=99)
+        # Fast-forward past the initial round's worth of points so the sequence
+        # never overlaps with generate_lhs_samples (which also uses Sobol, seed=42).
+        # (Different seeds already guarantee no overlap, but this is explicit.)
 
         # Results storage
         self.all_points = []
@@ -649,14 +670,34 @@ class TrainingDataGenerator:
         print(f"Round {round_num}: Adaptive Importance Sampling")
         print("=" * 70)
 
-        # Generate new samples using importance sampling
-        points = self.sampler.generate_importance_samples(self.config.n_per_round)
+        n_total = self.config.n_per_round
+        n_sobol = max(0, int(round(n_total * self.config.sobol_fraction)))
+        n_adaptive = n_total - n_sobol
 
-        print(f"  Computing {len(points)} adaptive samples...")
+        # --- Importance-sampled points ---
+        adaptive_points = self.sampler.generate_importance_samples(n_adaptive)
+
+        # --- Sobol exploration points ---
+        if n_sobol > 0:
+            sobol_points = generate_sobol_samples(n_sobol, self.config, self._sobol_sampler)
+            # Enforce z0 < zf on Sobol points
+            z0_idx, zf_idx = 4, 5
+            mask = sobol_points[:, z0_idx] >= sobol_points[:, zf_idx]
+            if mask.any():
+                sobol_points[mask, z0_idx], sobol_points[mask, zf_idx] = (
+                    sobol_points[mask, zf_idx].copy(),
+                    sobol_points[mask, z0_idx].copy(),
+                )
+            points = np.vstack([adaptive_points, sobol_points])
+            print(f"  Split: {n_adaptive} importance-sampled + {n_sobol} Sobol exploration")
+        else:
+            points = adaptive_points
+
+        print(f"  Computing {len(points)} samples...")
         t0 = time.time()
         values, errors = self.compute_batch(points)
         dt = time.time() - t0
-        print(f"  Done in {dt:.1f}s ({dt/len(points):.2f}s per point)")
+        print(f"  Done in {dt:.1f}s ({dt / len(points):.2f}s per point)")
 
         # Filter out failed integrations
         valid = ~np.isnan(values)
@@ -664,19 +705,24 @@ class TrainingDataGenerator:
         values = values[valid]
         errors = errors[valid]
 
-        # Compute importance weights for these new samples
-        # (inverse of sampling probability for unbiased training)
+        # Compute importance weights for these new samples.
+        # Sobol points are treated as uniform draws → weight = 1.
+        # Importance-sampled points get inverse-probability weights.
         if len(self.sampler.points) > 10:
             sampling_weights = self.sampler.compute_importance_weights()
-            # Find which existing points these were sampled near
-            # For simplicity, use uniform weights adjusted by local density
             points_norm = normalize_to_unit_cube(points, self.sampler.ranges)
             _, indices = self.sampler.tree.query(points_norm, k=1)
 
-            # Weight = 1 / sampling_probability (capped for stability)
             sample_probs = sampling_weights[indices]
             weights = 1.0 / (sample_probs * len(self.sampler.points) + 1e-10)
             weights = np.clip(weights, 0.1, 10.0)
+
+            # Override weights for the Sobol portion: they were drawn uniformly
+            if n_sobol > 0:
+                # The Sobol points sit at the end of the (post-filter) array.
+                # Recompute how many survived the validity filter.
+                n_adaptive_valid = int(valid[:n_adaptive].sum())
+                weights[n_adaptive_valid:] = 1.0
         else:
             weights = np.ones(len(points))
 
@@ -843,14 +889,15 @@ if __name__ == "__main__":
         neval=10_000,
 
         # Sampling
-        n_initial=500,  # Start smaller for testing; increase for production
+        n_initial=2048,  # Use powers of 2 for optimal sobol sampling
         n_per_round=800,
         n_rounds=2500,  # Increase for more data
+        sobol_fraction=0.2,  # Fraction of each adaptive round drawn from Sobol
 
         # Importance weights
-        weight_uncertainty=0.4,
-        weight_gradient=0.3,
-        weight_coverage=0.3,
+        weight_uncertainty=0.1,  # Weight for high MC uncertainty regions
+        weight_gradient=0.4,  # Weight for high gradient regions
+        weight_coverage=0.5,  # Weight for undersampled regions
 
         # Output
         output_file="radiation_training_data.h5",
