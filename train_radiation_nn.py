@@ -523,7 +523,9 @@ def train_model(config: TrainingConfig):
             f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
             f"Train Loss: {train_metrics['loss']:.4e} | "
             f"Val Loss: {val_metrics['loss']:.4e} | "
+            f"Train MSE: {train_metrics['mse']:.4e} | "
             f"Val MSE: {val_metrics['mse']:.4e} | "
+            f"MSE Ratio: {(train_metrics['mse']/val_metrics['mse']):.4e} | "
             f"LR: {current_lr:.2e}"
         )
 
