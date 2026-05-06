@@ -472,15 +472,15 @@ def train_model(config: TrainingConfig):
         scheduler.step(val_metrics['loss'])
 
         # Print progress
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(
-                f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
-                f"Train Loss: {train_metrics['loss']:.4e} | "
-                f"Val Loss: {val_metrics['loss']:.4e} | "
-                f"Val MSE: {val_metrics['mse']:.4e} | "
-                f"LR: {current_lr:.2e}"
-            )
+        # if (epoch + 1) % 10 == 0 or epoch == 0:
+        current_lr = optimizer.param_groups[0]['lr']
+        print(
+            f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
+            f"Train Loss: {train_metrics['loss']:.4e} | "
+            f"Val Loss: {val_metrics['loss']:.4e} | "
+            f"Val MSE: {val_metrics['mse']:.4e} | "
+            f"LR: {current_lr:.2e}"
+        )
 
         # Early stopping check
         if val_metrics['loss'] < best_val_loss:
