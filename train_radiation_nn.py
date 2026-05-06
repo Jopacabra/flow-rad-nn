@@ -514,7 +514,7 @@ def train_model(config: TrainingConfig):
         val_metrics = validate(model, val_loader, config)
 
         # Update scheduler
-        scheduler.step(val_metrics['loss'])
+        scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
 
         # Print progress
         # if (epoch + 1) % 10 == 0 or epoch == 0:
