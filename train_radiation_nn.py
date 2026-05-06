@@ -275,18 +275,9 @@ def compute_loss(
         targets: torch.Tensor,
         weights: torch.Tensor,
         config: TrainingConfig,
-        norm_kx_mean: float = 0.0,
-        norm_kx_std: float = 1.0,
-        norm_ky_mean: float = 0.0,
-        norm_ky_std: float = 1.0,
-        compute_uv: bool = True,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
-    Compute weighted MSE loss with optional physics constraints.
-
-    norm_k{x,y}_{mean,std} are the dataset-level normalisation constants for
-    the kx (index 1) and ky (index 2) features.  Pass them from the dataset so
-    that physical k values can be recovered inside the UV regularisation term.
+    Compute weighted MSE loss with physics constraints.
 
     Returns total loss and dictionary of individual loss components.
     """
@@ -307,98 +298,15 @@ def compute_loss(
     predictions_flipped = model(inputs_ky_flipped).squeeze(-1)
     ky_symmetry = ((predictions - predictions_flipped) ** 2).mean()
 
-    # ------------------------------------------------------------------
-    # UV regularisation: enforce d(log|f|)/d(log kt^2) = -2 at large kt.
-    #
-    # f ~ kt^{-4} in the UV, so:
-    #   d(log|f|)/d(log kt)   = -4
-    #   d(log|f|)/d(log kt^2) = -2    [since log kt^2 = 2 log kt]
-    #
-    # The model predicts pred = y_std * log|f| + const (after normalisation),
-    # so d(pred)/d(log kt^2) = y_std * (-2), but as we are working in
-    # normalised-output space we keep everything in pred units and target -2.
-    #
-    # The log-slope identity in terms of physical kx, ky is:
-    #   d(log|f|)/d(log kt^2)
-    #     = (kt^2 / 2) * (1/f) * (df/dkt^2)
-    #     = (1/2) * (kx/kt * df/dkx + ky/kt * df/dky) * kt / f
-    #     = (1/2) * (kx * d(log|f|)/dkx + ky * d(log|f|)/dky)
-    #
-    # In practice the model outputs pred ≈ log|f| (up to affine transform),
-    # so d(pred)/dkx ≈ d(log|f|)/dkx, and we can write:
-    #
-    #   log_slope = (1/2) * (kx * d(pred)/dkx + ky * d(pred)/dky)
-    #
-    # Chain rule through normalisation hat_k = (k - mu) / sigma:
-    #   d(pred)/dk_i = (1/sigma_i) * d(pred)/d(hat_k_i)
-    # ------------------------------------------------------------------
-    uv_loss = torch.zeros(1, device=inputs.device, dtype=inputs.dtype).squeeze()
-    if compute_uv and config.lambda_uv > 0.0:   # Don't bother if it's dialed to zero.
-        # Use dataset-level normalisation constants (passed in as arguments).
-        # Convert to tensors on the correct device.
-        mu_kx = torch.tensor(norm_kx_mean, dtype=inputs.dtype, device=inputs.device)
-        mu_ky = torch.tensor(norm_ky_mean, dtype=inputs.dtype, device=inputs.device)
-        sigma_kx = torch.tensor(norm_kx_std,  dtype=inputs.dtype, device=inputs.device).clamp(min=1e-6)
-        sigma_ky = torch.tensor(norm_ky_std,  dtype=inputs.dtype, device=inputs.device).clamp(min=1e-6)
-
-        # Recover physical kx, ky from the *original* (non-grad) inputs to build the mask.
-        with torch.no_grad():
-            kx_phys_all = inputs[:, 1] * sigma_kx + mu_kx
-            ky_phys_all = inputs[:, 2] * sigma_ky + mu_ky
-            kt_phys_all = torch.sqrt(kx_phys_all ** 2 + ky_phys_all ** 2)
-            uv_mask = kt_phys_all > config.uv_kt_threshold
-
-        n_uv = int(uv_mask.sum().item())
-
-        if n_uv > 0:
-            # Re-run forward pass on UV subset with gradient tracking on the inputs.
-            # Dropout is disabled by temporarily setting training=False only on Dropout
-            # modules, so the gradient graph through model parameters is preserved.
-            inputs_uv = inputs[uv_mask].detach().requires_grad_(True)
-
-            # Disable dropout only (leave everything else in train mode)
-            for m in model.modules():
-                if isinstance(m, nn.Dropout):
-                    m.eval()
-
-            pred_uv = model(inputs_uv).squeeze(-1)
-
-            # d(pred) / d(hat_k),  shape (n_uv, 9)
-            grad_hat = torch.autograd.grad(
-                outputs=pred_uv,
-                inputs=inputs_uv,
-                grad_outputs=torch.ones_like(pred_uv),
-                create_graph=True,
-                retain_graph=True,
-            )[0]
-
-            # Restore dropout to training mode
-            for m in model.modules():
-                if isinstance(m, nn.Dropout):
-                    m.train()
-
-            # d(pred)/d(k_phys_i) = d(pred)/d(hat_k_i) / sigma_i
-            dpred_dkx = grad_hat[:, 1] / sigma_kx
-            dpred_dky = grad_hat[:, 2] / sigma_ky
-
-            # Physical kx, ky, kt recomputed from inputs_uv so the graph is intact.
-            kx_uv = inputs_uv[:, 1] * sigma_kx + mu_kx
-            ky_uv = inputs_uv[:, 2] * sigma_ky + mu_ky
-            kt_uv = torch.sqrt(kx_uv ** 2 + ky_uv ** 2).clamp(min=1e-10)
-
-            # d(log|f|)/d(log kt^2) = (1/2) * (kx * d(pred)/dkx + ky * d(pred)/dky)
-            # Target is -2 (equivalent to f ~ kt^{-4}).
-            log_slope = 0.5 * (kx_uv * dpred_dkx + ky_uv * dpred_dky)
-
-            uv_loss = ((log_slope + 2.0) ** 2).mean()
-
+    # Option B: Soft constraint with tolerance (only penalize large violations)
+    # tolerance = 0.1  # Allow small differences
+    # ky_symmetry = torch.relu((predictions - predictions_flipped).abs() - tolerance).mean()
 
     # Total loss
     total_loss = (
             mse
             + config.lambda_positivity * positivity
             + config.lambda_ky_symmetry * ky_symmetry
-            + config.lambda_uv * uv_loss
     )
 
     # Return loss components for logging
@@ -406,7 +314,6 @@ def compute_loss(
         'mse': mse.item(),
         'positivity': positivity.item(),
         'ky_symmetry': ky_symmetry.item(),
-        'uv': uv_loss.item(),
         'total': total_loss.item(),
     }
 
@@ -418,15 +325,10 @@ def train_epoch(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
-        norm_kx_mean: float = 0.0,
-        norm_kx_std: float = 1.0,
-        norm_ky_mean: float = 0.0,
-        norm_ky_std: float = 1.0,
 ) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
     total_loss = 0.0
-    val_style_loss = 0.0
     total_mse = 0.0
     n_batches = 0
 
@@ -436,22 +338,16 @@ def train_epoch(
         weights = weights.to(config.device)
 
         optimizer.zero_grad()
-        loss, components = compute_loss(
-            model, inputs, targets, weights, config,
-            norm_kx_mean=norm_kx_mean, norm_kx_std=norm_kx_std,
-            norm_ky_mean=norm_ky_mean, norm_ky_std=norm_ky_std,
-        )
+        loss, components = compute_loss(model, inputs, targets, weights, config)
         loss.backward()
         optimizer.step()
 
         total_loss += components['total']
-        val_style_loss += components['mse']  # this is just used for printing -- comparable to loss as done in validate()
         total_mse += components['mse']
         n_batches += 1
 
     return {
         'loss': total_loss / n_batches,
-        'val_style_loss': val_style_loss / n_batches,
         'mse': total_mse / n_batches,
     }
 
@@ -473,10 +369,7 @@ def validate(
             targets = targets.to(config.device)
             weights = weights.to(config.device)
 
-            _, components = compute_loss(
-                model, inputs, targets, weights, config,
-                compute_uv=False,   # ← UV term needs grad, skip during validation
-            )
+            _, components = compute_loss(model, inputs, targets, weights, config)
 
             total_loss += components['total']
             total_mse += components['mse']
@@ -535,14 +428,6 @@ def train_model(config: TrainingConfig):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
-    # Extract normalisation constants for kx (index 1) and ky (index 2) once.
-    # These are fixed for the lifetime of training and are passed into compute_loss
-    # so physical k values can be recovered from the normalised inputs.
-    norm_kx_mean = float(dataset.X_mean[1])
-    norm_kx_std = float(dataset.X_std[1])
-    norm_ky_mean = float(dataset.X_mean[2])
-    norm_ky_std = float(dataset.X_std[2])
-
     # Optimizer -- applies various strategies that change the way we use our neurons
     # Controls usage of dropout and L2 regularization to encourage generalization instead of memorization
     optimizer = torch.optim.AdamW(
@@ -578,12 +463,7 @@ def train_model(config: TrainingConfig):
 
     for epoch in range(config.n_epochs):
         # Train
-        train_metrics = (
-            train_epoch(
-            model, train_loader, optimizer, config,
-            norm_kx_mean=norm_kx_mean, norm_kx_std=norm_kx_std,
-            norm_ky_mean=norm_ky_mean, norm_ky_std=norm_ky_std,
-        ))
+        train_metrics = train_epoch(model, train_loader, optimizer, config)
 
         # Validate
         val_metrics = validate(model, val_loader, config)
@@ -596,7 +476,7 @@ def train_model(config: TrainingConfig):
             current_lr = optimizer.param_groups[0]['lr']
             print(
                 f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
-                f"Train Loss: {train_metrics['val_style_loss']:.4e} | "
+                f"Train Loss: {train_metrics['loss']:.4e} | "
                 f"Val Loss: {val_metrics['loss']:.4e} | "
                 f"Val MSE: {val_metrics['mse']:.4e} | "
                 f"LR: {current_lr:.2e}"
@@ -859,11 +739,7 @@ def find_learning_rate(
         weights = weights.to(config.device)
 
         optimizer.zero_grad()
-        loss, components = compute_loss(
-            model, inputs, targets, weights, config,
-            norm_kx_mean=0, norm_kx_std=0,
-            norm_ky_mean=0, norm_ky_std=0,
-        )
+        loss, components = compute_loss(model, inputs, targets, weights, config)
         loss.backward()
         optimizer.step()
 
