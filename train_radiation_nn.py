@@ -18,6 +18,7 @@ Usage:
 """
 
 import argparse
+import math
 import numpy as np
 import h5py
 import torch
@@ -59,7 +60,7 @@ class TrainingConfig:
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
     lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
-    lambda_uv: float = 0.5  # Weight for UV power-law regularisation
+    lambda_uv: float = 0.1  # Weight for UV power-law regularisation
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
     # A safe default is 4.0 GeV^2 (kt > 2 GeV).
@@ -283,30 +284,73 @@ def compute_loss(
     """
     predictions = model(inputs).squeeze(-1)
 
-    # Weighted MSE loss
+    """
+    Weighted MSE loss
+    """
     mse = (weights * (predictions - targets) ** 2).mean()
 
-    # Positivity penalty (in normalized space, this is approximate)
-    # We penalize strongly negative predictions
+    """
+    Positivity enforcement loss
+     
+    (in normalized space, this is approximate)
+    We don't use this, it's just here as a sample loss term
+    """
     positivity = torch.relu(-predictions - 2.0).mean()  # Threshold at -2 std
 
-    # k_y symmetry is already built into the training data (mirrored samples).
-    # The constraint below can optionally add an extra soft penalty on top.
+    """
+    k_y symmetry enforcement loss 
+    
+    k_y symmetry is already built into the training data (mirrored samples).
+    This is an optional soft loss penalty on top.
+    """
     # Create inputs with flipped k_y (index 2 in feature list)
     inputs_ky_flipped = inputs.clone()
     inputs_ky_flipped[:, 2] = -inputs_ky_flipped[:, 2]  # ky -> -ky
     predictions_flipped = model(inputs_ky_flipped).squeeze(-1)
     ky_symmetry = ((predictions - predictions_flipped) ** 2).mean()
 
-    # Option B: Soft constraint with tolerance (only penalize large violations)
-    # tolerance = 0.1  # Allow small differences
-    # ky_symmetry = torch.relu((predictions - predictions_flipped).abs() - tolerance).mean()
+    """
+    UV decay enforcement loss
+    
+    Enforces f(params, k_x, k_y) -> 0 as k_perp -> inf.
+    """
+    k_perp_max = 1e4  # Maximum k_perp value to consider
+    n_uv_samples = 64  # Number of samples to draw from UV region
+
+    # Get shape and device of inputs
+    B = inputs.shape[0]
+    device = inputs.device
+
+    # Sample k_perp log-uniformly in the UV region
+    log_k = torch.empty(n_uv_samples, device=device).uniform_(
+        math.log(config.uv_kt_threshold),
+        math.log(k_perp_max),
+    )
+    k_perp = torch.exp(log_k)
+
+    # Isotropic: random azimuthal angle phi
+    phi = torch.empty(n_uv_samples, device=device).uniform_(0, 2 * math.pi)
+    k_x_uv = k_perp * torch.cos(phi)
+    k_y_uv = k_perp * torch.sin(phi)
+
+    # Tile the other 7 parameters from random rows of the training batch
+    idx = torch.randint(0, B, (n_uv_samples,), device=device)
+    uv_params = inputs[idx].clone()  # (n_uv_samples, 9)
+    uv_params[:, 1] = k_x_uv  # overwrite k_x
+    uv_params[:, 2] = k_y_uv  # overwrite k_y
+
+    uv_output = model(uv_params).squeeze(-1)  # (n_uv_samples,) or (n_uv_samples, 1)
+
+    # Use log weight to penalize nonzero result at larger k_perp values more
+    log_weight = 2 * log_k - 2 * math.log(config.uv_kt_threshold)
+    uv_decay = (log_weight * uv_output ** 2).mean()
 
     # Total loss
     total_loss = (
             mse
             + config.lambda_positivity * positivity
             + config.lambda_ky_symmetry * ky_symmetry
+            + config.lambda_uv * uv_decay
     )
 
     # Return loss components for logging
@@ -314,6 +358,7 @@ def compute_loss(
         'mse': mse.item(),
         'positivity': positivity.item(),
         'ky_symmetry': ky_symmetry.item(),
+        'uv_decay': uv_decay.item(),
         'total': total_loss.item(),
     }
 
