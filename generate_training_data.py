@@ -648,10 +648,14 @@ class TrainingDataGenerator:
         print(f"  Done in {dt:.1f}s ({dt/len(points):.2f}s per point)")
 
         # Filter out failed integrations
+        print(f"  Filtering out failed integrations...")
+        t0 = time.time()
         valid = ~np.isnan(values)
         points = points[valid]
         values = values[valid]
         errors = errors[valid]
+        dt = time.time() - t0
+        print(f"  Done in {dt:.1f}s")
 
         # Initial weights are uniform
         weights = np.ones(len(points))
@@ -674,9 +678,15 @@ class TrainingDataGenerator:
         n_adaptive = self.config.n_adaptive_per_round
 
         # --- Importance-sampled points ---
+        print(f"Sampling {n_adaptive} importance-sampled points...")
+        t0 = time.time()
         adaptive_points = self.sampler.generate_importance_samples(n_adaptive)
+        dt = time.time() - t0
+        print(f"  Done in {dt:.1f}s")
 
         # --- Sobol exploration points ---
+        print(f"Sampling {n_sobol} sobol points...")
+        t0 = time.time()
         if n_sobol > 0:
             sobol_points = generate_sobol_samples(n_sobol, self.config, self._sobol_sampler)
             # Enforce z0 < zf on Sobol points
@@ -691,6 +701,8 @@ class TrainingDataGenerator:
             print(f"  Split: {n_adaptive} importance-sampled + {n_sobol} Sobol exploration")
         else:
             points = adaptive_points
+        dt = time.time() - t0
+        print(f"  Done in {dt:.1f}s")
 
         print(f"  Computing {len(points)} samples...")
         t0 = time.time()
@@ -699,14 +711,20 @@ class TrainingDataGenerator:
         print(f"  Done in {dt:.1f}s ({dt / len(points):.2f}s per point)")
 
         # Filter out failed integrations
+        print(f"  Filtering out failed integrations...")
+        t0 = time.time()
         valid = ~np.isnan(values)
         points = points[valid]
         values = values[valid]
         errors = errors[valid]
+        dt = time.time() - t0
+        print(f"  Done in {dt:.1f}s")
 
         # Compute importance weights for these new samples.
         # Sobol points are treated as uniform draws → weight = 1.
         # Importance-sampled points get inverse-probability weights.
+        print(f"  Importance sampling weights...")
+        t0 = time.time()
         if len(self.sampler.points) > 10:
             sampling_weights = self.sampler.compute_importance_weights()
             points_norm = normalize_to_unit_cube(points, self.sampler.ranges)
@@ -724,6 +742,8 @@ class TrainingDataGenerator:
                 weights[n_adaptive_valid:] = 1.0
         else:
             weights = np.ones(len(points))
+        dt = time.time() - t0
+        print(f"  Done in {dt:.1f}s")
 
         # Store results
         self._store_results(points, values, errors, weights)
@@ -734,10 +754,14 @@ class TrainingDataGenerator:
         print(f"  Mean error: {errors.mean():.4e}")
 
         # Print importance sampling statistics
+        print(f"Printing importance sampling stats...")
+        t0 = time.time()
         if len(self.sampler.points) > 10:
             imp_weights = self.sampler.compute_importance_weights()
             print(f"  Importance weight stats: min={imp_weights.min():.4f}, "
                   f"max={imp_weights.max():.4f}, entropy={self._entropy(imp_weights):.2f}")
+        dt = time.time() - t0
+        print(f"  Done in {dt:.1f}s")
 
     def _entropy(self, probs: np.ndarray) -> float:
         """Compute entropy of probability distribution (higher = more uniform)."""
