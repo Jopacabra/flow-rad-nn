@@ -757,7 +757,7 @@ class TrainingDataGenerator:
         print(f"Printing importance sampling stats...")
         t0 = time.time()
         if len(self.sampler.points) > 10:
-            imp_weights = self.sampler.compute_importance_weights()
+            imp_weights = sampling_weights
             print(f"  Importance weight stats: min={imp_weights.min():.4f}, "
                   f"max={imp_weights.max():.4f}, entropy={self._entropy(imp_weights):.2f}")
         dt = time.time() - t0
