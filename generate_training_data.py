@@ -391,24 +391,19 @@ class ImportanceSampler:
         if n < k_neighbors + 1 or self.tree is None:
             return np.ones(n)
 
-        gradients = np.zeros(n)
+        # Batch query: all n points at once → shape (n, k_neighbors+1)
+        dists, indices = self.tree.query(self.points_normalized, k=k_neighbors + 1)
 
-        for i in range(n):
-            # Find k nearest neighbors
-            dists, indices = self.tree.query(self.points_normalized[i], k=k_neighbors + 1)
+        # dists[:, 0] is self (distance ≈ 0); slice it off
+        neighbor_dists = dists[:, 1:]  # (n, k_neighbors)
+        neighbor_indices = indices[:, 1:]  # (n, k_neighbors)
 
-            # Exclude self (distance = 0)
-            neighbor_mask = dists > 1e-10
-            if neighbor_mask.sum() == 0:
-                continue
+        # Gather neighbour values: (n, k_neighbors)
+        neighbor_values = values[neighbor_indices]
 
-            neighbor_dists = dists[neighbor_mask]
-            neighbor_indices = indices[neighbor_mask]
-            neighbor_values = values[neighbor_indices]
-
-            # Estimate gradient as max |ΔI / Δr|
-            value_diffs = np.abs(neighbor_values - values[i])
-            gradients[i] = np.max(value_diffs / (neighbor_dists + 1e-10))
+        # |ΔI| / Δr for every (point, neighbour) pair, then take max over neighbours
+        value_diffs = np.abs(neighbor_values - values[:, None])
+        gradients = np.max(value_diffs / (neighbor_dists + 1e-10), axis=1)
 
         # Normalize
         grad_median = np.median(gradients) + 1e-10
@@ -423,15 +418,15 @@ class ImportanceSampler:
         if n < k_neighbors + 1 or self.tree is None:
             return np.ones(n)
 
-        # Average distance to k nearest neighbors
-        densities = np.zeros(n)
+        # Batch query: all n points at once → shape (n, k_neighbors+1)
+        dists, _ = self.tree.query(self.points_normalized, k=k_neighbors + 1)
 
-        for i in range(n):
-            dists, _ = self.tree.query(self.points_normalized[i], k=k_neighbors + 1)
-            # Exclude self
-            dists = dists[dists > 1e-10]
-            if len(dists) > 0:
-                densities[i] = 1.0 / (np.mean(dists) + 1e-10)
+        # dists[:, 0] is self (distance ≈ 0); slice it off
+        neighbor_dists = dists[:, 1:]  # (n, k_neighbors)
+
+        # Mean distance to k neighbours → local density proxy
+        mean_dists = np.mean(neighbor_dists, axis=1)
+        densities = 1.0 / (mean_dists + 1e-10)
 
         # Inverse density → sparse regions have high weight
         density_median = np.median(densities) + 1e-10
