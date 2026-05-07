@@ -327,6 +327,10 @@ class ImportanceSampler:
         # KD-tree for nearest neighbor queries (rebuilt after each round)
         self.tree: Optional[cKDTree] = None
         self.points_normalized: Optional[np.ndarray] = None
+        self._points_arr: Optional[np.ndarray] = None  # numpy view of self.points
+
+        # Cached importance weights — invalidated when new samples are added
+        self._cached_weights: Optional[np.ndarray] = None
 
     def add_samples(self, points: np.ndarray, values: np.ndarray, errors: np.ndarray):
         """Add computed samples to the database."""
@@ -335,23 +339,28 @@ class ImportanceSampler:
             self.values.append(values[i])
             self.errors.append(errors[i])
 
-        # Rebuild KD-tree
+        # Rebuild KD-tree and invalidate weight cache
         self._rebuild_tree()
+        self._cached_weights = None
 
     def _rebuild_tree(self):
         """Rebuild the KD-tree for nearest neighbor queries."""
         if len(self.points) < 2:
             return
 
-        points_arr = np.array(self.points)
-        self.points_normalized = normalize_to_unit_cube(points_arr, self.ranges)
+        self._points_arr = np.array(self.points)
+        self.points_normalized = normalize_to_unit_cube(self._points_arr, self.ranges)
         self.tree = cKDTree(self.points_normalized)
 
     def compute_importance_weights(self) -> np.ndarray:
         """
         Compute importance weights for each existing sample.
         Higher weight = more likely to sample nearby.
+        Returns cached result if weights are still valid.
         """
+        if self._cached_weights is not None:
+            return self._cached_weights
+
         n = len(self.points)
         if n < 10:
             return np.ones(n) / n
@@ -383,6 +392,7 @@ class ImportanceSampler:
         weights = np.maximum(weights, 1e-10)
         weights /= weights.sum()
 
+        self._cached_weights = weights
         return weights
 
     def _estimate_gradient_weights(self, values: np.ndarray, k_neighbors: int = 5) -> np.ndarray:
@@ -441,7 +451,6 @@ class ImportanceSampler:
         Samples are drawn near existing high-weight points with added noise.
         """
         if len(self.points) < 10:
-            # Fall back to LHS if not enough data
             return generate_lhs_samples(n_samples, self.config)
 
         weights = self.compute_importance_weights()
@@ -449,8 +458,8 @@ class ImportanceSampler:
         # Sample indices according to importance weights
         indices = np.random.choice(len(self.points), size=n_samples, p=weights)
 
-        # Generate new points by adding noise around selected points
-        base_points = np.array([self.points[i] for i in indices])
+        # Direct numpy fancy-index instead of Python list comprehension
+        base_points = self._points_arr[indices]
 
         # Noise scale decreases with round: broad early, refined later
         noise_scale = max(0.02, 0.15 * np.exp(-round_num / 50))
