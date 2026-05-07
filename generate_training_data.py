@@ -72,9 +72,9 @@ class SamplingConfig:
 
     # Sampling settings
     n_initial: int = 1000  # Initial LHS samples
-    n_per_round: int = 500  # Samples per adaptive round
+    n_adaptive_per_round: int = 500  # Samples per adaptive round
     n_rounds: int = 10  # Number of adaptive rounds
-    sobol_fraction: float = 0.2  # Fraction of each adaptive round drawn from Sobol
+    n_sobol_per_round: int = 2048  # Number of sobol points per round
 
     # Importance sampling weights
     weight_uncertainty: float = 0.1  # Weight for high MC uncertainty regions
@@ -492,7 +492,7 @@ class TrainingDataGenerator:
 
         # Persistent Sobol sampler — advances across all rounds so points are never repeated.
         # Seeded differently from the initial LHS sampler (seed=42) to avoid overlap.
-        self._sobol_sampler = qmc.Sobol(d=len(get_ranges(config)), seed=99)
+        self._sobol_sampler = qmc.Sobol(d=len(get_ranges(config)))  # No seed, resuming works
         # Fast-forward past the initial round's worth of points so the sequence
         # never overlaps with generate_lhs_samples (which also uses Sobol, seed=42).
         # (Different seeds already guarantee no overlap, but this is explicit.)
@@ -670,9 +670,8 @@ class TrainingDataGenerator:
         print(f"Round {round_num}: Adaptive Importance Sampling")
         print("=" * 70)
 
-        n_total = self.config.n_per_round
-        n_sobol = max(0, int(round(n_total * self.config.sobol_fraction)))
-        n_adaptive = n_total - n_sobol
+        n_sobol = self.config.n_sobol_per_round
+        n_adaptive = self.config.n_adaptive_per_round
 
         # --- Importance-sampled points ---
         adaptive_points = self.sampler.generate_importance_samples(n_adaptive)
@@ -821,8 +820,8 @@ class TrainingDataGenerator:
         print(f"Configuration:")
         print(f"  Initial samples: {self.config.n_initial}")
         print(f"  Adaptive rounds: {self.config.n_rounds}")
-        print(f"  Samples per round: {self.config.n_per_round}")
-        print(f"  Total expected: ~{self.config.n_initial + self.config.n_rounds * self.config.n_per_round}")
+        print(f"  Samples per round: {self.config.n_adaptive_per_round}")
+        print(f"  Total expected: ~{self.config.n_initial + self.config.n_rounds * self.config.n_adaptive_per_round}")
         print(f"  Output file: {self.config.output_file}")
         print(f"  Parameter dimensions: 9 (x, kx, ky, E, z0, zf, u_perp, T, g)")
         print(f"  Note: CF factor NOT included in output")
@@ -890,9 +889,9 @@ if __name__ == "__main__":
 
         # Sampling
         n_initial=2048,  # Use powers of 2 for optimal sobol sampling
-        n_per_round=800,
+        n_adaptive_per_round=2048,
         n_rounds=2500,  # Increase for more data
-        sobol_fraction=0.2,  # Fraction of each adaptive round drawn from Sobol
+        n_sobol_per_round=2048,  # Fraction of each adaptive round drawn from Sobol
 
         # Importance weights
         weight_uncertainty=0.1,  # Weight for high MC uncertainty regions
