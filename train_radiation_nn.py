@@ -506,54 +506,58 @@ def train_model(config: TrainingConfig):
     print("\nStarting training...")
     print("-" * 70)
 
-    for epoch in range(config.n_epochs):
-        # Train
-        train_metrics = train_epoch(model, train_loader, optimizer, config)
+    try:
+        for epoch in range(config.n_epochs):
+            # Train
+            train_metrics = train_epoch(model, train_loader, optimizer, config)
 
-        # Validate
-        val_metrics = validate(model, val_loader, config)
+            # Validate
+            val_metrics = validate(model, val_loader, config)
 
-        # Update scheduler
-        scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
+            # Update scheduler
+            scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
 
-        # Print progress
-        # if (epoch + 1) % 10 == 0 or epoch == 0:
-        current_lr = optimizer.param_groups[0]['lr']
-        print(
-            f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
-            f"Train Loss: {train_metrics['loss']:.4e} | "
-            f"Val Loss: {val_metrics['loss']:.4e} | "
-            f"Train MSE: {train_metrics['mse']:.4e} | "
-            f"Val MSE: {val_metrics['mse']:.4e} | "
-            f"MSE Ratio: {(train_metrics['mse']/val_metrics['mse']):.4e} | "
-            f"LR: {current_lr:.2e}"
-        )
+            # Print progress
+            # if (epoch + 1) % 10 == 0 or epoch == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(
+                f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
+                f"Train Loss: {train_metrics['loss']:.4e} | "
+                f"Val Loss: {val_metrics['loss']:.4e} | "
+                f"Train MSE: {train_metrics['mse']:.4e} | "
+                f"Val MSE: {val_metrics['mse']:.4e} | "
+                f"MSE Ratio: {(train_metrics['mse']/val_metrics['mse']):.4e} | "
+                f"LR: {current_lr:.2e}"
+            )
 
-        # Early stopping check
-        if val_metrics['loss'] < best_val_loss:
-            best_val_loss = val_metrics['loss']
-            patience_counter = 0
+            # Early stopping check
+            if val_metrics['loss'] < best_val_loss:
+                best_val_loss = val_metrics['loss']
+                patience_counter = 0
 
-            # Save best model
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'config': {
-                    'hidden_dim': config.hidden_dim,
-                    'n_layers': config.n_layers,
-                    'activation': config.activation,
-                    'input_dim': len(dataset.FEATURE_NAMES),
-                    'dropout_p': config.dropout_p,
-                },
-                'epoch': epoch,
-                'val_loss': best_val_loss,
-            }, config.model_file)
-        else:
-            patience_counter += 1
-            if patience_counter >= config.patience:
-                print(f"\nEarly stopping at epoch {epoch + 1}")
-                break
+                # Save best model
+                torch.save({
+                    'model_state_dict': model.state_dict(),
+                    'config': {
+                        'hidden_dim': config.hidden_dim,
+                        'n_layers': config.n_layers,
+                        'activation': config.activation,
+                        'input_dim': len(dataset.FEATURE_NAMES),
+                        'dropout_p': config.dropout_p,
+                    },
+                    'epoch': epoch,
+                    'val_loss': best_val_loss,
+                }, config.model_file)
+            else:
+                patience_counter += 1
+                if patience_counter >= config.patience:
+                    print(f"\nEarly stopping at epoch {epoch + 1}")
+                    break
+    except KeyboardInterrupt:
+        print("Keyboard interrupt. Training stopped.")
 
     # Save normalization parameters
+    print("Saving normalization...")
     norm_params = dataset.get_normalization_params()
     with open(config.normalization_file, 'w') as f:
         json.dump(norm_params, f, indent=2)
