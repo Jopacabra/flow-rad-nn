@@ -442,6 +442,12 @@ def train_model(config: TrainingConfig):
     # Load dataset
     dataset = RadiationDataset(config.data_file, log_transform_output=config.log_transform)
 
+    # Save normalization parameters
+    print("Saving normalization...")
+    norm_params = dataset.get_normalization_params()
+    with open(config.normalization_file, 'w') as f:
+        json.dump(norm_params, f, indent=2)
+
     # Split into train/validation
     n_train = int(len(dataset) * config.train_fraction)
     n_val = len(dataset) - n_train
@@ -555,12 +561,6 @@ def train_model(config: TrainingConfig):
                     break
     except KeyboardInterrupt:
         print("Keyboard interrupt. Training stopped.")
-
-    # Save normalization parameters
-    print("Saving normalization...")
-    norm_params = dataset.get_normalization_params()
-    with open(config.normalization_file, 'w') as f:
-        json.dump(norm_params, f, indent=2)
 
     print("-" * 70)
     print(f"Training complete!")
