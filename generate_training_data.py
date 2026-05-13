@@ -19,7 +19,7 @@ Note: The Casimir factor (CF) is NOT included in the output. Multiply by CF at r
 """
 
 from scipy.stats import qmc
-from scipy.spatial import cKDTree
+from pynndescent import NNDescent
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 import time
@@ -80,6 +80,9 @@ class SamplingConfig:
     weight_uncertainty: float = 0.1  # Weight for high MC uncertainty regions
     weight_gradient: float = 0.4  # Weight for high gradient regions
     weight_coverage: float = 0.5  # Weight for undersampled regions
+
+    # Parallelization
+    n_workers: int = 4  # Number of cores for parallelized bits
 
     # Output
     output_file: str = "radiation_training_data.h5"
@@ -325,7 +328,7 @@ class ImportanceSampler:
         self.errors = []  # List of I_err values
 
         # KD-tree for nearest neighbor queries (rebuilt after each round)
-        self.tree: Optional[cKDTree] = None
+        self._ann_index = Optional[NNDescent]
         self.points_normalized: Optional[np.ndarray] = None
         self._points_arr: Optional[np.ndarray] = None  # numpy view of self.points
 
@@ -350,7 +353,14 @@ class ImportanceSampler:
 
         self._points_arr = np.array(self.points)
         self.points_normalized = normalize_to_unit_cube(self._points_arr, self.ranges)
-        self.tree = cKDTree(self.points_normalized)
+        self._ann_index = NNDescent(
+            self.points_normalized,
+            n_neighbors=15,
+            metric="euclidean",
+            random_state=42,
+            n_jobs=-1,
+        )
+        self._ann_index.prepare()  # pre-build search structures
 
     def compute_importance_weights(self) -> np.ndarray:
         """
@@ -365,7 +375,6 @@ class ImportanceSampler:
         if n < 10:
             return np.ones(n) / n
 
-        values = np.array(self.values)
         errors = np.array(self.errors)
 
         # 1. Uncertainty-based weight: high MC error → high weight
@@ -374,11 +383,8 @@ class ImportanceSampler:
         w_uncertainty = np.abs(errors) / err_median
         w_uncertainty = np.clip(w_uncertainty, 0.1, 10.0)
 
-        # 2. Gradient-based weight: estimate local variation
-        w_gradient = self._estimate_gradient_weights(values)
-
-        # 3. Coverage-based weight: inverse local density
-        w_coverage = self._estimate_coverage_weights()
+        # 2. Gradient-based weight: estimate local variation & Coverage-based weight: inverse local density
+        w_gradient, w_coverage = self._estimate_weights()
 
         # Combine weights
         cfg = self.config
@@ -395,22 +401,35 @@ class ImportanceSampler:
         self._cached_weights = weights
         return weights
 
-    def _estimate_gradient_weights(self, values: np.ndarray, k_neighbors: int = 5) -> np.ndarray:
-        """Estimate gradient magnitude using nearest neighbors."""
-        n = len(values)
-        if n < k_neighbors + 1 or self.tree is None:
-            return np.ones(n)
+    def _estimate_weights(self, k_neighbors: int = 5):
+        """
+        Estimate gradient magnitude using nearest neighbors.
+        &
+        Estimate inverse local density (sparse regions get higher weight).
+        """
+        values = np.array(self.values)
+        n_grad = len(values)
+        n_cov = len(self.points)
+        if n_grad < k_neighbors + 1 or self._ann_index is None:
+            return np.ones(n_grad), np.ones(n_cov)
 
         # Batch query: all n points at once → shape (n, k_neighbors+1)
-        dists, indices = self.tree.query(self.points_normalized, k=k_neighbors + 1)
+        t0 = time.time()
+        indices, dists = self._ann_index.query(self.points_normalized, k=k_neighbors + 1)
+        dt = time.time() - t0
+        print(f"Tree query done in {dt:.1f}s")
 
         # dists[:, 0] is self (distance ≈ 0); slice it off
+        t0 = time.time()
         neighbor_dists = dists[:, 1:]  # (n, k_neighbors)
         neighbor_indices = indices[:, 1:]  # (n, k_neighbors)
+        dt = time.time() - t0
+        print(f"slicing done in {dt:.1f}s")
 
         # Gather neighbour values: (n, k_neighbors)
         neighbor_values = values[neighbor_indices]
 
+        # Gradient weights
         # |ΔI| / Δr for every (point, neighbour) pair, then take max over neighbours
         value_diffs = np.abs(neighbor_values - values[:, None])
         gradients = np.max(value_diffs / (neighbor_dists + 1e-10), axis=1)
@@ -420,20 +439,7 @@ class ImportanceSampler:
         w_gradient = gradients / grad_median
         w_gradient = np.clip(w_gradient, 0.1, 10.0)
 
-        return w_gradient
-
-    def _estimate_coverage_weights(self, k_neighbors: int = 5) -> np.ndarray:
-        """Estimate inverse local density (sparse regions get higher weight)."""
-        n = len(self.points)
-        if n < k_neighbors + 1 or self.tree is None:
-            return np.ones(n)
-
-        # Batch query: all n points at once → shape (n, k_neighbors+1)
-        dists, _ = self.tree.query(self.points_normalized, k=k_neighbors + 1)
-
-        # dists[:, 0] is self (distance ≈ 0); slice it off
-        neighbor_dists = dists[:, 1:]  # (n, k_neighbors)
-
+        # Coverage weights
         # Mean distance to k neighbours → local density proxy
         mean_dists = np.mean(neighbor_dists, axis=1)
         densities = 1.0 / (mean_dists + 1e-10)
@@ -443,7 +449,7 @@ class ImportanceSampler:
         w_coverage = density_median / (densities + 1e-10)
         w_coverage = np.clip(w_coverage, 0.1, 10.0)
 
-        return w_coverage
+        return w_gradient, w_coverage
 
     def generate_importance_samples(self, n_samples: int, round_num: int = 1) -> np.ndarray:
         """
@@ -489,9 +495,8 @@ class ImportanceSampler:
 class TrainingDataGenerator:
     """Main class for generating training data with adaptive importance sampling."""
 
-    def __init__(self, config: SamplingConfig, n_workers: int = None):
+    def __init__(self, config: SamplingConfig):
         self.config = config
-        self.n_workers = n_workers  # None → os.cpu_count()
         self.sampler = ImportanceSampler(config)
 
         # Persistent Sobol sampler — advances across all rounds so points are never repeated.
@@ -610,11 +615,11 @@ class TrainingDataGenerator:
             for i in range(n)
         ]
 
-        print(f"  Computing {n} points on {self.n_workers or 'all available'} workers...")
+        print(f"  Computing {n} points on {self.config.n_workers or 'all available'} workers...")
         t0 = time.time()
         completed = 0
 
-        with ProcessPoolExecutor(max_workers=self.n_workers) as pool:
+        with ProcessPoolExecutor(max_workers=self.config.n_workers) as pool:
             futures = {pool.submit(_integrate_one, task): task for task in tasks}
             for future in as_completed(futures):
                 idx, mean, sdev = future.result()
@@ -727,12 +732,13 @@ class TrainingDataGenerator:
         # Compute importance weights for these new samples.
         # Sobol points are treated as uniform draws → weight = 1.
         # Importance-sampled points get inverse-probability weights.
-        print(f"  Importance sampling weights...")
+        print(f"  Importance sampling weights for next round...")
         t0 = time.time()
         if len(self.sampler.points) > 10:
             sampling_weights = self.sampler.compute_importance_weights()
             points_norm = normalize_to_unit_cube(points, self.sampler.ranges)
-            _, indices = self.sampler.tree.query(points_norm, k=1)
+            indices, _ = self.sampler._ann_index.query(points_norm, k=1)
+            indices = indices.ravel()  # (n, 1) -> (n,)
 
             sample_probs = sampling_weights[indices]
             weights = 1.0 / (sample_probs * len(self.sampler.points) + 1e-10)
@@ -870,8 +876,12 @@ class TrainingDataGenerator:
 
             # Checkpoint
             if r % self.config.checkpoint_every == 0:
+                print("Checkpointing...")
+                t0 = time.time()
                 checkpoint_file = self.config.output_file.replace('.h5', f'_checkpoint_r{r}.h5')
                 self.save_checkpoint(checkpoint_file)
+                dt = time.time() - t0
+                print(f"  Done in {dt:.1f}s")
 
         # Final save
         self.save_checkpoint()
@@ -917,20 +927,23 @@ if __name__ == "__main__":
 
         # Sampling
         n_initial=2048,  # Use powers of 2 for optimal sobol sampling
-        n_adaptive_per_round=2048,
+        n_adaptive_per_round=0,
         n_rounds=2500,  # Increase for more data
-        n_sobol_per_round=2048,  # Fraction of each adaptive round drawn from Sobol
+        n_sobol_per_round=8192,  # Number drawn from Sobol sequence each round
 
         # Importance weights
         weight_uncertainty=0.1,  # Weight for high MC uncertainty regions
         weight_gradient=0.4,  # Weight for high gradient regions
         weight_coverage=0.5,  # Weight for undersampled regions
 
+        # Parallelization
+        n_workers=8,  # Number of cores for parallelized bits
+
         # Output
         output_file="radiation_training_data.h5",
-        checkpoint_every=10,
+        checkpoint_every=3,
     )
 
     # Run generation
-    generator = TrainingDataGenerator(config, n_workers=8)  # control number of workers here.
+    generator = TrainingDataGenerator(config)  # control number of workers here.
     generator.run(resume_from=args.resume)
