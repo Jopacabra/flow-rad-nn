@@ -289,7 +289,7 @@ def generate_lhs_samples(n_samples: int, config: SamplingConfig) -> np.ndarray:
     ranges = get_ranges(config)
     n_dims = len(ranges)
 
-    sampler = qmc.LatinHypercube(d=n_dims, seed=42)
+    sampler = qmc.LatinHypercube(d=n_dims)
     samples_unit = sampler.random(n=n_samples)
     samples = denormalize_from_unit_cube(samples_unit, ranges)
 
