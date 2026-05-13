@@ -739,28 +739,31 @@ class TrainingDataGenerator:
         # Compute importance weights for these new samples.
         # Sobol points are treated as uniform draws → weight = 1.
         # Importance-sampled points get inverse-probability weights.
-        print(f"  Importance sampling weights for next round...")
-        t0 = time.time()
-        if len(self.sampler.points) > 10:
-            sampling_weights = self.sampler.compute_importance_weights()
-            points_norm = normalize_to_unit_cube(points, self.sampler.ranges)
-            indices, _ = self.sampler._ann_index.query(points_norm, k=1)
-            indices = indices.ravel()  # (n, 1) -> (n,)
+        if n_adaptive > 0:
+            print(f"  Importance sampling weights for next round...")
+            t0 = time.time()
+            if len(self.sampler.points) > 10:
+                sampling_weights = self.sampler.compute_importance_weights()
+                points_norm = normalize_to_unit_cube(points, self.sampler.ranges)
+                indices, _ = self.sampler._ann_index.query(points_norm, k=1)
+                indices = indices.ravel()  # (n, 1) -> (n,)
 
-            sample_probs = sampling_weights[indices]
-            weights = 1.0 / (sample_probs * len(self.sampler.points) + 1e-10)
-            weights = np.clip(weights, 0.1, 10.0)
+                sample_probs = sampling_weights[indices]
+                weights = 1.0 / (sample_probs * len(self.sampler.points) + 1e-10)
+                weights = np.clip(weights, 0.1, 10.0)
 
-            # Override weights for the Sobol portion: they were drawn uniformly
-            if n_sobol > 0:
-                # The Sobol points sit at the end of the (post-filter) array.
-                # Recompute how many survived the validity filter.
-                n_adaptive_valid = int(valid[:n_adaptive].sum())
-                weights[n_adaptive_valid:] = 1.0
+                # Override weights for the Sobol portion: they were drawn uniformly
+                if n_sobol > 0:
+                    # The Sobol points sit at the end of the (post-filter) array.
+                    # Recompute how many survived the validity filter.
+                    n_adaptive_valid = int(valid[:n_adaptive].sum())
+                    weights[n_adaptive_valid:] = 1.0
+            else:
+                weights = np.ones(len(points))
+            dt = time.time() - t0
+            print(f"  Done in {dt:.1f}s")
         else:
             weights = np.ones(len(points))
-        dt = time.time() - t0
-        print(f"  Done in {dt:.1f}s")
 
         # Store results
         self._store_results(points, values, errors, weights)
@@ -771,14 +774,15 @@ class TrainingDataGenerator:
         print(f"  Mean error: {errors.mean():.4e}")
 
         # Print importance sampling statistics
-        print(f"Printing importance sampling stats...")
-        t0 = time.time()
-        if len(self.sampler.points) > 10:
-            imp_weights = sampling_weights
-            print(f"  Importance weight stats: min={imp_weights.min():.4f}, "
-                  f"max={imp_weights.max():.4f}, entropy={self._entropy(imp_weights):.2f}")
-        dt = time.time() - t0
-        print(f"  Done in {dt:.1f}s")
+        if n_adaptive > 0:
+            print(f"Printing importance sampling stats...")
+            t0 = time.time()
+            if len(self.sampler.points) > 10:
+                imp_weights = sampling_weights
+                print(f"  Importance weight stats: min={imp_weights.min():.4f}, "
+                      f"max={imp_weights.max():.4f}, entropy={self._entropy(imp_weights):.2f}")
+            dt = time.time() - t0
+            print(f"  Done in {dt:.1f}s")
 
     def _entropy(self, probs: np.ndarray) -> float:
         """Compute entropy of probability distribution (higher = more uniform)."""
@@ -933,7 +937,7 @@ if __name__ == "__main__":
         neval=10_000,
 
         # Sampling
-        n_initial=2048,  # Use powers of 2 for optimal sobol sampling
+        n_initial=131072,  # Use powers of 2 for optimal sobol sampling
         n_adaptive_per_round=0,
         n_rounds=2500,  # Increase for more data
         n_sobol_per_round=8192,  # Number drawn from Sobol sequence each round
@@ -944,7 +948,7 @@ if __name__ == "__main__":
         weight_coverage=0.5,  # Weight for undersampled regions
 
         # Parallelization
-        n_workers=8,  # Number of cores for parallelized bits
+        n_workers=4,  # Number of cores for parallelized bits
 
         # Output
         output_file="radiation_training_data.h5",
