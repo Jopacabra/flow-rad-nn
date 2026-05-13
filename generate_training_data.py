@@ -687,16 +687,18 @@ class TrainingDataGenerator:
         n_adaptive = self.config.n_adaptive_per_round
 
         # --- Importance-sampled points ---
-        print(f"Sampling {n_adaptive} importance-sampled points...")
-        t0 = time.time()
-        adaptive_points = self.sampler.generate_importance_samples(n_adaptive)
-        dt = time.time() - t0
-        print(f"  Done in {dt:.1f}s")
+        if n_adaptive > 0:
+            print(f"Sampling {n_adaptive} importance-sampled points...")
+            t0 = time.time()
+            adaptive_points = self.sampler.generate_importance_samples(n_adaptive)
+            dt = time.time() - t0
+            print(f"  Done in {dt:.1f}s")
 
         # --- Sobol exploration points ---
-        print(f"Sampling {n_sobol} sobol points...")
-        t0 = time.time()
         if n_sobol > 0:
+            print(f"Sampling {n_sobol} sobol points...")
+            t0 = time.time()
+
             sobol_points = generate_sobol_samples(n_sobol, self.config, self._sobol_sampler)
             # Enforce z0 < zf on Sobol points
             z0_idx, zf_idx = 4, 5
@@ -706,12 +708,17 @@ class TrainingDataGenerator:
                     sobol_points[mask, zf_idx].copy(),
                     sobol_points[mask, z0_idx].copy(),
                 )
+            dt = time.time() - t0
+            print(f"  Done in {dt:.1f}s")
+
+        # --- Combine points ---
+        print(f"  Split: {n_adaptive} importance-sampled + {n_sobol} Sobol exploration")
+        if n_sobol > 0 and n_adaptive > 0:
             points = np.vstack([adaptive_points, sobol_points])
-            print(f"  Split: {n_adaptive} importance-sampled + {n_sobol} Sobol exploration")
+        elif n_sobol > 0:
+            points = sobol_points
         else:
             points = adaptive_points
-        dt = time.time() - t0
-        print(f"  Done in {dt:.1f}s")
 
         print(f"  Computing {len(points)} samples...")
         t0 = time.time()
