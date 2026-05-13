@@ -60,11 +60,12 @@ class TrainingConfig:
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
     lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
-    lambda_uv: float = 0.1  # Weight for UV power-law regularisation
+    lambda_uv: float = 1.0  # Weight for UV decay loss term
+    lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
     # A safe default is 4.0 GeV^2 (kt > 2 GeV).
-    uv_kt_threshold: float = 4.0
+    uv_kt_threshold: float = 10.0
 
     # Output
     model_file: str = "radiation_emulator.pt"
@@ -345,12 +346,54 @@ def compute_loss(
     log_weight = 2 * log_k - 2 * math.log(config.uv_kt_threshold)
     uv_decay = (log_weight * uv_output ** 2).mean()
 
+    """
+    UV power law behavior enforcement loss
+    
+    Enforces f(alpha * k_perp) / f(k_perp) ~ alpha^{-power}.
+    Robust to overall normalisation; constrains the UV shape directly.
+    """
+    B = inputs.shape[0]
+    device = inputs.device
+    alpha = 4.0  # scale_factor between compared points -- compare f(k) vs f(scale_factor * k)
+    n_uv_power_law_samples = 64
+    k_perp_base = 2.0  # base UV scale
+    power = 4.0  # expected UV power law exponent
+
+    idx = torch.randint(0, B, (n_uv_power_law_samples,), device=device)
+    base_params = inputs[idx].clone()
+
+    # Randomise k_perp_base point in a moderate UV range
+    k_perp = k_perp_base * torch.exp(
+        torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 3)
+    )
+    phi = torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 2 * torch.pi)
+
+    # Low-k point
+    base_params[:, -3] = k_perp * torch.cos(phi)
+    base_params[:, -2] = k_perp * torch.sin(phi)
+    f_low = model(base_params).squeeze()
+
+    # High-k point (same direction, same other params)
+    high_params = base_params.clone()
+    high_params[:, -3] = (alpha * k_perp) * torch.cos(phi)
+    high_params[:, -2] = (alpha * k_perp) * torch.sin(phi)
+    f_high = model(high_params).squeeze()
+
+    # Target ratio: f(alpha*k) / f(k) = alpha^{-power}
+    expected_ratio = alpha ** (-power)
+    # Use log-ratio loss for numerical stability; avoids division-by-zero
+    log_ratio = torch.log(torch.abs(f_high) + 1e-30) - torch.log(torch.abs(f_low) + 1e-30)
+    target_log_ratio = torch.full_like(log_ratio, torch.log(torch.tensor(expected_ratio)))
+
+    uv_power_law =  nn.functional.mse_loss(log_ratio, target_log_ratio)
+
     # Total loss
     total_loss = (
             mse
             + config.lambda_positivity * positivity
             + config.lambda_ky_symmetry * ky_symmetry
             + config.lambda_uv * uv_decay
+            + config.lambda_uv_power * uv_power_law
     )
 
     # Return loss components for logging
@@ -359,6 +402,7 @@ def compute_loss(
         'positivity': positivity.item(),
         'ky_symmetry': ky_symmetry.item(),
         'uv_decay': uv_decay.item(),
+        'uv_power_law': uv_power_law.item(),
         'total': total_loss.item(),
     }
 
@@ -502,7 +546,7 @@ def train_model(config: TrainingConfig):
     #
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode='min', factor=0.5, patience=10,  # verbose deprecated -- prints LR later on
-        min_lr=1e-5,  # Minimum learning rate, so we don't go to negligibly small values and stagnate learning
+        min_lr=6.24e-5,  # Minimum learning rate, so we don't go to negligibly small values and stagnate learning
     )
 
     # Training loop
