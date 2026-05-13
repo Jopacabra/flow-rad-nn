@@ -42,7 +42,7 @@ class TrainingConfig:
     # Data
     data_file: str = "radiation_training_data.h5"
     train_fraction: float = 0.8
-    log_transform: bool = True
+    transform: str = "arcsinh"
 
     # Architecture
     hidden_dim: int = 256
@@ -60,7 +60,7 @@ class TrainingConfig:
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
     lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
-    lambda_uv: float = 1.0  # Weight for UV decay loss term
+    lambda_uv: float = 0.01  # Weight for UV decay loss term
     lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
@@ -87,7 +87,7 @@ class RadiationDataset(Dataset):
     # Input feature names in order
     FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'zf', 'u_perp', 'T', 'g']
 
-    def __init__(self, data_file: str, log_transform_output: bool = True):
+    def __init__(self, data_file: str, transform_output: str = "arcsinh"):
         """
         Load training data from HDF5 file.
 
@@ -95,10 +95,10 @@ class RadiationDataset(Dataset):
         ----------
         data_file : str
             Path to HDF5 file with training data
-        log_transform_output : bool
-            Whether to apply log(|I| + epsilon) transformation to outputs
+        transform_output : str
+            Whether to apply arcsinh, log, etc. transformation to outputs
         """
-        self.log_transform = log_transform_output
+        self.transform = transform_output
         self.epsilon = 1e-10  # Small constant for log stability
 
         # Load data from HDF5
@@ -131,13 +131,21 @@ class RadiationDataset(Dataset):
         self.X_mean = self.X.mean(axis=0)
         self.X_std = self.X.std(axis=0) + 1e-8  # Avoid division by zero
 
-        # Store sign of y before log transform (needed for reconstruction)
+        # Store information potentially needed for transforms
         self.y_sign = np.sign(self.y)
+        self.f0 = np.std(self.y)  # Scale factor for dataset -- choose physically motivated scale
 
         # Compute output normalization
-        if self.log_transform:
+        print(f"Using transform: {self.transform}")
+        if self.transform == "log":
             # Log transform: y_transformed = sign(y) * log(|y| + epsilon)
             self.y_transformed = self.y_sign * np.log(np.abs(self.y) + self.epsilon)
+        elif self.transform == "arcsinh":
+
+            def arcsinh_transform(y, f0):
+                return torch.arcsinh(y / f0)
+
+            self.y_transformed = arcsinh_transform(torch.tensor(self.y), self.f0)
         else:
             self.y_transformed = self.y
 
@@ -173,7 +181,8 @@ class RadiationDataset(Dataset):
             'X_std': self.X_std.tolist(),
             'y_mean': float(self.y_mean),
             'y_std': float(self.y_std),
-            'log_transform': self.log_transform,
+            'transform': str(self.transform),
+            'f0': float(self.f0),
             'epsilon': self.epsilon,
             'feature_names': self.FEATURE_NAMES,
         }
@@ -484,7 +493,7 @@ def train_model(config: TrainingConfig):
     print()
 
     # Load dataset
-    dataset = RadiationDataset(config.data_file, log_transform_output=config.log_transform)
+    dataset = RadiationDataset(config.data_file, transform_output=config.transform)
 
     # Save normalization parameters
     print("Saving normalization...")
@@ -655,7 +664,8 @@ class RadiationEmulatorInference:
         self.X_std = torch.tensor(self.norm_params['X_std'], dtype=torch.float32)
         self.y_mean = self.norm_params['y_mean']
         self.y_std = self.norm_params['y_std']
-        self.log_transform = self.norm_params['log_transform']
+        self.transform = self.norm_params['transform']
+        self.f0 = self.norm_params['f0']
         self.epsilon = self.norm_params['epsilon']
 
         # Load model
@@ -737,7 +747,7 @@ class RadiationEmulatorInference:
         predictions_transformed = predictions_norm.cpu().numpy() * self.y_std + self.y_mean
 
         # Inverse log transform
-        if self.log_transform:
+        if self.transform == "log":
             # y_transformed = sign(y) * log(|y| + epsilon)
             # For simplicity, assume y > 0 most of the time (physical intensity)
             # Inverse: y = exp(y_transformed) - epsilon
@@ -745,7 +755,11 @@ class RadiationEmulatorInference:
             # Approximation: exp(pred) - epsilon (works when pred > 0)
             predictions = np.exp(np.abs(predictions_transformed)) - self.epsilon
             predictions = np.sign(predictions_transformed) * predictions
+        elif self.transform == "arcsinh":
+            # Inverse of transform above
+            predictions = self.f0 * np.sinh(predictions_transformed)
         else:
+            # No transformation, so predictions are already in physical units
             predictions = predictions_transformed
 
         return predictions
@@ -1002,7 +1016,7 @@ if __name__ == "__main__":
     parser.add_argument("--inference-only", action="store_true", help="Skip training, demo inference only")
     parser.add_argument("--data-file", type=str, default=default_config.data_file, help="Training data file")
     parser.add_argument("--model-file", type=str, default=default_config.model_file, help="Model output file")
-    parser.add_argument("--log", type=bool, default=default_config.log_transform, help="Whether to log transform data")
+    parser.add_argument("--transform", type=str, default=default_config.transform, help="Whether to log transform data")
     parser.add_argument("--epochs", type=int, default=default_config.n_epochs, help="Number of training epochs")
     parser.add_argument("--hidden-dim", type=int, default=default_config.hidden_dim, help="Hidden layer dimension")
     parser.add_argument("--n-layers", type=int, default=default_config.n_layers, help="Number of hidden layers")
@@ -1018,7 +1032,7 @@ if __name__ == "__main__":
         n_layers=args.n_layers,
         learning_rate=args.learning_rate,
         run_lr_finder=args.find_lr,
-        log_transform=args.log,
+        transform=args.transform,
     )
 
     # # Example overfitting-style training config
