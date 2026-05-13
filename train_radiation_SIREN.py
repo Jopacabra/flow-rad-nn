@@ -79,9 +79,9 @@ class TrainingConfig:
     # w0_initial: frequency for the first SIREN layer.
     #   Start at 30. Increase to 60 or 120 if high-frequency LPM oscillations
     #   are not resolved. Too high risks training instability.
-    siren_w0_initial: float = 30.0
-    # w0: frequency for all subsequent hidden layers. Usually kept at 30.
-    siren_w0: float = 30.0
+    siren_w0_initial: float = 3
+    # w0: frequency for all subsequent hidden layers -- principled choice is 1, otherwise rescale w0_initial
+    siren_w0: float = 1
 
     # Training
     # Note: a lower learning rate than a standard MLP is recommended for SIRENs.
@@ -89,7 +89,7 @@ class TrainingConfig:
     batch_size: int = 256
     learning_rate: float = 1e-4
     # weight_decay: float = 1e-4  # counterproductive for SIRENs
-    n_epochs: int = 200
+    n_epochs: int = 500
     patience: int = 20  # Early stopping patience
 
     # Physics constraints
@@ -421,7 +421,7 @@ def train_model(config: TrainingConfig):
     print(f"Device:          {config.device}")
     print(f"Data file:       {config.data_file}")
     print(f"w0_initial:      {config.siren_w0_initial}  (first-layer frequency)")
-    print(f"w0:              {config.siren_w0}  (hidden-layer frequency)")
+    print(f"w0:              {config.siren_w0}  (hidden-layer frequency mean)")
     print()
 
     # Load dataset
@@ -879,7 +879,7 @@ def find_w0(
         Smoothed final validation loss for each w0_initial.
     """
     if w0_values is None:
-        w0_values = [1.0, 1/3.0, 1/10.0, 1/30.0, 1/60.0, 1/100.0, 1/200.0, 1/300.0][::-1]
+        w0_values = [0.1, 0.5, 1.0, 2.0, 3.0, 10.0]
 
     # Build dataloaders from the provided dataset
     n_train = int(len(dataset) * config.train_fraction)
@@ -937,7 +937,7 @@ def find_w0(
                 smoothed_loss = smoothing * raw_loss + (1.0 - smoothing) * smoothed_loss
 
         final_losses.append(smoothed_loss)
-        print(f"{w0:>12.1f}  {smoothed_loss:>16.4e}")
+        print(f"{w0:>12.2f}  {smoothed_loss:>16.4e}")
 
     print("-" * 70)
     best_idx = int(np.argmin(final_losses))
@@ -1065,7 +1065,7 @@ if __name__ == "__main__":
     parser.add_argument("--w0-initial", type=float, default=default_config.siren_w0_initial,
                         help="First-layer SIREN frequency (try 30, 60, 120)")
     parser.add_argument("--w0", type=float, default=default_config.siren_w0,
-                        help="Hidden-layer SIREN frequency (usually keep at 30)")
+                        help="Hidden-layer SIREN frequency mean")
     parser.add_argument("--find-lr", action="store_true", help="Run LR range test and exit")
     parser.add_argument("--find-w0", action="store_true", help="Run omega_0 range test and exit")
     args = parser.parse_args()
