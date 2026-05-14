@@ -60,7 +60,7 @@ class TrainingConfig:
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
     lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
-    lambda_uv: float = 0.01  # Weight for UV decay loss term
+    lambda_uv: float = 0.0  # Weight for UV decay loss term
     lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
@@ -326,47 +326,53 @@ def compute_loss(
     k_y symmetry is already built into the training data (mirrored samples).
     This is an optional soft loss penalty on top.
     """
-    # Create inputs with flipped k_y (index 2 in feature list)
-    inputs_ky_flipped = inputs.clone()
-    inputs_ky_flipped[:, 2] = -inputs_ky_flipped[:, 2]  # ky -> -ky
-    predictions_flipped = model(inputs_ky_flipped).squeeze(-1)
-    ky_symmetry = ((predictions - predictions_flipped) ** 2).mean()
+    if config.lambda_ky_symmetry > 0.0:
+        # Create inputs with flipped k_y (index 2 in feature list)
+        inputs_ky_flipped = inputs.clone()
+        inputs_ky_flipped[:, 2] = -inputs_ky_flipped[:, 2]  # ky -> -ky
+        predictions_flipped = model(inputs_ky_flipped).squeeze(-1)
+        ky_symmetry = ((predictions - predictions_flipped) ** 2).mean()
+    else:
+        ky_symmetry = torch.tensor(0.0, device=inputs.device)
 
     """
     UV decay enforcement loss
     
     Enforces f(params, k_x, k_y) -> 0 as k_perp -> inf.
     """
-    k_perp_max = 1e4  # Maximum k_perp value to consider
-    n_uv_samples = 64  # Number of samples to draw from UV region
+    if config.lambda_uv > 0.0:
+        k_perp_max = 1e4  # Maximum k_perp value to consider
+        n_uv_samples = 64  # Number of samples to draw from UV region
 
-    # Get shape and device of inputs
-    B = inputs.shape[0]
-    device = inputs.device
+        # Get shape and device of inputs
+        B = inputs.shape[0]
+        device = inputs.device
 
-    # Sample k_perp log-uniformly in the UV region
-    log_k = torch.empty(n_uv_samples, device=device).uniform_(
-        math.log(config.uv_kt_threshold),
-        math.log(k_perp_max),
-    )
-    k_perp = torch.exp(log_k)
+        # Sample k_perp log-uniformly in the UV region
+        log_k = torch.empty(n_uv_samples, device=device).uniform_(
+            math.log(config.uv_kt_threshold),
+            math.log(k_perp_max),
+        )
+        k_perp = torch.exp(log_k)
 
-    # Isotropic: random azimuthal angle phi
-    phi = torch.empty(n_uv_samples, device=device).uniform_(0, 2 * math.pi)
-    k_x_uv = k_perp * torch.cos(phi)
-    k_y_uv = k_perp * torch.sin(phi)
+        # Isotropic: random azimuthal angle phi
+        phi = torch.empty(n_uv_samples, device=device).uniform_(0, 2 * math.pi)
+        k_x_uv = k_perp * torch.cos(phi)
+        k_y_uv = k_perp * torch.sin(phi)
 
-    # Tile the other 7 parameters from random rows of the training batch
-    idx = torch.randint(0, B, (n_uv_samples,), device=device)
-    uv_params = inputs[idx].clone()  # (n_uv_samples, 9)
-    uv_params[:, 1] = k_x_uv  # overwrite k_x
-    uv_params[:, 2] = k_y_uv  # overwrite k_y
+        # Tile the other 7 parameters from random rows of the training batch
+        idx = torch.randint(0, B, (n_uv_samples,), device=device)
+        uv_params = inputs[idx].clone()  # (n_uv_samples, 9)
+        uv_params[:, 1] = k_x_uv  # overwrite k_x
+        uv_params[:, 2] = k_y_uv  # overwrite k_y
 
-    uv_output = model(uv_params).squeeze(-1)  # (n_uv_samples,) or (n_uv_samples, 1)
+        uv_output = model(uv_params).squeeze(-1)  # (n_uv_samples,) or (n_uv_samples, 1)
 
-    # Use log weight to penalize nonzero result at larger k_perp values more
-    log_weight = 2 * log_k - 2 * math.log(config.uv_kt_threshold)
-    uv_decay = (log_weight * uv_output ** 2).mean()
+        # Use log weight to penalize nonzero result at larger k_perp values more
+        log_weight = 2 * log_k - 2 * math.log(config.uv_kt_threshold)
+        uv_decay = (log_weight * uv_output ** 2).mean()
+    else:
+        uv_decay = torch.tensor(0.0, device=inputs.device)
 
     """
     UV power law behavior enforcement loss
@@ -374,40 +380,43 @@ def compute_loss(
     Enforces f(alpha * k_perp) / f(k_perp) ~ alpha^{-power}.
     Robust to overall normalisation; constrains the UV shape directly.
     """
-    B = inputs.shape[0]
-    device = inputs.device
-    alpha = 4.0  # scale_factor between compared points -- compare f(k) vs f(scale_factor * k)
-    n_uv_power_law_samples = 64
-    k_perp_base = 2.0  # base UV scale
-    power = 4.0  # expected UV power law exponent
+    if config.lambda_uv_power > 0.0:
+        B = inputs.shape[0]
+        device = inputs.device
+        alpha = 4.0  # scale_factor between compared points -- compare f(k) vs f(scale_factor * k)
+        n_uv_power_law_samples = 64
+        k_perp_base = 2.0  # base UV scale
+        power = 4.0  # expected UV power law exponent
 
-    idx = torch.randint(0, B, (n_uv_power_law_samples,), device=device)
-    base_params = inputs[idx].clone()
+        idx = torch.randint(0, B, (n_uv_power_law_samples,), device=device)
+        base_params = inputs[idx].clone()
 
-    # Randomise k_perp_base point in a moderate UV range
-    k_perp = k_perp_base * torch.exp(
-        torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 3)
-    )
-    phi = torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 2 * torch.pi)
+        # Randomise k_perp_base point in a moderate UV range
+        k_perp = k_perp_base * torch.exp(
+            torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 3)
+        )
+        phi = torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 2 * torch.pi)
 
-    # Low-k point
-    base_params[:, -3] = k_perp * torch.cos(phi)
-    base_params[:, -2] = k_perp * torch.sin(phi)
-    f_low = model(base_params).squeeze()
+        # Low-k point
+        base_params[:, -3] = k_perp * torch.cos(phi)
+        base_params[:, -2] = k_perp * torch.sin(phi)
+        f_low = model(base_params).squeeze()
 
-    # High-k point (same direction, same other params)
-    high_params = base_params.clone()
-    high_params[:, -3] = (alpha * k_perp) * torch.cos(phi)
-    high_params[:, -2] = (alpha * k_perp) * torch.sin(phi)
-    f_high = model(high_params).squeeze()
+        # High-k point (same direction, same other params)
+        high_params = base_params.clone()
+        high_params[:, -3] = (alpha * k_perp) * torch.cos(phi)
+        high_params[:, -2] = (alpha * k_perp) * torch.sin(phi)
+        f_high = model(high_params).squeeze()
 
-    # Target ratio: f(alpha*k) / f(k) = alpha^{-power}
-    expected_ratio = alpha ** (-power)
-    # Use log-ratio loss for numerical stability; avoids division-by-zero
-    log_ratio = torch.log(torch.abs(f_high) + 1e-30) - torch.log(torch.abs(f_low) + 1e-30)
-    target_log_ratio = torch.full_like(log_ratio, torch.log(torch.tensor(expected_ratio)))
+        # Target ratio: f(alpha*k) / f(k) = alpha^{-power}
+        expected_ratio = alpha ** (-power)
+        # Use log-ratio loss for numerical stability; avoids division-by-zero
+        log_ratio = torch.log(torch.abs(f_high) + 1e-30) - torch.log(torch.abs(f_low) + 1e-30)
+        target_log_ratio = torch.full_like(log_ratio, torch.log(torch.tensor(expected_ratio)))
 
-    uv_power_law =  nn.functional.mse_loss(log_ratio, target_log_ratio)
+        uv_power_law =  nn.functional.mse_loss(log_ratio, target_log_ratio)
+    else:
+        uv_power_law = torch.tensor(0.0, device=inputs.device)
 
     # Total loss
     total_loss = (
