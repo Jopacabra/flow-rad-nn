@@ -73,6 +73,7 @@ class TrainingConfig:
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    num_workers: int = 4  # DataLoader worker processes
 
     # Utilities
     run_lr_finder: bool = False
@@ -139,7 +140,7 @@ class RadiationDataset(Dataset):
         print(f"Using transform: {self.transform}")
         if self.transform == "log":
             # Log transform: y_transformed = sign(y) * log(|y| + epsilon)
-            self.y_transformed = self.y_sign * np.log(np.abs(self.y) + self.epsilon)
+            self.y_transformed = torch.tensor(self.y_sign * np.log(np.abs(self.y) + self.epsilon))
         elif self.transform == "arcsinh":
 
             def arcsinh_transform(y, f0):
@@ -153,11 +154,11 @@ class RadiationDataset(Dataset):
         self.y_std = self.y_transformed.std() + 1e-8
 
         # Normalize
-        self.X_normalized = (self.X - self.X_mean) / self.X_std
+        self.X_normalized = torch.tensor((self.X - self.X_mean) / self.X_std)
         self.y_normalized = (self.y_transformed - self.y_mean) / self.y_std
 
         # Normalize weights to have mean 1
-        self.weights = self.weights / self.weights.mean()
+        self.weights = torch.tensor(self.weights / self.weights.mean())
 
         print(f"Loaded {len(self.y)} samples from {data_file}")
         print(f"Input shape: {self.X.shape}")
@@ -168,11 +169,23 @@ class RadiationDataset(Dataset):
 
     def __getitem__(self, idx):
         return (
-            torch.from_numpy(self.X_normalized[idx]),
-            torch.tensor(self.y_normalized[idx]),
-            torch.tensor(self.weights[idx]),
-            torch.tensor(self.y_sign[idx]),  # For symmetry loss
+            self.X_normalized[idx],
+            self.y_normalized[idx],
+            self.weights[idx],
         )
+
+    def __getitems__(self, idxs):
+        X = self.X_normalized[idxs]  # single numpy fancy-index
+        y = self.y_normalized[idxs]
+        w = self.weights[idxs]
+        return [
+            (
+                X[i],
+                y[i],
+                w[i],
+            )
+            for i in range(len(idxs))
+        ]
 
     def get_normalization_params(self) -> Dict:
         """Return normalization parameters for saving."""
@@ -430,7 +443,7 @@ def train_epoch(
     total_mse = 0.0
     n_batches = 0
 
-    for inputs, targets, weights, _ in dataloader:
+    for inputs, targets, weights in dataloader:
         inputs = inputs.to(config.device)
         targets = targets.to(config.device)
         weights = weights.to(config.device)
@@ -462,7 +475,7 @@ def validate(
     n_batches = 0
 
     with torch.no_grad():
-        for inputs, targets, weights, _ in dataloader:
+        for inputs, targets, weights in dataloader:
             inputs = inputs.to(config.device)
             targets = targets.to(config.device)
             weights = weights.to(config.device)
@@ -513,12 +526,24 @@ def train_model(config: TrainingConfig):
     print(f"Validation samples: {n_val}")
 
     # Create dataloaders
-    train_loader = DataLoader(
-        train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=0
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=0
-    )
+    if config.device == "cuda":
+        train_loader = DataLoader(
+            train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0, pin_memory=True
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0, pin_memory=True
+        )
+    elif config.device == "cpu":
+        train_loader = DataLoader(
+            train_dataset, batch_size=config.batch_size, shuffle=True, num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=config.batch_size, shuffle=False, num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0
+        )
 
     # Create model
     model = RadiationEmulator(
@@ -531,6 +556,9 @@ def train_model(config: TrainingConfig):
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
+
+    if hasattr(torch, 'compile'):
+        model = torch.compile(model)
 
     # Optimizer -- applies various strategies that change the way we use our neurons
     # Controls usage of dropout and L2 regularization to encourage generalization instead of memorization
@@ -838,10 +866,10 @@ def find_learning_rate(
     for step in range(n_steps):
         # Get next batch, cycling through dataloader if needed
         try:
-            inputs, targets, weights, _ = next(data_iter)
+            inputs, targets, weights = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
-            inputs, targets, weights, _ = next(data_iter)
+            inputs, targets, weights = next(data_iter)
 
         inputs = inputs.to(config.device)
         targets = targets.to(config.device)
@@ -1022,6 +1050,7 @@ if __name__ == "__main__":
     parser.add_argument("--n-layers", type=int, default=default_config.n_layers, help="Number of hidden layers")
     parser.add_argument("--learning-rate", type=float, default=default_config.learning_rate, help="Initial learning rate")
     parser.add_argument("--find-lr", action="store_true", help="Run LR range test and exit")
+    parser.add_argument("--n-workers", type=int, default=default_config.num_workers, help="Number of workers for data loading")
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -1033,6 +1062,7 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         run_lr_finder=args.find_lr,
         transform=args.transform,
+        num_workers=args.n_workers,
     )
 
     # # Example overfitting-style training config
