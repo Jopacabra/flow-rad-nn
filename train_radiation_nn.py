@@ -631,9 +631,16 @@ def train_model(config: TrainingConfig):
                 best_val_loss = val_metrics['loss']
                 patience_counter = 0
 
-                # Save best model
+                # Save best model — unwrap torch.compile's OptimizedModule if present
+                # so that the checkpoint is always loadable without torch.compile.
+                raw_state_dict = model.state_dict()
+                fixed_state_dict = {
+                    k.removeprefix('_orig_mod.'): v
+                    for k, v in raw_state_dict.items()
+                }
+
                 torch.save({
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': fixed_state_dict,
                     'config': {
                         'hidden_dim': config.hidden_dim,
                         'n_layers': config.n_layers,
@@ -717,7 +724,15 @@ class RadiationEmulatorInference:
             dropout_p=model_config.get('dropout_p', 0.0),  # backward compatible
         ).to(device)
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        try:
+            self.model.load_state_dict(checkpoint['model_state_dict'])
+        except RuntimeError:
+            # Strip torch.compile's '_orig_mod.' prefix if present (backward compatible)
+            state_dict = {
+                k.removeprefix('_orig_mod.'): v
+                for k, v in checkpoint['model_state_dict'].items()
+            }
+            self.model.load_state_dict(state_dict)
         self.model.eval()
 
         print(f"Loaded model from {model_file}")
