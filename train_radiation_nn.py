@@ -60,7 +60,7 @@ class TrainingConfig:
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
     lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
-    lambda_uv: float = 0.0  # Weight for UV decay loss term
+    lambda_uv: float = 0.01  # Weight for UV decay loss term
     lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
@@ -841,6 +841,106 @@ class RadiationEmulatorInference:
             T=inputs['T'],
             g=inputs['g'],
         )
+
+    def sample_emission(self,
+            E: np.ndarray,
+            z0: np.ndarray,
+            zf: np.ndarray,
+            u_perp: np.ndarray,
+            T: np.ndarray,
+            g: np.ndarray,
+            N_samples: int = 1,
+    ) -> (float, np.ndarray):
+        """
+        Computes a complete grid in x, kx, ky and returns a 3D inverse CDF sample value for x, kx, ky vector.
+        """
+
+        # Grid of x, kx, ky values
+        max_kx_ky = 5  # Maybe should be dependent on energy, needs testing.
+        x_values = np.logspace(-4, 0, 100)
+        kx_values = np.linspace(-max_kx_ky, max_kx_ky, 100)
+        ky_values = np.linspace(0, max_kx_ky, 100)
+        x_grid, kx_grid, ky_grid = np.meshgrid(x_values, kx_values, ky_values, indexing='ij')
+        n_pts = x_grid.size
+
+        # Predict intensity spectrum points
+        I_nn_flat = self.predict(
+            x=x_grid.ravel(),
+            kx=kx_grid.ravel(),
+            ky=ky_grid.ravel(),
+            E=np.full(n_pts, E),
+            z0=np.full(n_pts, z0),
+            zf=np.full(n_pts, zf),
+            u_perp=np.full(n_pts, u_perp),
+            T=np.full(n_pts, T),
+            g=np.full(n_pts, g),
+        )
+
+        # --- Reshape flat predictions back onto the 3D grid ---
+        I_nn = I_nn_flat.reshape(x_grid.shape)  # shape: (n_x, n_kx, n_ky)
+
+        # -------------------------------------------------------
+        # 1. INTEGRATION
+        #    Integrate over ky first, then kx, then x (in log-space).
+        #    np.trapz(y, x) integrates y along the last axis by default.
+        # -------------------------------------------------------
+        # Integrate over ky (axis 2)
+        I_kx_x = 2*np.trapezoid(I_nn, ky_values, axis=2)  # shape: (n_x, n_kx), multiply by two for symmetric -ky half of grid
+        # Integrate over kx (axis 1)
+        I_x = np.trapezoid(I_kx_x, kx_values, axis=1)  # shape: (n_x,)
+        # Integrate over x in log-space (accounts for log-spaced grid) -- includes Jacobian, factor of x
+        total_integral = np.trapezoid(I_x*x_values, np.log(x_values))  # scalar
+
+        print(f"Total integral: {total_integral:.6e}")
+
+        # -------------------------------------------------------
+        # 2. SAMPLING
+        #    Treat I_nn as an (unnormalized) 3D probability density
+        #    and draw N_samples points (x, kx, ky) from it.
+        # -------------------------------------------------------
+
+        # Build a normalized flat PDF, then a CDF
+        I_flat = I_nn.ravel()
+        I_flat_pos = np.clip(I_flat, 0, None)  # ensure non-negative
+        pdf = I_flat_pos / I_flat_pos.sum()  # normalize to sum to 1
+        cdf = np.cumsum(pdf)  # build CDF
+        cdf[-1] = 1.0  # Force exact upper bound — removes all floating point slop
+
+        # Draw uniform samples and find where they land in the CDF
+        uniform_samples = np.random.uniform(size=N_samples)  # Should use the global RNG...
+        sign_samples = np.random.choice([-1, 1], size=N_samples)
+        flat_indices = np.searchsorted(cdf, uniform_samples)  # shape: (N_samples,)
+
+        # Convert flat indices back to 3D grid indices
+        ix, ikx, iky = np.unravel_index(flat_indices, I_nn.shape)
+
+        # Look up the corresponding coordinate values
+        sampled_x = x_values[ix]
+        sampled_kx = kx_values[ikx]
+        sampled_ky = sign_samples*ky_values[iky]  # Apply a random sign to the ky values to simulate symmetric -ky values
+
+        # Actual longitudinal component of the momentum vector
+        # We know $k^+ = x p^+$, so we apply the lightcone non-diagonal metric and the on-shell condition, $k^2 = 0$
+        sampled_kz = (1/np.sqrt(2)) * (sampled_x*E - ((sampled_kx**2 + sampled_ky**2)/(2*sampled_x*E)))
+
+        # sampled_kz = 0  # Just give zero kz for now
+        # mag = np.sqrt(sampled_kx**2 + sampled_ky**2 + sampled_kz**2)
+        # emission_momentum = total_integral * np.column_stack([sampled_kx/mag, sampled_ky/mag, sampled_kz/mag])
+        # emission_momentum =  np.column_stack([sampled_x*E * sampled_kx / mag, sampled_x*E * sampled_ky / mag, sampled_x*E * sampled_kz / mag])
+        emission_momentum = np.column_stack([sampled_kx, sampled_ky, sampled_kz])
+
+        # # Apply random uniform jitter to point, to simulate continuous sampling
+        # sampled_x += np.random.uniform(-dx / 2, dx / 2, size=N_samples)
+        # sampled_kx += np.random.uniform(-dkx / 2, dkx / 2, size=N_samples)
+        # sampled_ky += np.random.uniform(-dky / 2, dky / 2, size=N_samples)
+
+        print(f"Sampled {N_samples} points.")
+        print(f"  x  range: [{sampled_x.min():.4e},  {sampled_x.max():.4e}]")
+        print(f"  kx range: [{sampled_kx.min():.3f}, {sampled_kx.max():.3f}]")
+        print(f"  ky range: [{sampled_ky.min():.3f}, {sampled_ky.max():.3f}]")
+
+        return total_integral, emission_momentum
+
 
 # ==============================================================================
 # Optimization tools
