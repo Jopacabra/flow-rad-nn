@@ -28,9 +28,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
 import vegas
 import h5py
+from pathlib import Path
 
 # Import medium property functions from plasma_interaction
-sys.path.append("/home/jo/PycharmProjects/ape")
+ape_dir = str(Path(__file__).resolve().parent[1])
+sys.path.append(ape_dir)
 import plasma_interaction
 
 

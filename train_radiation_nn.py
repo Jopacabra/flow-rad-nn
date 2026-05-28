@@ -40,7 +40,7 @@ class TrainingConfig:
     """
 
     # Data
-    data_file: str = "radiation_training_data.h5"
+    data_file: str = "data/radiation_training_data.h5"
     train_fraction: float = 0.8
     transform: str = "arcsinh"
 
@@ -68,8 +68,8 @@ class TrainingConfig:
     uv_kt_threshold: float = 10.0
 
     # Output
-    model_file: str = "radiation_emulator.pt"
-    normalization_file: str = "radiation_normalization.json"
+    model_file: str = "data/radiation_emulator.pt"
+    normalization_file: str = "data/radiation_normalization.json"
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -682,8 +682,8 @@ class RadiationEmulatorInference:
 
     def __init__(
             self,
-            model_file: str = "radiation_emulator.pt",
-            normalization_file: str = "radiation_normalization.json",
+            model_file: str = "data/radiation_emulator.pt",
+            normalization_file: str = "data/radiation_normalization.json",
             device: str = "cpu",
     ):
         """
@@ -1200,6 +1200,9 @@ if __name__ == "__main__":
     #     hidden_dim=512,  # Larger model
     #     n_layers=8,  # Deeper
     # )
+
+    # Make data directory, if not present
+    Path(config.model_file).parent.mkdir(exist_ok=True)
 
     if args.inference_only:
         # Demo inference only
