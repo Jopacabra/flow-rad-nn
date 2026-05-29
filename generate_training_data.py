@@ -917,6 +917,8 @@ if __name__ == "__main__":
                         help="Path to checkpoint file to resume from")
     parser.add_argument("--n-workers", type=int, default=4,
                         help="Number of workers to use for numerical integration")
+    parser.add_argument("--output", type=str, default="data/radiation_training_data.h5",
+                        help="Output file to ")
     args = parser.parse_args()
 
     # Configure the generation
@@ -955,7 +957,7 @@ if __name__ == "__main__":
         n_workers=args.n_workers,  # Number of cores for parallelized bits
 
         # Output
-        output_file="radiation_training_data.h5",
+        output_file=arg.output,
         checkpoint_every=3,
     )
 
