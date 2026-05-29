@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 import json
 import os
+import time
 
 
 # ==============================================================================
@@ -314,7 +315,7 @@ def compute_loss(
 
     """
     Positivity enforcement loss
-     
+
     (in normalized space, this is approximate)
     We don't use this, it's just here as a sample loss term
     """
@@ -322,7 +323,7 @@ def compute_loss(
 
     """
     k_y symmetry enforcement loss 
-    
+
     k_y symmetry is already built into the training data (mirrored samples).
     This is an optional soft loss penalty on top.
     """
@@ -337,7 +338,7 @@ def compute_loss(
 
     """
     UV decay enforcement loss
-    
+
     Enforces f(params, k_x, k_y) -> 0 as k_perp -> inf.
     """
     if config.lambda_uv > 0.0:
@@ -376,7 +377,7 @@ def compute_loss(
 
     """
     UV power law behavior enforcement loss
-    
+
     Enforces f(alpha * k_perp) / f(k_perp) ~ alpha^{-power}.
     Robust to overall normalisation; constrains the UV shape directly.
     """
@@ -414,7 +415,7 @@ def compute_loss(
         log_ratio = torch.log(torch.abs(f_high) + 1e-30) - torch.log(torch.abs(f_low) + 1e-30)
         target_log_ratio = torch.full_like(log_ratio, torch.log(torch.tensor(expected_ratio)))
 
-        uv_power_law =  nn.functional.mse_loss(log_ratio, target_log_ratio)
+        uv_power_law = nn.functional.mse_loss(log_ratio, target_log_ratio)
     else:
         uv_power_law = torch.tensor(0.0, device=inputs.device)
 
@@ -622,7 +623,7 @@ def train_model(config: TrainingConfig):
                 f"Val Loss: {val_metrics['loss']:.4e} | "
                 f"Train MSE: {train_metrics['mse']:.4e} | "
                 f"Val MSE: {val_metrics['mse']:.4e} | "
-                f"MSE Ratio: {(train_metrics['mse']/val_metrics['mse']):.4e} | "
+                f"MSE Ratio: {(train_metrics['mse'] / val_metrics['mse']):.4e} | "
                 f"LR: {current_lr:.2e}"
             )
 
@@ -735,6 +736,16 @@ class RadiationEmulatorInference:
             self.model.load_state_dict(state_dict)
         self.model.eval()
 
+        # Pre-move normalization tensors to the target device once,
+        # so repeated predict() calls don't trigger device copies.
+        self.X_mean = self.X_mean.to(device)
+        self.X_std = self.X_std.to(device)
+
+        # Optionally compile the model for faster repeated inference
+        # (requires PyTorch >= 2.0; falls back silently on older versions)
+        if hasattr(torch, 'compile'):
+            self.model = torch.compile(self.model)
+
         print(f"Loaded model from {model_file}")
         print(f"  Validation loss: {checkpoint['val_loss']:.4e}")
         print(f"  Trained for {checkpoint['epoch'] + 1} epochs")
@@ -751,67 +762,60 @@ class RadiationEmulatorInference:
             T: np.ndarray,
             g: np.ndarray,
     ) -> np.ndarray:
-        """
-        Predict radiation intensity for a batch of input points.
+        # Stack inputs directly into a contiguous float32 C-array,
+        # then wrap with from_numpy (zero-copy) before sending to device.
+        inputs = np.column_stack([x, kx, ky, E, z0, zf, u_perp, T, g]).astype(
+            np.float32, order='C', copy=False
+        )
+        inputs_tensor = torch.from_numpy(inputs).to(self.device, non_blocking=True)
 
-        All inputs should be 1D numpy arrays of the same length.
+        # Normalize (X_mean / X_std are already on self.device)
+        inputs_norm = (inputs_tensor - self.X_mean) / self.X_std
 
-        Parameters
-        ----------
-        x : array-like
-            Momentum fraction
-        kx : array-like
-            Transverse momentum k_x (GeV)
-        ky : array-like
-            Transverse momentum k_y (GeV)
-        E : array-like
-            Parton energy (GeV)
-        z0 : array-like
-            Initial longitudinal position (fm)
-        zf : array-like
-            Final longitudinal position (fm)
-        u_perp : array-like
-            Transverse flow velocity magnitude
-        T : array-like
-            Temperature (GeV)
-        g : array-like
-            Coupling constant
-
-        Returns
-        -------
-        np.ndarray
-            Predicted radiation intensity I (NOT including CF factor)
-        """
-        # Stack inputs
-        inputs = np.column_stack([x, kx, ky, E, z0, zf, u_perp, T, g]).astype(np.float32)
-
-        # Convert to tensor
-        inputs_tensor = torch.from_numpy(inputs).to(self.device)
-
-        # Normalize
-        inputs_norm = (inputs_tensor - self.X_mean.to(self.device)) / self.X_std.to(self.device)
-
-        # Predict
         with torch.no_grad():
             predictions_norm = self.model(inputs_norm).squeeze()
 
-        # Denormalize
-        predictions_transformed = predictions_norm.cpu().numpy() * self.y_std + self.y_mean
+        # Stay on CPU as a numpy array; avoid an extra .cpu() call
+        # by using the tensor directly when device is already CPU.
+        pn = predictions_norm if self.device == "cpu" else predictions_norm.cpu()
+        predictions_transformed = pn.numpy() * self.y_std + self.y_mean
 
-        # Inverse log transform
         if self.transform == "log":
-            # y_transformed = sign(y) * log(|y| + epsilon)
-            # For simplicity, assume y > 0 most of the time (physical intensity)
-            # Inverse: y = exp(y_transformed) - epsilon
-            # But we stored sign*log(|y|+eps), so need to handle sign
-            # Approximation: exp(pred) - epsilon (works when pred > 0)
             predictions = np.exp(np.abs(predictions_transformed)) - self.epsilon
             predictions = np.sign(predictions_transformed) * predictions
         elif self.transform == "arcsinh":
-            # Inverse of transform above
             predictions = self.f0 * np.sinh(predictions_transformed)
         else:
-            # No transformation, so predictions are already in physical units
+            predictions = predictions_transformed
+
+        return predictions
+
+    def predict_raw(self, inputs: np.ndarray) -> np.ndarray:
+        """
+        Faster entry-point when the caller can supply a pre-stacked
+        (N, 9) float32 array in feature order [x, kx, ky, E, z0, zf, u_perp, T, g].
+
+        Skips the np.column_stack overhead, which matters when predict()
+        is called thousands of times with the same grid layout.
+        """
+        inputs_tensor = torch.from_numpy(
+            np.asarray(inputs, dtype=np.float32, order='C')
+        ).to(self.device, non_blocking=True)
+
+        inputs_norm = (inputs_tensor - self.X_mean) / self.X_std
+
+        with torch.no_grad():
+            predictions_norm = self.model(inputs_norm).squeeze()
+
+        pn = predictions_norm if self.device == "cpu" else predictions_norm.cpu()
+        predictions_transformed = pn.numpy() * self.y_std + self.y_mean
+
+        if self.transform == "log":
+            predictions = np.exp(np.abs(predictions_transformed)) - self.epsilon
+            predictions = np.sign(predictions_transformed) * predictions
+        elif self.transform == "arcsinh":
+            predictions = self.f0 * np.sinh(predictions_transformed)
+        else:
             predictions = predictions_transformed
 
         return predictions
@@ -843,15 +847,15 @@ class RadiationEmulatorInference:
         )
 
     def sample_emission(self,
-            E: np.ndarray,
-            z0: np.ndarray,
-            zf: np.ndarray,
-            u_perp: np.ndarray,
-            T: np.ndarray,
-            g: np.ndarray,
-            N_samples: int = 1,
-            rng: np.random._generator = np.random.default_rng()
-    ) -> (float, np.ndarray):
+                        E: np.ndarray,
+                        z0: np.ndarray,
+                        zf: np.ndarray,
+                        u_perp: np.ndarray,
+                        T: np.ndarray,
+                        g: np.ndarray,
+                        N_samples: int = 1,
+                        rng: np.random._generator = np.random.default_rng()
+                        ) -> (float, np.ndarray):
         """
         Computes a complete grid in x, kx, ky and returns a 3D inverse CDF sample value for x, kx, ky vector.
         """
@@ -859,23 +863,20 @@ class RadiationEmulatorInference:
         # Grid of x, kx, ky values
         max_kx_ky = 5  # Maybe should be dependent on energy, needs testing.
         x_values = np.logspace(-4, 0, 10)
-        kx_values = np.linspace(-max_kx_ky, max_kx_ky, 100)
-        ky_values = np.linspace(0, max_kx_ky, 100)
+        kx_values = np.linspace(-max_kx_ky, max_kx_ky, 50)
+        ky_values = np.linspace(0, max_kx_ky, 50)
         x_grid, kx_grid, ky_grid = np.meshgrid(x_values, kx_values, ky_values, indexing='ij')
         n_pts = x_grid.size
 
-        # Predict intensity spectrum points
-        I_nn_flat = self.predict(
-            x=x_grid.ravel(),
-            kx=kx_grid.ravel(),
-            ky=ky_grid.ravel(),
-            E=np.full(n_pts, E),
-            z0=np.full(n_pts, z0),
-            zf=np.full(n_pts, zf),
-            u_perp=np.full(n_pts, u_perp),
-            T=np.full(n_pts, T),
-            g=np.full(n_pts, g),
-        )
+        # Build input grid once
+        grid_inputs = np.column_stack([
+            x_grid.ravel(), kx_grid.ravel(), ky_grid.ravel(),
+            np.full(n_pts, E), np.full(n_pts, z0), np.full(n_pts, zf),
+            np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
+        ]).astype(np.float32)
+
+        # Get predictions
+        I_nn_flat = self.predict_raw(grid_inputs)
 
         # --- Reshape flat predictions back onto the 3D grid ---
         I_nn = I_nn_flat.reshape(x_grid.shape)  # shape: (n_x, n_kx, n_ky)
@@ -886,13 +887,14 @@ class RadiationEmulatorInference:
         #    np.trapz(y, x) integrates y along the last axis by default.
         # -------------------------------------------------------
         # Integrate over ky (axis 2)
-        I_kx_x = 2*np.trapezoid(I_nn, ky_values, axis=2)  # shape: (n_x, n_kx), multiply by two for symmetric -ky half of grid
+        I_kx_x = 2 * np.trapezoid(I_nn, ky_values,
+                                  axis=2)  # shape: (n_x, n_kx), multiply by two for symmetric -ky half of grid
         # Integrate over kx (axis 1)
         I_x = np.trapezoid(I_kx_x, kx_values, axis=1)  # shape: (n_x,)
         # Integrate over x in log-space (accounts for log-spaced grid) -- includes Jacobian, factor of x
-        total_integral = np.trapezoid(I_x*x_values, np.log(x_values))  # scalar
+        total_integral = np.trapezoid(I_x * x_values, np.log(x_values))  # scalar
 
-        print(f"Total integral: {total_integral:.6e}")
+        # print(f"Total integral: {total_integral:.6e}")
 
         # -------------------------------------------------------
         # 2. SAMPLING
@@ -918,11 +920,12 @@ class RadiationEmulatorInference:
         # Look up the corresponding coordinate values
         sampled_x = x_values[ix]
         sampled_kx = kx_values[ikx]
-        sampled_ky = sign_samples*ky_values[iky]  # Apply a random sign to the ky values to simulate symmetric -ky values
+        sampled_ky = sign_samples * ky_values[
+            iky]  # Apply a random sign to the ky values to simulate symmetric -ky values
 
         # Actual longitudinal component of the momentum vector
         # We know $k^+ = x p^+$, so we apply the lightcone non-diagonal metric and the on-shell condition, $k^2 = 0$
-        sampled_kz = (1/np.sqrt(2)) * (sampled_x*E - ((sampled_kx**2 + sampled_ky**2)/(2*sampled_x*E)))
+        sampled_kz = (1 / np.sqrt(2)) * (sampled_x * E - ((sampled_kx ** 2 + sampled_ky ** 2) / (2 * sampled_x * E)))
 
         # sampled_kz = 0  # Just give zero kz for now
         # mag = np.sqrt(sampled_kx**2 + sampled_ky**2 + sampled_kz**2)
@@ -935,10 +938,10 @@ class RadiationEmulatorInference:
         # sampled_kx += np.random.uniform(-dkx / 2, dkx / 2, size=N_samples)
         # sampled_ky += np.random.uniform(-dky / 2, dky / 2, size=N_samples)
 
-        print(f"Sampled {N_samples} points.")
-        print(f"  x  range: [{sampled_x.min():.4e},  {sampled_x.max():.4e}]")
-        print(f"  kx range: [{sampled_kx.min():.3f}, {sampled_kx.max():.3f}]")
-        print(f"  ky range: [{sampled_ky.min():.3f}, {sampled_ky.max():.3f}]")
+        # print(f"Sampled {N_samples} points.")
+        # print(f"  x  range: [{sampled_x.min():.4e},  {sampled_x.max():.4e}]")
+        # print(f"  kx range: [{sampled_kx.min():.3f}, {sampled_kx.max():.3f}]")
+        # print(f"  ky range: [{sampled_ky.min():.3f}, {sampled_ky.max():.3f}]")
 
         if N_samples == 1:
             return total_integral, np.reshape(emission_momentum, 3)
@@ -1176,9 +1179,11 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=default_config.n_epochs, help="Number of training epochs")
     parser.add_argument("--hidden-dim", type=int, default=default_config.hidden_dim, help="Hidden layer dimension")
     parser.add_argument("--n-layers", type=int, default=default_config.n_layers, help="Number of hidden layers")
-    parser.add_argument("--learning-rate", type=float, default=default_config.learning_rate, help="Initial learning rate")
+    parser.add_argument("--learning-rate", type=float, default=default_config.learning_rate,
+                        help="Initial learning rate")
     parser.add_argument("--find-lr", action="store_true", help="Run LR range test and exit")
-    parser.add_argument("--n-workers", type=int, default=default_config.num_workers, help="Number of workers for data loading")
+    parser.add_argument("--n-workers", type=int, default=default_config.num_workers,
+                        help="Number of workers for data loading")
     args = parser.parse_args()
 
     config = TrainingConfig(
