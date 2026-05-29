@@ -850,6 +850,7 @@ class RadiationEmulatorInference:
             T: np.ndarray,
             g: np.ndarray,
             N_samples: int = 1,
+            rng: np.random._generator = np.random.default_rng()
     ) -> (float, np.ndarray):
         """
         Computes a complete grid in x, kx, ky and returns a 3D inverse CDF sample value for x, kx, ky vector.
@@ -857,7 +858,7 @@ class RadiationEmulatorInference:
 
         # Grid of x, kx, ky values
         max_kx_ky = 5  # Maybe should be dependent on energy, needs testing.
-        x_values = np.logspace(-4, 0, 100)
+        x_values = np.logspace(-4, 0, 10)
         kx_values = np.linspace(-max_kx_ky, max_kx_ky, 100)
         ky_values = np.linspace(0, max_kx_ky, 100)
         x_grid, kx_grid, ky_grid = np.meshgrid(x_values, kx_values, ky_values, indexing='ij')
@@ -907,8 +908,8 @@ class RadiationEmulatorInference:
         cdf[-1] = 1.0  # Force exact upper bound — removes all floating point slop
 
         # Draw uniform samples and find where they land in the CDF
-        uniform_samples = np.random.uniform(size=N_samples)  # Should use the global RNG...
-        sign_samples = np.random.choice([-1, 1], size=N_samples)
+        uniform_samples = rng.uniform(size=N_samples)  # Should use the global RNG...
+        sign_samples = rng.choice([-1, 1], size=N_samples)
         flat_indices = np.searchsorted(cdf, uniform_samples)  # shape: (N_samples,)
 
         # Convert flat indices back to 3D grid indices
@@ -939,7 +940,10 @@ class RadiationEmulatorInference:
         print(f"  kx range: [{sampled_kx.min():.3f}, {sampled_kx.max():.3f}]")
         print(f"  ky range: [{sampled_ky.min():.3f}, {sampled_ky.max():.3f}]")
 
-        return total_integral, emission_momentum
+        if N_samples == 1:
+            return total_integral, np.reshape(emission_momentum, 3)
+        else:
+            return total_integral, emission_momentum
 
 
 # ==============================================================================
