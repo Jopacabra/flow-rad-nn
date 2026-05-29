@@ -31,7 +31,7 @@ import h5py
 from pathlib import Path
 
 # Import medium property functions from plasma_interaction
-ape_dir = str(Path(__file__).resolve().parent[1])
+ape_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.append(ape_dir)
 import plasma_interaction
 
