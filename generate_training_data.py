@@ -915,6 +915,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate training data for radiation PINN")
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint file to resume from")
+    parser.add_argument("--n-workers", type=int, default=4,
+                        help="Number of workers to use for numerical integration")
     args = parser.parse_args()
 
     # Configure the generation
@@ -950,7 +952,7 @@ if __name__ == "__main__":
         weight_coverage=0.5,  # Weight for undersampled regions
 
         # Parallelization
-        n_workers=4,  # Number of cores for parallelized bits
+        n_workers=args.n_workers,  # Number of cores for parallelized bits
 
         # Output
         output_file="radiation_training_data.h5",
