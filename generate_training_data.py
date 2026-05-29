@@ -502,11 +502,7 @@ class TrainingDataGenerator:
         self.sampler = ImportanceSampler(config)
 
         # Persistent Sobol sampler — advances across all rounds so points are never repeated.
-        # Seeded differently from the initial LHS sampler (seed=42) to avoid overlap.
-        self._sobol_sampler = qmc.Sobol(d=len(get_ranges(config)))  # No seed, resuming works
-        # Fast-forward past the initial round's worth of points so the sequence
-        # never overlaps with generate_lhs_samples (which also uses Sobol, seed=42).
-        # (Different seeds already guarantee no overlap, but this is explicit.)
+        self._sobol_sampler = qmc.Sobol(d=len(get_ranges(config)))  # No seed, resuming starts from a different point
 
         # Results storage
         self.all_points = []
@@ -918,7 +914,13 @@ if __name__ == "__main__":
     parser.add_argument("--n-workers", type=int, default=4,
                         help="Number of workers to use for numerical integration")
     parser.add_argument("--output", type=str, default="data/radiation_training_data.h5",
-                        help="Output file to ")
+                        help="Output file to save to")
+    parser.add_argument("--n-initial", type=int, default=131072,
+                        help="Number of initial Latin Hypercube Sampled points before adaptive rounds")
+    parser.add_argument("--n-sobol", type=int, default=131072,
+                        help="Number of Sobol Sampled points per adaptive round. Use powers of 2, e.g. (2^n)")
+    parser.add_argument("--n-adaptive", type=int, default=0,
+                        help="Number of Importance Sampled points per adaptive round. Gets expensive to find points...")
     args = parser.parse_args()
 
     # Configure the generation
@@ -943,10 +945,10 @@ if __name__ == "__main__":
         neval=10_000,
 
         # Sampling
-        n_initial=131072,  # Use powers of 2 for optimal sobol sampling
-        n_adaptive_per_round=0,
+        n_initial=args.n_initial,
+        n_adaptive_per_round=args.n_adaptive,
         n_rounds=2500,  # Increase for more data
-        n_sobol_per_round=8192,  # Number drawn from Sobol sequence each round
+        n_sobol_per_round=args.n_sobol,  # Number drawn from Sobol sequence each round. Powers of 2 for optimal properties.
 
         # Importance weights
         weight_uncertainty=0.1,  # Weight for high MC uncertainty regions
