@@ -959,7 +959,7 @@ if __name__ == "__main__":
         n_workers=args.n_workers,  # Number of cores for parallelized bits
 
         # Output
-        output_file=arg.output,
+        output_file=args.output,
         checkpoint_every=3,
     )
 
