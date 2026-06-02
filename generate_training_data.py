@@ -960,7 +960,7 @@ if __name__ == "__main__":
 
         # Output
         output_file=args.output,
-        checkpoint_every=3,
+        checkpoint_every=1,
     )
 
     # Run generation

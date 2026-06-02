@@ -29,6 +29,7 @@ from typing import Optional, Tuple, Dict
 import json
 import os
 import time
+from pathlib import Path
 
 
 # ==============================================================================
@@ -846,6 +847,43 @@ class RadiationEmulatorInference:
             g=inputs['g'],
         )
 
+    def compute_grid(self,
+                        E: float,
+                        z0: float,
+                        zf: float,
+                        u_perp: float,
+                        T: float,
+                        g: float,
+                        x_values: np.ndarray,
+                        kx_values: np.ndarray,
+                        ky_values: np.ndarray
+                        ) -> (np.ndarray):
+        """
+        Computes a complete grid of dN/(dxdkxdky) in x, kx, ky and returns the grid.
+        """
+
+
+        x_grid, kx_grid, ky_grid = np.meshgrid(x_values, kx_values, ky_values, indexing='ij')
+        n_pts = x_grid.size
+
+        # Build input grid once
+        grid_inputs = np.column_stack([
+            x_grid.ravel(), kx_grid.ravel(), ky_grid.ravel(),
+            np.full(n_pts, E), np.full(n_pts, z0), np.full(n_pts, zf),
+            np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
+        ]).astype(np.float32)
+
+        # Get predictions
+        I_nn_flat = self.predict_raw(grid_inputs)
+
+        # --- Reshape flat predictions back onto the 3D grid ---
+        I_nn = I_nn_flat.reshape(x_grid.shape)  # shape: (n_x, n_kx, n_ky)
+
+        # --- Compute dN/dxdkxdky ---
+        N_nn = I_nn / (E*x_grid)  # Still needs casimir factor
+
+        return N_nn
+
     def sample_emission(self,
                         E: np.ndarray,
                         z0: np.ndarray,
@@ -854,7 +892,7 @@ class RadiationEmulatorInference:
                         T: np.ndarray,
                         g: np.ndarray,
                         N_samples: int = 1,
-                        rng: np.random._generator = np.random.default_rng()
+                        rng: np.random.Generator = np.random.default_rng()
                         ) -> (float, np.ndarray):
         """
         Computes a complete grid in x, kx, ky and returns a 3D inverse CDF sample value for x, kx, ky vector.
