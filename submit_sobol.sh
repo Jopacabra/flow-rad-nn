@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=rad_data_gen
-#SBATCH --array=0-1   # Each batch has a specific seed -- deterministic samples for given n-points & array val
+#SBATCH --array=0-9   # Each batch has a specific seed -- deterministic samples for given n-points & array val
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8     # Must match --n-workers below
-#SBATCH --mem-per-cpu=1G
-#SBATCH --time=1-00:00:00
+#SBATCH --mem-per-cpu=2G
+#SBATCH --time=0-01:00:00
 #SBATCH --partition=normal
 #SBATCH --output=logs/sobol_%A_%a.out
 #SBATCH --error=logs/sobol_%A_%a.err
@@ -23,6 +23,6 @@ mkdir -p logs data/batches
 
 srun python generate_sobol_samples.py \
     --batch-id   $SLURM_ARRAY_TASK_ID \
-    --n-points   2097152 \
+    --n-points   65536 \
     --n-workers  $SLURM_CPUS_PER_TASK \
     --output-dir data/batches
