@@ -533,7 +533,7 @@ class TrainingDataGenerator:
         print("=" * 70)
 
         with h5py.File(filename, 'r') as f:
-            # Load all features - note: file contains mirrored ky data
+            # Load all features - note: file does not contain mirrored ky data
             x = f['x'][:]
             kx = f['kx'][:]
             ky = f['ky'][:]
@@ -549,22 +549,22 @@ class TrainingDataGenerator:
             weights = f['weight'][:]
 
             n_total = len(I)
-            n_original = f.attrs.get('n_original', n_total // 2)
+            n_original = f.attrs.get('n_original', n_total )
 
-        # Only keep the original points (not the mirrored ky ones)
-        # The mirrored points are the second half of the array
-        x = x[:n_original]
-        kx = kx[:n_original]
-        ky = ky[:n_original]
-        E = E[:n_original]
-        z0 = z0[:n_original]
-        zf = zf[:n_original]
-        u_perp = u_perp[:n_original]
-        T = T[:n_original]
-        g = g[:n_original]
-        I = I[:n_original]
-        I_err = I_err[:n_original]
-        weights = weights[:n_original]
+        # # Only keep the original points (not the mirrored ky ones)
+        # # The mirrored points are the second half of the array
+        # x = x[:n_original]
+        # kx = kx[:n_original]
+        # ky = ky[:n_original]
+        # E = E[:n_original]
+        # z0 = z0[:n_original]
+        # zf = zf[:n_original]
+        # u_perp = u_perp[:n_original]
+        # T = T[:n_original]
+        # g = g[:n_original]
+        # I = I[:n_original]
+        # I_err = I_err[:n_original]
+        # weights = weights[:n_original]
 
         # Stack into points array
         points = np.column_stack([x, kx, ky, E, z0, zf, u_perp, T, g])
@@ -586,7 +586,7 @@ class TrainingDataGenerator:
         # Add to importance sampler
         self.sampler.add_samples(points, I, I_err)
 
-        print(f"  Loaded {len(I)} original samples (excluding mirrored ky)")
+        print(f"  Loaded {len(I)} original samples")
         print(f"  Value range: [{I.min():.4e}, {I.max():.4e}]")
         print(f"  Mean error: {I_err.mean():.4e}")
 
@@ -805,15 +805,20 @@ class TrainingDataGenerator:
         errors = np.array(self.all_errors)
         weights = np.array(self.all_weights)
 
-        # Also save mirrored ky data (exploit symmetry)
-        points_mirror = points.copy()
-        points_mirror[:, 2] = -points_mirror[:, 2]  # ky → -ky
+        # # Also save mirrored ky data (exploit symmetry)
+        # points_mirror = points.copy()
+        # points_mirror[:, 2] = -points_mirror[:, 2]  # ky → -ky
+        #
+        # # Combine original and mirrored
+        # points_full = np.vstack([points, points_mirror])
+        # values_full = np.concatenate([values, values])
+        # errors_full = np.concatenate([errors, errors])
+        # weights_full = np.concatenate([weights, weights])
 
-        # Combine original and mirrored
-        points_full = np.vstack([points, points_mirror])
-        values_full = np.concatenate([values, values])
-        errors_full = np.concatenate([errors, errors])
-        weights_full = np.concatenate([weights, weights])
+        points_full = points
+        values_full = values
+        errors_full = errors
+        weights_full = weights
 
         with h5py.File(filename, 'w') as f:
             # Input features (order: x, kx, ky, E, z0, zf, u_perp, T, g)
@@ -838,7 +843,7 @@ class TrainingDataGenerator:
             f.attrs['soft_pids'] = SOFT_PIDS
             f.attrs['description'] = (
                 'Training data for medium-induced radiation PINN. '
-                'Includes original samples and ky-mirrored samples (symmetry). '
+                'Includes original samples only. '
                 'CF factor NOT included - multiply by CF at runtime '
                 '(4/3 for quarks, 3 for gluons). '
                 'Uses plasma_interaction.mu_DeBye() for Debye mass and '

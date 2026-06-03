@@ -20,7 +20,7 @@ export OPENBLAS_NUM_THREADS=1
 
 mkdir -p logs data/batches
 
-srun python generate_sobol_batch.py \
+srun python generate_sobol_samples.py \
     --batch-id   $SLURM_ARRAY_TASK_ID \
     --n-points   4096 \
     --n-workers  8 \

@@ -326,7 +326,7 @@ def run_batch(n_points: int, batch_id: int, n_workers: int, output_file: str):
             "CF factor NOT included (multiply by 4/3 quarks, 3 gluons at runtime)."
         )
 
-    print(f"Saved {len(vals_full)} samples ({n_valid} original + {n_valid} mirrored) "
+    print(f"Saved {len(vals_full)} samples ({n_valid} original) "
           f"to {output_file}", flush=True)
 
 
@@ -341,7 +341,7 @@ if __name__ == "__main__":
         description="Generate a Sobol-sampled batch of radiation training data."
     )
     parser.add_argument("--batch-id",  type=int, default=0,
-                        help="Batch index (used as Sobol scramble seed; use "
+                        help="Batch index; use "
                              "$SLURM_ARRAY_TASK_ID in a job array)")
     parser.add_argument("--n-points",  type=int, default=4096,
                         help="Number of Sobol points to compute (powers of 2 recommended)")
