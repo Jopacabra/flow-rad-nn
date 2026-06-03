@@ -21,6 +21,8 @@ Usage:
 
 import argparse
 import sys
+import os
+from pathlib import Path
 import time
 import numpy as np
 import matplotlib.pyplot as plt
@@ -28,8 +30,8 @@ import matplotlib.colors as mcolors
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Allow running from the flow-rad-nn directory
-sys.path.insert(0, '.')
-sys.path.insert(0, '/home/jo/PycharmProjects/ape')  # for plasma_interaction
+ape_dir = str(Path(__file__).resolve().parent.parent)
+sys.path.append(ape_dir)
 
 from generate_training_data import integrate_point, SamplingConfig
 from train_radiation_nn import RadiationEmulatorInference

@@ -36,7 +36,7 @@ def merge(input_files: list[str], output_file: str):
     # points_mirror['ky'] = ky_mirror
 
     print(
-        f"Writing {output_file} ({total_original} original + {total_original} mirrored = {2 * total_original} total)...")
+        f"Writing {output_file} ({total_original} original samples)...")
     with h5py.File(output_file, 'w') as f:
         for key in DATASETS:
             full = combined[key]
