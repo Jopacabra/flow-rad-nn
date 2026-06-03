@@ -283,9 +283,9 @@ def main():
     parser.add_argument('--ky-max',  type=float, default=DEFAULTS['ky_max'], help='ky grid range [0, ky_max] (GeV)')
     parser.add_argument('--workers', type=int,   default=4,                  help='Parallel workers for reference computation')
     parser.add_argument('--model-file',
-                        type=str, default='radiation_emulator.pt')
+                        type=str, default='data/radiation_emulator.pt')
     parser.add_argument('--normalization-file',
-                        type=str, default='radiation_normalization.json')
+                        type=str, default='data/radiation_normalization.json')
     parser.add_argument('--output',  type=str,   default='kxky_comparison.png')
     args = parser.parse_args()
 
