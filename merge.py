@@ -49,9 +49,18 @@ def merge(input_files: list[str], output_file: str):
 
 
 if __name__ == "__main__":
+    # Get command line args
     parser = argparse.ArgumentParser()
     parser.add_argument("inputs", nargs='+', help="Input HDF5 batch files")
     parser.add_argument("--output", default="radiation_training_data_combined.h5")
     args = parser.parse_args()
 
+    # Merga all files, saving to requested file
     merge(args.inputs, args.output)
+
+    # Load the saved file and check for infs and nans.
+    with h5py.File(args.output, "r") as f:
+        for key in ['x', 'kx', 'ky', 'E', 'z0', 'zf', 'u_perp', 'T', 'g', 'I', 'I_err', 'weight']:
+            data = f[key][:]
+            n_nan = np.sum(~np.isfinite(data))
+            print(f"{key:10s}: {n_nan:,} non-finite values out of {len(data):,}")

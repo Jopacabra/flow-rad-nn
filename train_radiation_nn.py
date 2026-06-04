@@ -164,7 +164,8 @@ class RadiationDataset(Dataset):
         # Normalize weights to have mean 1
         self.weights = torch.tensor(self.weights / self.weights.mean())
 
-        print(f"Loaded {len(self.y)} samples from {data_file}")
+        print(f"Loaded {len(self.Y)} samples from {data_file}")
+        print(f"Keeping {len(self.y)} valid samples from {data_file}")
         print(f"Input shape: {self.X.shape}")
         print(f"Output range: [{self.y.min():.4e}, {self.y.max():.4e}]")
 
