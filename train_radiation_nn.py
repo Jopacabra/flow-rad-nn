@@ -31,6 +31,8 @@ import os
 import time
 from pathlib import Path
 
+# Set use of float32 for matmuls to improve performance. Trial feature -- may impact accuracy, depending on problem.
+torch.set_float32_matmul_precision('high')
 
 # ==============================================================================
 # Configuration
