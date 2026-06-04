@@ -121,6 +121,9 @@ class RadiationDataset(Dataset):
             # Store metadata
             self.n_samples = f.attrs.get('n_samples', len(self.y))
 
+        # Print raw values
+        print(f"Loaded {len(self.y)} raw samples from {data_file}")
+
         # Filter out any NaN or Inf values
         valid_mask = (
                 np.isfinite(self.y) &
@@ -164,7 +167,6 @@ class RadiationDataset(Dataset):
         # Normalize weights to have mean 1
         self.weights = torch.tensor(self.weights / self.weights.mean())
 
-        print(f"Loaded {len(self.Y)} samples from {data_file}")
         print(f"Keeping {len(self.y)} valid samples from {data_file}")
         print(f"Input shape: {self.X.shape}")
         print(f"Output range: [{self.y.min():.4e}, {self.y.max():.4e}]")
