@@ -51,6 +51,7 @@ DEFAULTS = dict(
     n_ky    = 30,
     kx_max  = 4.0,
     ky_max  = 4.0,
+    x_values = [0.3, 0.7],   # fixed x values for the x-slice plots
 )
 
 # Integration config — use moderate accuracy for the test grid.
@@ -211,7 +212,7 @@ def make_comparison_plot(
         ky_values, kx_values, rel_err,
         levels=[0.5], colors='yellow', linewidths=1.0, linestyles='--',
     )
-    axes[0].set_title('Reference (Vegas integrator)\n'
+    axes[0].set_title('Reference (Vegas integrator)'
                       r'dashed = $\sigma_\mathrm{MC}/|I| > 0.5$')
 
     # --- Panel 1: NN ---
@@ -264,6 +265,123 @@ def make_comparison_plot(
 
 
 # ==============================================================================
+# Combined multi-row plot
+# ==============================================================================
+def make_combined_plot(
+    kx_values, ky_values,
+    rows: list,          # list of (params, I_ref, I_err, I_nn)
+    output_file: str,
+):
+    """
+    Plot all comparison rows in a single figure.
+
+    Each entry in *rows* produces one row of three panels:
+      [col 0] Reference integrator
+      [col 1] NN emulator
+      [col 2] Relative residual
+    The colour scale for the reference/NN panels is shared within each row
+    (based on that row's reference 98th percentile).  The residual scale is
+    fixed at ±2 for every row so rows are directly comparable.
+
+    Parameters
+    ----------
+    rows : list of (params dict, I_ref ndarray, I_err ndarray, I_nn ndarray)
+    """
+    n_rows = len(rows)
+    fig, axes = plt.subplots(
+        n_rows, 3,
+        figsize=(16, 5 * n_rows),
+        squeeze=False,
+    )
+
+    extent = [ky_values[0], ky_values[-1], kx_values[0], kx_values[-1]]
+    imshow_kwargs = dict(
+        origin='lower',
+        aspect='auto',
+        extent=extent,
+        interpolation='nearest',
+    )
+
+    for row_idx, (params, I_ref, I_err, I_nn) in enumerate(rows):
+        ax_ref, ax_nn, ax_res = axes[row_idx]
+
+        # Per-row colour scale
+        ref_max = np.nanpercentile(np.abs(I_ref), 98)
+        vmin, vmax = -ref_max, ref_max
+
+        with np.errstate(invalid='ignore', divide='ignore'):
+            rel_residual = (I_nn - I_ref) / (np.abs(I_ref) + 1e-30)
+            rel_residual[~np.isfinite(rel_residual)] = np.nan
+
+        # --- Reference panel ---
+        im0 = ax_ref.imshow(
+            I_ref, cmap='RdBu_r', vmin=vmin, vmax=vmax, **imshow_kwargs
+        )
+        with np.errstate(invalid='ignore', divide='ignore'):
+            rel_err = I_err / (np.abs(I_ref) + 1e-30)
+        ax_ref.contour(
+            ky_values, kx_values, rel_err,
+            levels=[0.5], colors='yellow', linewidths=1.0, linestyles='--',
+        )
+        ax_ref.set_title('Reference (Vegas integrator)\n'
+                         r'dashed = $\sigma_\mathrm{MC}/|I| > 0.5$')
+        ax_ref.set_xlabel(r'$k_y$ (GeV)')
+        ax_ref.set_ylabel(r'$k_x$ (GeV)')
+        fig.colorbar(im0, ax=ax_ref, label=r'$I$ (no $C_F$)')
+
+        # --- NN panel ---
+        im1 = ax_nn.imshow(
+            I_nn, cmap='RdBu_r', vmin=vmin, vmax=vmax, **imshow_kwargs
+        )
+        ax_nn.set_title('NN emulator')
+        ax_nn.set_xlabel(r'$k_y$ (GeV)')
+        ax_nn.set_ylabel(r'$k_x$ (GeV)')
+        fig.colorbar(im1, ax=ax_nn, label=r'$I$ (no $C_F$)')
+
+        # --- Residual panel ---
+        im2 = ax_res.imshow(
+            rel_residual, cmap='coolwarm', vmin=-2, vmax=2, **imshow_kwargs
+        )
+        ax_res.set_title(
+            r'Relative residual $(I_\mathrm{NN} - I_\mathrm{ref})/|I_\mathrm{ref}|$'
+        )
+        ax_res.set_xlabel(r'$k_y$ (GeV)')
+        ax_res.set_ylabel(r'$k_x$ (GeV)')
+        fig.colorbar(im2, ax=ax_res, label='Relative residual')
+
+        # Row label on the left spine
+        ax_ref.set_ylabel(
+            f"$x={params['x']:.2f}$, " + '\n\n' + r'$k_x$ (GeV)',
+            fontsize=9,
+        )
+
+        # Console statistics
+        valid = np.isfinite(I_ref) & np.isfinite(I_nn)
+        if valid.sum() > 0:
+            mae = np.mean(np.abs(I_nn[valid] - I_ref[valid]))
+            mre = np.nanmedian(np.abs(rel_residual[valid]))
+            print(f"\n  x={params['x']:.3f}  MAE={mae:.4e}  "
+                  f"Median|rel|={mre:.3f} ({mre*100:.1f}%)  "
+                  f"|rel|>0.5: {(np.abs(rel_residual[valid]) > 0.5).sum()}/{valid.sum()}")
+
+    # Total parameter string label as supertitle
+    param_str = (
+        # f"$x={params['x']:.2f}$, "
+        f"$E={params['E']:.1f}$ GeV, "
+        f"$z_0={params['z0']:.1f}$ fm, "
+        f"$z_f={params['zf']:.1f}$ fm, "
+        f"$u_\\perp={params['u_perp']:.2f}$, "
+        f"$T={params['T']:.3f}$ GeV, "
+        f"$g={params['g']:.2f}$"
+    )
+    fig.suptitle(param_str, fontsize=9)
+    plt.tight_layout()
+    plt.savefig(output_file, dpi=150, bbox_inches='tight')
+    print(f"\n  Combined plot saved to: {output_file}")
+    plt.show()
+
+
+# ==============================================================================
 # Main
 # ==============================================================================
 def main():
@@ -282,6 +400,10 @@ def main():
     parser.add_argument('--kx-max',  type=float, default=DEFAULTS['kx_max'], help='kx grid range [-kx_max, kx_max] (GeV)')
     parser.add_argument('--ky-max',  type=float, default=DEFAULTS['ky_max'], help='ky grid range [0, ky_max] (GeV)')
     parser.add_argument('--workers', type=int,   default=4,                  help='Parallel workers for reference computation')
+    parser.add_argument('--x-values', type=float, nargs='+',
+                        default=DEFAULTS['x_values'],
+                        help='List of fixed x values for additional comparison rows '
+                             '(e.g. --x-values 0.01 0.3 0.7)')
     parser.add_argument('--model-file',
                         type=str, default='data/radiation_emulator.pt')
     parser.add_argument('--normalization-file',
@@ -333,18 +455,49 @@ def main():
         kx_values=kx_values,
         ky_values=ky_values,
     )
-    print(f"  NN prediction: {(time.time()-t0)*1000:.1f} ms "
+    print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms "
           f"for {args.n_kx * args.n_ky} points")
 
-    # --- Plot ---
-    print("\nStep 3: Generating comparison plot")
-    make_comparison_plot(
+    # Accumulate rows: start with the primary (--x) row
+    plot_rows = [(params, I_ref, I_err, I_nn)]
+
+    # --- x-slice rows ---
+    if args.x_values:
+        print("\n" + "=" * 70)
+        print(f"x-SLICE COMPARISONS: {args.x_values}")
+        print("=" * 70)
+        for x_val in args.x_values:
+            print(f"\n--- x = {x_val} ---")
+            x_params = dict(params, x=x_val)
+
+            print("  Computing reference grid...")
+            I_ref_x, I_err_x = compute_reference_grid(
+                x=x_val, E=args.E, z0=args.z0, zf=args.zf,
+                u_perp=args.u_perp, T=args.T, g=args.g,
+                kx_values=kx_values,
+                ky_values=ky_values,
+                n_workers=args.workers,
+            )
+
+            print("  Computing NN grid...")
+            t0 = time.time()
+            I_nn_x = compute_nn_grid(
+                emulator=emulator,
+                x=x_val, E=args.E, z0=args.z0, zf=args.zf,
+                u_perp=args.u_perp, T=args.T, g=args.g,
+                kx_values=kx_values,
+                ky_values=ky_values,
+            )
+            print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms")
+
+            plot_rows.append((x_params, I_ref_x, I_err_x, I_nn_x))
+
+    # --- Combined plot ---
+    print("\nGenerating combined comparison plot...")
+    make_combined_plot(
         kx_values=kx_values,
         ky_values=ky_values,
-        I_ref=I_ref,
-        I_err=I_err,
-        I_nn=I_nn,
-        params=params,
+        rows=plot_rows,
         output_file=args.output,
     )
 
