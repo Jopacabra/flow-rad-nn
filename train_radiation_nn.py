@@ -692,6 +692,7 @@ class RadiationEmulatorInference:
             model_file: str = "data/radiation_emulator.pt",
             normalization_file: str = "data/radiation_normalization.json",
             device: str = "cpu",
+            compile: bool = True,
     ):
         """
         Load trained model and normalization parameters.
@@ -749,7 +750,7 @@ class RadiationEmulatorInference:
 
         # Optionally compile the model for faster repeated inference
         # (requires PyTorch >= 2.0; falls back silently on older versions)
-        if hasattr(torch, 'compile'):
+        if hasattr(torch, 'compile') and compile == True:
             self.model = torch.compile(self.model)
 
         print(f"Loaded model from {model_file}")
