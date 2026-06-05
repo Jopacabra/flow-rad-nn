@@ -423,14 +423,14 @@ def compute_loss(
         phi = torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 2 * torch.pi)
 
         # Low-k point
-        base_params[:, -3] = k_perp * torch.cos(phi)
-        base_params[:, -2] = k_perp * torch.sin(phi)
+        base_params[:, 1] = k_perp * torch.cos(phi)
+        base_params[:, 2] = k_perp * torch.sin(phi)
         f_low = model(base_params).squeeze()
 
         # High-k point (same direction, same other params)
         high_params = base_params.clone()
-        high_params[:, -3] = (alpha * k_perp) * torch.cos(phi)
-        high_params[:, -2] = (alpha * k_perp) * torch.sin(phi)
+        high_params[:, 1] = (alpha * k_perp) * torch.cos(phi)
+        high_params[:, 2] = (alpha * k_perp) * torch.sin(phi)
         f_high = model(high_params).squeeze()
 
         # Target ratio: f(alpha*k) / f(k) = alpha^{-power}
