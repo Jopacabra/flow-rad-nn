@@ -47,6 +47,7 @@ class TrainingConfig:
     data_file: str = "data/radiation_training_data.h5"
     train_fraction: float = 0.8
     transform: str = "arcsinh"
+    mirror: bool = True  # Whether to mirror data in ky.
 
     # Architecture
     hidden_dim: int = 256
@@ -135,6 +136,19 @@ class RadiationDataset(Dataset):
         self.y_err = self.y_err[valid_mask]
         self.weights = self.weights[valid_mask]
 
+        # Mirror data, if desired
+        if config.mirror:
+            print("Mirroring dataset along ky axis...")
+            # Mirror ky coordinate points
+            points_mirror = self.X.copy()
+            points_mirror[:, 2] = -points_mirror[:, 2]  # ky → -ky
+
+            # Combine original and mirrored, using identical values and weights
+            self.X = np.vstack([self.X, points_mirror])
+            self.y = np.concatenate([self.y, self.y])
+            self.y_err = np.concatenate([self.y_err, self.y_err])
+            self.weights = np.concatenate([self.weights, self.weights])
+
         # Compute input normalization (mean/std for each feature)
         self.X_mean = self.X.mean(axis=0)
         self.X_std = self.X.std(axis=0) + 1e-8  # Avoid division by zero
@@ -167,9 +181,10 @@ class RadiationDataset(Dataset):
         # Normalize weights to have mean 1
         self.weights = torch.tensor(self.weights / self.weights.mean())
 
-        print(f"Keeping {len(self.y):,} valid samples from {data_file}")
+        print(f"Using {len(self.y):,} valid samples from {data_file}")
         print(f"Input shape: {self.X.shape}")
         print(f"Output range: [{self.y.min():.4e}, {self.y.max():.4e}]")
+        print(f"Transformed range: [{self.y_transformed.min():.4e}, {self.y_transformed.max():.4e}]")
 
     def __len__(self):
         return len(self.y)
@@ -365,7 +380,10 @@ def compute_loss(
         # Isotropic: random azimuthal angle phi
         phi = torch.empty(n_uv_samples, device=device).uniform_(0, 2 * math.pi)
         k_x_uv = k_perp * torch.cos(phi)
-        k_y_uv = np.abs(k_perp * torch.sin(phi))  # make k_y always positive
+        if config.mirror:
+            k_y_uv = k_perp * torch.sin(phi)  # k_y positive or negative
+        else:
+            k_y_uv = np.abs(k_perp * torch.sin(phi))  # make k_y always positive
 
         # Tile the other 7 parameters from random rows of the training batch
         idx = torch.randint(0, B, (n_uv_samples,), device=device)
