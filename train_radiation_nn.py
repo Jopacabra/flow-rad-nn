@@ -711,6 +711,7 @@ class RadiationEmulatorInference:
             normalization_file: str = "data/radiation_normalization.json",
             device: str = "cpu",
             compile: bool = True,
+            quiet: bool = False,
     ):
         """
         Load trained model and normalization parameters.
@@ -732,6 +733,8 @@ class RadiationEmulatorInference:
 
         self.X_mean = torch.tensor(self.norm_params['X_mean'], dtype=torch.float32)
         self.X_std = torch.tensor(self.norm_params['X_std'], dtype=torch.float32)
+        # self.X_max = torch.tensor(self.norm_params['X_max'], dtype=torch.float32)
+        # self.X_min = torch.tensor(self.norm_params['X_min'], dtype=torch.float32)
         self.y_mean = self.norm_params['y_mean']
         self.y_std = self.norm_params['y_std']
         self.transform = self.norm_params['transform']
@@ -771,9 +774,10 @@ class RadiationEmulatorInference:
         if hasattr(torch, 'compile') and compile == True:
             self.model = torch.compile(self.model)
 
-        print(f"Loaded model from {model_file}")
-        print(f"  Validation loss: {checkpoint['val_loss']:.4e}")
-        print(f"  Trained for {checkpoint['epoch'] + 1} epochs")
+        if not quiet:
+            print(f"Loaded model from {model_file}")
+            print(f"  Validation loss: {checkpoint['val_loss']:.4e}")
+            print(f"  Trained for {checkpoint['epoch'] + 1} epochs")
 
     def predict(
             self,
@@ -871,23 +875,24 @@ class RadiationEmulatorInference:
             g=inputs['g'],
         )
 
-    def compute_grid(self,
-                        E: float,
-                        z0: float,
-                        zf: float,
-                        u_perp: float,
-                        T: float,
-                        g: float,
-                        x_values: np.ndarray,
-                        kx_values: np.ndarray,
-                        ky_values: np.ndarray
-                        ) -> (np.ndarray):
+    def compute_dNd3k_grid(self,
+                           E: float,
+                           z0: float,
+                           zf: float,
+                           u_perp: float,
+                           T: float,
+                           g: float,
+                           kz_values: np.ndarray,
+                           kx_values: np.ndarray,
+                           ky_values: np.ndarray
+                           ) -> (np.ndarray):
         """
-        Computes a complete grid of dN/(dxdkxdky) in x, kx, ky and returns the grid.
+        Computes a complete grid of dN/(dxdkxdky) shaped as (kx, ky, kz) and returns the grid, sans CR
         """
 
-
-        x_grid, kx_grid, ky_grid = np.meshgrid(x_values, kx_values, ky_values, indexing='ij')
+        # Create a meshgrid and compute x values for each grid point
+        kx_grid, ky_grid, kz_grid = np.meshgrid(kx_values, ky_values, kz_values, indexing='ij')
+        x_grid = (1 / ((E**2 )*np.sqrt(2))) * (E*kz_grid + np.sqrt(E**2 * (kz_grid**2 + kx_grid**2 + ky_grid**2)))
         n_pts = x_grid.size
 
         # Build input grid once
@@ -897,15 +902,26 @@ class RadiationEmulatorInference:
             np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
         ]).astype(np.float32)
 
-        # Get predictions
+        # Get predictions -- returns as flat array of dI/dxd^2k_perp points
         I_nn_flat = self.predict_raw(grid_inputs)
 
-        # --- Reshape flat predictions back onto the 3D grid ---
-        I_nn = I_nn_flat.reshape(x_grid.shape)  # shape: (n_x, n_kx, n_ky)
+        # Reshape flat predictions back onto the 3D grid
+        I_nn = I_nn_flat.reshape(x_grid.shape)  # shape: (n_kx, n_ky, n_x)
 
-        # --- Compute dN/dxdkxdky ---
+        # Set any unphysical x coordinate values to zero
+        I_nn[x_grid > 1.0] = 0
+
+        # Compute dN/dxd^2k_perp by dividing out energy of each grid point
         N_nn = I_nn / (E*x_grid)  # Still needs casimir factor
 
+        # Convert to dN/d^3k
+        # Compute and apply Jacobian for x -> kz : dN/dkz = (dN/dx) * |dx/dkz|
+        # Broadcast shapes: kx/ky -> (m, 1, 1) and (1, m, 1), x -> (1, 1, n)
+        dkz_dx = (1 / np.sqrt(2)) * (E + (kx_grid ** 2 + ky_grid ** 2) / (2 * x_grid ** 2 * E))
+        jacobian = 1.0 / dkz_dx  # |dx/dkz|, shape broadcasts to (m, m, n)
+        N_nn = N_nn * jacobian
+
+        # Return as dN/d^3k
         return N_nn
 
     def sample_emission(self,
