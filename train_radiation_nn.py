@@ -777,15 +777,15 @@ class RadiationEmulatorInference:
 
     def predict(
             self,
-            x: np.ndarray,
-            kx: np.ndarray,
-            ky: np.ndarray,
-            E: np.ndarray,
-            z0: np.ndarray,
-            zf: np.ndarray,
-            u_perp: np.ndarray,
-            T: np.ndarray,
-            g: np.ndarray,
+            x: np.ndarray,  # unitless
+            kx: np.ndarray,  # in GeV
+            ky: np.ndarray,  # in GeV
+            E: np.ndarray,  # in GeV
+            z0: np.ndarray,  # in invGeV
+            zf: np.ndarray,  # in invGeV
+            u_perp: np.ndarray,  # unitless
+            T: np.ndarray,  # in GeV
+            g: np.ndarray,  # unitless
     ) -> np.ndarray:
         # Stack inputs directly into a contiguous float32 C-array,
         # then wrap with from_numpy (zero-copy) before sending to device.

@@ -47,8 +47,8 @@ PARAM_RANGES = [
     (-5.0, 5.0),    # kx  (GeV)
     (0.0,  5.0),    # ky  (GeV) — positive half only; mirrored at save time
     (1.0,  100.0),  # E   (GeV)
-    (0.0,  10.0),   # z0  (fm)
-    (0.0,  10.0),   # zf  (fm)
+    (0.0,  50.0),   # z0  (fm)
+    (0.0,  50.0),   # zf  (fm)
     (0.0,  0.9),    # u_perp
     (0.150, 0.650), # T   (GeV)
     (1.5,  2.5),    # g

@@ -58,8 +58,8 @@ class SamplingConfig:
     kx_range: Tuple[float, float] = (-5.0, 5.0)
     ky_range: Tuple[float, float] = (0.0, 5.0)  # Only ky >= 0 due to symmetry
     E_range: Tuple[float, float] = (5.0, 100.0)
-    z0_range: Tuple[float, float] = (0.0, 10.0)
-    zf_range: Tuple[float, float] = (0.0, 10.0)
+    z0_range: Tuple[float, float] = (0.0, 50.0)  # in invGeV, not fm!!! 0 to 10 fm -> 0 to 50 invGeV
+    zf_range: Tuple[float, float] = (0.0, 50.0)  # in invGeV, not fm!!! 0 to 10 fm -> 0 to 50 invGeV
     u_perp_range: Tuple[float, float] = (0.0, 0.7)
 
     # Medium parameters (now sampled)
@@ -935,8 +935,8 @@ if __name__ == "__main__":
         kx_range=(-5.0, 5.0),
         ky_range=(0.0, 5.0),  # Only positive due to symmetry
         E_range=(1.0, 100.0),
-        z0_range=(0.0, 10.0),
-        zf_range=(0.0, 10.0),
+        z0_range=(0.0, 50.0),  # in invGeV, not fm!!! 0 to 10 fm -> 0 to 50 invGeV
+        zf_range=(0.0, 50.0),  # in invGeV, not fm!!! 0 to 10 fm -> 0 to 50 invGeV
         u_perp_range=(0.0, 0.9),
 
         # Medium parameter ranges
