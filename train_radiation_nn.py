@@ -27,6 +27,7 @@ from torch.utils.data import Dataset, DataLoader, random_split
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 import json
+import signal
 import os
 import time
 from pathlib import Path
@@ -75,6 +76,8 @@ class TrainingConfig:
     # Output
     model_file: str = "data/radiation_emulator.pt"
     normalization_file: str = "data/radiation_normalization.json"
+    checkpoint_file: str = "data/radiation_training_checkpoint.pt"  # Resume checkpoint
+    checkpoint_interval: int = 1  # Save resume checkpoint every N epochs
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -526,6 +529,53 @@ def validate(
     }
 
 
+
+
+def save_training_checkpoint(
+        path: str,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        epoch: int,
+        best_val_loss: float,
+        patience_counter: int,
+):
+    """Save a full training state for resumption."""
+    raw_state_dict = model.state_dict()
+    fixed_state_dict = {k.removeprefix('_orig_mod.'): v for k, v in raw_state_dict.items()}
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': fixed_state_dict,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'best_val_loss': best_val_loss,
+        'patience_counter': patience_counter,
+    }, path)
+    print(f"  [checkpoint] Saved training state at epoch {epoch + 1} → {path}")
+
+
+def load_training_checkpoint(
+        path: str,
+        model: nn.Module,
+        optimizer: torch.optim.Optimizer,
+        scheduler,
+        device: str,
+):
+    """
+    Load a training checkpoint.  Returns (start_epoch, best_val_loss, patience_counter).
+    """
+    print(f"Resuming from checkpoint: {path}")
+    ckpt = torch.load(path, map_location=device)
+    state_dict = {k.removeprefix('_orig_mod.'): v for k, v in ckpt['model_state_dict'].items()}
+    model.load_state_dict(state_dict)
+    optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+    scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+    start_epoch    = ckpt['epoch'] + 1          # resume at the *next* epoch
+    best_val_loss  = ckpt['best_val_loss']
+    patience_counter = ckpt['patience_counter']
+    print(f"  Resumed from epoch {ckpt['epoch'] + 1}  |  best val loss: {best_val_loss:.4e}")
+    return start_epoch, best_val_loss, patience_counter
+
 # ==============================================================================
 # Main training function
 # ==============================================================================
@@ -591,9 +641,6 @@ def train_model(config: TrainingConfig):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
-    if hasattr(torch, 'compile'):
-        model = torch.compile(model)
-
     # Optimizer -- applies various strategies that change the way we use our neurons
     # Controls usage of dropout and L2 regularization to encourage generalization instead of memorization
     optimizer = torch.optim.AdamW(
@@ -613,22 +660,52 @@ def train_model(config: TrainingConfig):
         return model, dataset.get_normalization_params()
 
     # Scheduler -- controls the variation of learning rate over training epochs
-    # ReduceLROnPlateau reduces learning rate when validation loss plateaus, helps prevent oscillation over local minima
-    #
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10,  # verbose deprecated -- prints LR later on
-        min_lr=6.24e-5,  # Minimum learning rate, so we don't go to negligibly small values and stagnate learning
+        optimizer, mode='min', factor=0.5, patience=10,
+        min_lr=6.24e-5,
     )
 
     # Training loop
     best_val_loss = float('inf')
     patience_counter = 0
+    start_epoch = 0
+
+    # ── Resume from checkpoint if one exists ──────────────────────────────
+    if os.path.exists(config.checkpoint_file):
+        start_epoch, best_val_loss, patience_counter = load_training_checkpoint(
+            config.checkpoint_file, model, optimizer, scheduler, config.device
+        )
+    else:
+        print("No checkpoint found – starting from scratch.")
+
+    if hasattr(torch, 'compile'):
+        model = torch.compile(model)
+
+    # ── SIGTERM handler: save checkpoint before SLURM kills the job ──────
+    _sigterm_received = [False]
+
+    def _sigterm_handler(signum, frame):
+        print("\n[SLURM] SIGTERM received – saving checkpoint before exit...")
+        save_training_checkpoint(
+            config.checkpoint_file, model, optimizer, scheduler,
+            current_epoch[0], best_val_loss, patience_counter
+        )
+        _sigterm_received[0] = True
+
+    current_epoch = [start_epoch]
+    signal.signal(signal.SIGTERM, _sigterm_handler)
 
     print("\nStarting training...")
     print("-" * 70)
 
     try:
-        for epoch in range(config.n_epochs):
+        for epoch in range(start_epoch, config.n_epochs):
+            current_epoch[0] = epoch
+
+            if _sigterm_received[0]:
+                print("Exiting cleanly after SIGTERM.")
+                break
+
             # Train
             train_metrics = train_epoch(model, train_loader, optimizer, config)
 
@@ -639,7 +716,6 @@ def train_model(config: TrainingConfig):
             scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
 
             # Print progress
-            # if (epoch + 1) % 10 == 0 or epoch == 0:
             current_lr = optimizer.param_groups[0]['lr']
             print(
                 f"Epoch {epoch + 1:3d}/{config.n_epochs} | "
@@ -681,8 +757,21 @@ def train_model(config: TrainingConfig):
                 if patience_counter >= config.patience:
                     print(f"\nEarly stopping at epoch {epoch + 1}")
                     break
+
+            # ── Periodic resume checkpoint ─────────────────────────────
+            if (epoch + 1) % config.checkpoint_interval == 0:
+                save_training_checkpoint(
+                    config.checkpoint_file, model, optimizer, scheduler,
+                    epoch, best_val_loss, patience_counter
+                )
+
     except KeyboardInterrupt:
-        print("Keyboard interrupt. Training stopped.")
+        print("Keyboard interrupt – saving checkpoint...")
+        save_training_checkpoint(
+            config.checkpoint_file, model, optimizer, scheduler,
+            current_epoch[0], best_val_loss, patience_counter
+        )
+        print("Training stopped.")
 
     print("-" * 70)
     print(f"Training complete!")
@@ -1262,6 +1351,12 @@ if __name__ == "__main__":
     parser.add_argument("--find-lr", action="store_true", help="Run LR range test and exit")
     parser.add_argument("--n-workers", type=int, default=default_config.num_workers,
                         help="Number of workers for data loading")
+    parser.add_argument("--checkpoint-file", type=str, default=default_config.checkpoint_file,
+                        help="Path for the resume checkpoint (read + written during training)")
+    parser.add_argument("--checkpoint-interval", type=int, default=default_config.checkpoint_interval,
+                        help="Save a resume checkpoint every N epochs")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Ignore any existing checkpoint and start from scratch")
     args = parser.parse_args()
 
     config = TrainingConfig(
@@ -1274,7 +1369,14 @@ if __name__ == "__main__":
         run_lr_finder=args.find_lr,
         transform=args.transform,
         num_workers=args.n_workers,
+        checkpoint_file=args.checkpoint_file,
+        checkpoint_interval=args.checkpoint_interval,
     )
+
+    # --no-resume: delete checkpoint so training starts from scratch
+    if args.no_resume and os.path.exists(config.checkpoint_file):
+        os.remove(config.checkpoint_file)
+        print(f"Deleted existing checkpoint: {config.checkpoint_file}")
 
     # # Example overfitting-style training config
     # config = TrainingConfig(
