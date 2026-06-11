@@ -82,6 +82,7 @@ class TrainingConfig:
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     num_workers: int = 4  # DataLoader worker processes
+    compile: bool = False  # Whether or not to compile the NN during training. Will not work on older Discovery GPUs
 
     # Utilities
     run_lr_finder: bool = False
@@ -678,7 +679,7 @@ def train_model(config: TrainingConfig):
     else:
         print("No checkpoint found – starting from scratch.")
 
-    if hasattr(torch, 'compile'):
+    if hasattr(torch, 'compile') and config.compile == True:
         model = torch.compile(model)
 
     # ── SIGTERM handler: save checkpoint before SLURM kills the job ──────
@@ -799,7 +800,7 @@ class RadiationEmulatorInference:
             model_file: str = "data/radiation_emulator.pt",
             normalization_file: str = "data/radiation_normalization.json",
             device: str = "cpu",
-            compile: bool = True,
+            compile: bool = False,
             quiet: bool = False,
     ):
         """
