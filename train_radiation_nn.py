@@ -58,8 +58,8 @@ class TrainingConfig:
     activation: str = "silu"  # silu, relu, tanh, gelu
 
     # Training
-    batch_size: int = 256
-    learning_rate: float = 1e-3
+    batch_size: int = 4096
+    learning_rate: float = 2.72e-3
     weight_decay: float = 1e-4
     dropout_p: float = 0.1
     n_epochs: int = 500
@@ -83,7 +83,7 @@ class TrainingConfig:
 
     # Device
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
-    num_workers: int = 4  # DataLoader worker processes
+    num_workers: int = 4  # DataLoader worker processaes
     compile: bool = False  # Whether or not to compile the NN during training. Will not work on older Discovery GPUs
 
     # Utilities
@@ -95,28 +95,29 @@ class TrainingConfig:
 # ==============================================================================
 class RadiationDataset(Dataset):
     """
-    HDF5-backed dataset. Each worker process opens its own file handle.
+    RAM-backed dataset. All valid data is loaded into memory once at construction.
 
     Design
     ------
-    No background threads are used. The dataset stores only:
-      - valid_indices: the HDF5 row numbers that passed the finite-value filter
-      - normalization statistics (X_mean, X_std, y_mean, y_std, etc.)
+    All HDF5 I/O happens in __init__ via _scan_file. After construction, no
+    disk access occurs. __getitem__ is a pure array index + lightweight
+    normalization — essentially free compared to HDF5 scalar reads.
 
-    The HDF5 file is opened lazily in __getitem__ on first access within each
-    DataLoader worker process. Because each worker is a *separate process*
-    (fork), there is no shared HDF5 file handle and no locking contention.
+    Memory layout
+    -------------
+    self.X_data : np.ndarray, shape (N_valid, 9), float32   — input features
+    self.y_data : np.ndarray, shape (N_valid,),   float32   — raw intensity
+    self.w_data : np.ndarray, shape (N_valid,),   float32   — importance weights
 
-    For num_workers=0 (single process), the handle is opened once and reused.
+    For 127M valid rows at float32:
+      X_data  ~  4.6 GB  (127M × 9 × 4 bytes)
+      y_data  ~  0.5 GB  (127M × 4 bytes)
+      w_data  ~  0.5 GB  (127M × 4 bytes)
+      total   ~  5.6 GB
 
-    Mirroring in k_y is virtual: logical index i >= n_valid returns the same
-    HDF5 row as i - n_valid, with the ky column negated. No data is duplicated.
-
-    RAM usage
-    ---------
-    Only valid_indices (int64 array, ~8 bytes/row) lives in RAM permanently.
-    For 240M valid rows that is ~1.9 GB. If this is still too much, pass
-    subsample_indices=True to store every Nth index, though this is rarely needed.
+    Mirroring in k_y is virtual (same as before): logical index i >= n_valid
+    returns the same row as i - n_valid with the ky column negated. No data
+    is duplicated in memory.
     """
 
     FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'zf', 'u_perp', 'T', 'g']
@@ -127,19 +128,14 @@ class RadiationDataset(Dataset):
         self,
         data_file: str,
         transform_output: str = "arcsinh",
-        chunk_rows: int = 65_536,
         mirror: bool = True,
     ):
-        self.data_file  = data_file
-        self.transform  = transform_output
-        self.chunk_rows = chunk_rows
-        self.mirror     = mirror
-        self.epsilon    = 1e-10
+        self.data_file = data_file
+        self.transform = transform_output
+        self.mirror    = mirror
+        self.epsilon   = 1e-10
 
-        # Per-worker file handle — None until first __getitem__ call in that worker
-        self._hdf5_file = None
-
-        print(f"Scanning {data_file} ...")
+        print(f"Loading {data_file} into RAM ...")
         self._scan_file()
 
         n_logical = 2 * self.n_valid if self.mirror else self.n_valid
@@ -147,73 +143,86 @@ class RadiationDataset(Dataset):
               f"logical={n_logical:,}  transform={self.transform}")
 
     # ------------------------------------------------------------------
-    # One-time scan for valid indices + normalization stats
+    # Full load into RAM — no copies, no HDF5 handles kept open
     # ------------------------------------------------------------------
     def _scan_file(self):
-        CHUNK     = self.chunk_rows
-        valid_parts: list[np.ndarray] = []
-        X_mean    = np.zeros(self.N_FEATURES, dtype=np.float64)
-        X_M2      = np.zeros(self.N_FEATURES, dtype=np.float64)
-        n_welford = 0
-        MAX_Y     = 4_000_000
-        y_res: list[np.ndarray] = []
-        y_res_n   = 0
-        w_sum     = np.float64(0)
-        w_count   = 0
-
         with h5py.File(self.data_file, 'r') as f:
             n_raw = int(f['I'].shape[0])
-            for start in range(0, n_raw, CHUNK):
-                end = min(start + CHUNK, n_raw)
-                sl  = slice(start, end)
+            print(f"  Reading {n_raw:,} rows from HDF5 ...")
 
-                y_c    = f['I'][sl].astype(np.float32)
-                yerr_c = f['I_err'][sl].astype(np.float32)
-                X_c    = np.empty((end - start, self.N_FEATURES), dtype=np.float32)
-                for j, name in enumerate(self.FEATURE_NAMES):
-                    X_c[:, j] = f[name][sl]
+            # ----------------------------------------------------------
+            # Step 1 — allocate output arrays ONCE, read directly into them.
+            # h5py supports out= for direct no-copy reads.
+            # ----------------------------------------------------------
+            X_raw = np.empty((n_raw, self.N_FEATURES), dtype=np.float32)
+            for j, name in enumerate(self.FEATURE_NAMES):
+                f[name].read_direct(X_raw, dest_sel=np.s_[:, j])
 
-                ok = (np.isfinite(y_c) & np.isfinite(yerr_c) &
-                      np.all(np.isfinite(X_c), axis=1))
-                valid_parts.append(np.where(ok)[0] + start)
+            y_raw  = np.empty(n_raw, dtype=np.float32)
+            f['I'].read_direct(y_raw)
 
-                X_v = X_c[ok].astype(np.float64)
-                y_v = y_c[ok]
-                w_v = f['weight'][sl][ok].astype(np.float32)
+            w_raw  = np.empty(n_raw, dtype=np.float32)
+            f['weight'].read_direct(w_raw)
 
-                m = len(X_v)
-                if m > 0:
-                    bm  = X_v.mean(axis=0)
-                    bM2 = ((X_v - bm) ** 2).sum(axis=0)
-                    cn  = n_welford + m
-                    d   = bm - X_mean
-                    X_mean  = (n_welford * X_mean + m * bm) / cn
-                    X_M2   += bM2 + d ** 2 * n_welford * m / cn
-                    n_welford = cn
+            i_err  = np.empty(n_raw, dtype=np.float32)
+            f['I_err'].read_direct(i_err)
 
-                if y_res_n < MAX_Y:
-                    y_res.append(y_v)
-                    y_res_n += len(y_v)
+        # ----------------------------------------------------------
+        # Step 2 — validity mask; filter once, then immediately
+        # let the raw arrays go out of scope so GC can free them.
+        # ----------------------------------------------------------
+        print("  Filtering invalid rows ...")
+        ok = (
+            np.isfinite(y_raw)
+            & np.isfinite(i_err)
+            & np.all(np.isfinite(X_raw), axis=1)
+        )
+        # i_err is only needed for the validity check — drop it now
+        del i_err
 
-                w_sum   += w_v.sum()
-                w_count += len(w_v)
+        n_valid = int(ok.sum())
+        print(f"  {n_raw:,} raw  →  {n_valid:,} valid")
 
-        self.valid_indices = np.concatenate(valid_parts)   # shape (N_valid,), int64
-        self.n_valid       = len(self.valid_indices)
+        # Fancy-index once per array to keep only valid rows.
+        # This creates new contiguous arrays; the originals are then deleted.
+        self.X_data = X_raw[ok]   # (N_valid, 9)  float32
+        del X_raw
 
-        self.X_mean  = X_mean.astype(np.float32)
-        self.X_std   = (np.sqrt(np.maximum(X_M2 / max(n_welford - 1, 1), 0))
-                        + 1e-8).astype(np.float32)
-        self.weight_mean = float(w_sum / max(w_count, 1))
+        self.y_data = y_raw[ok]   # (N_valid,)    float32
+        del y_raw
 
-        y_sample    = np.concatenate(y_res) if y_res else np.array([0.0], dtype=np.float32)
-        self.f0     = float(np.std(y_sample)) or 1.0
-        y_t         = self._transform_y(y_sample)
-        self.y_mean = float(np.mean(y_t))
-        self.y_std  = float(np.std(y_t) + 1e-8)
+        self.w_data = w_raw[ok]   # (N_valid,)    float32
+        del w_raw
 
-        print(f"  {n_raw:,} raw  →  {self.n_valid:,} valid"
-              f"  |  weight_mean={self.weight_mean:.3e}  f0={self.f0:.3e}")
+        # Boolean mask is no longer needed either
+        del ok
+
+        self.n_valid = n_valid
+
+        # ----------------------------------------------------------
+        # Step 3 — normalization stats (no extra data copies needed;
+        # computed directly from self.X_data / self.y_data)
+        # ----------------------------------------------------------
+        print("  Computing normalization statistics ...")
+
+        # Input features: mean and std in float64 for numerical precision,
+        # then cast back to float32 for storage.
+        X64 = self.X_data.astype(np.float64)          # temporary; freed below
+        self.X_mean = X64.mean(axis=0).astype(np.float32)
+        self.X_std  = (X64.std(axis=0) + 1e-8).astype(np.float32)
+        del X64
+
+        # Importance weight normalization scalar
+        self.weight_mean = float(self.w_data.mean())
+
+        # Output transform + normalization
+        self.f0 = float(np.std(self.y_data)) or 1.0
+        y_t = self._transform_y(self.y_data)           # returns a new array
+        self.y_mean = float(y_t.mean())
+        self.y_std  = float(y_t.std() + 1e-8)
+        del y_t
+
+        print(f"  weight_mean={self.weight_mean:.3e}  f0={self.f0:.3e}")
 
     # ------------------------------------------------------------------
     # Output transform
@@ -226,30 +235,6 @@ class RadiationDataset(Dataset):
         return y.astype(np.float32)
 
     # ------------------------------------------------------------------
-    # Lazy per-worker file handle
-    # ------------------------------------------------------------------
-    def _get_file(self) -> "h5py.File":
-        """Return the open HDF5 handle for this process, opening it if needed."""
-        if self._hdf5_file is None:
-            self._hdf5_file = h5py.File(self.data_file, 'r')
-        return self._hdf5_file
-
-    # ------------------------------------------------------------------
-    # DataLoader worker initialisation hook
-    # ------------------------------------------------------------------
-    def worker_init(self, worker_id: int):
-        """
-        Call this as DataLoader's worker_init_fn to reset the file handle in
-        each forked worker process.  Without this, forked workers inherit the
-        parent's open handle, which causes HDF5 corruption / hangs.
-
-        Usage:
-            DataLoader(..., worker_init_fn=dataset.worker_init)
-        """
-        # Each forked worker must open its own handle — reset the inherited one.
-        self._hdf5_file = None
-
-    # ------------------------------------------------------------------
     # Dataset protocol
     # ------------------------------------------------------------------
     def __len__(self) -> int:
@@ -258,42 +243,33 @@ class RadiationDataset(Dataset):
     def __getitem__(self, idx: int):
         mirrored = self.mirror and (idx >= self.n_valid)
         raw_idx  = idx - self.n_valid if mirrored else idx
-        hdf_idx  = int(self.valid_indices[raw_idx])
 
-        f = self._get_file()
-        x_raw = np.array([f[name][hdf_idx] for name in self.FEATURE_NAMES],
-                         dtype=np.float32)
-        y_raw = float(f['I'][hdf_idx])
-        w_raw = float(f['weight'][hdf_idx])
-
-        x_norm = (x_raw - self.X_mean) / self.X_std
-        y_norm = float((self._transform_y(np.array([y_raw], dtype=np.float32))[0]
-                        - self.y_mean) / self.y_std)
-        w_norm = w_raw / self.weight_mean
+        # --- inputs ---
+        # np.array() with copy=False returns a view if possible.
+        # torch.from_numpy() on a C-contiguous float32 row is zero-copy.
+        x_raw  = self.X_data[raw_idx]                  # (9,) float32 view
+        x_norm = (x_raw - self.X_mean) / self.X_std    # new (9,) float32 array
 
         if mirrored:
             x_norm[self.KY_IDX] = -x_norm[self.KY_IDX]
 
+        # --- output ---
+        y_t    = float(self._transform_y(
+                     self.y_data[raw_idx : raw_idx + 1]  # slice keeps it as array
+                 )[0])
+        y_norm = (y_t - self.y_mean) / self.y_std
+
+        # --- weight ---
+        w_norm = float(self.w_data[raw_idx]) / self.weight_mean
+
         return (
-            torch.from_numpy(x_norm),
+            torch.from_numpy(x_norm),                              # zero-copy
             torch.tensor(y_norm, dtype=torch.float32),
             torch.tensor(w_norm, dtype=torch.float32),
         )
 
     # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
-    def shutdown(self):
-        """Close the HDF5 file handle if open. Call after training."""
-        if self._hdf5_file is not None:
-            try:
-                self._hdf5_file.close()
-            except Exception:
-                pass
-            self._hdf5_file = None
-
-    # ------------------------------------------------------------------
-    # Normalization export
+    # Normalization export (unchanged)
     # ------------------------------------------------------------------
     def get_normalization_params(self) -> Dict:
         return {
@@ -306,6 +282,10 @@ class RadiationDataset(Dataset):
             'epsilon':       self.epsilon,
             'feature_names': self.FEATURE_NAMES,
         }
+
+    # shutdown() is now a no-op — kept for API compatibility
+    def shutdown(self):
+        pass
 
 
 # ==============================================================================
@@ -698,27 +678,23 @@ def train_model(config: TrainingConfig):
             num_workers=config.num_workers,
             persistent_workers=config.num_workers > 0,
             pin_memory=True,
-            worker_init_fn=dataset.worker_init,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=config.batch_size, shuffle=False,
             num_workers=config.num_workers,
             persistent_workers=config.num_workers > 0,
             pin_memory=True,
-            worker_init_fn=dataset.worker_init,
         )
     elif config.device == "cpu":
         train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size, shuffle=True,
             num_workers=config.num_workers,
             persistent_workers=config.num_workers > 0,
-            worker_init_fn=dataset.worker_init,
         )
         val_loader = DataLoader(
             val_dataset, batch_size=config.batch_size, shuffle=False,
             num_workers=config.num_workers,
             persistent_workers=config.num_workers > 0,
-            worker_init_fn=dataset.worker_init,
         )
 
     # Create model
@@ -729,6 +705,10 @@ def train_model(config: TrainingConfig):
         activation=config.activation,
         dropout_p=config.dropout_p,
     ).to(config.device)
+
+    if torch.cuda.device_count() > 1:
+        print(f"Using {torch.cuda.device_count()} GPUs")
+        model = nn.DataParallel(model)
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
@@ -770,7 +750,7 @@ def train_model(config: TrainingConfig):
     else:
         print("No checkpoint found – starting from scratch.")
 
-    if hasattr(torch, 'compile') and config.compile == True:
+    if hasattr(torch, 'compile') and config.compile:
         model = torch.compile(model)
 
     # ── SIGTERM handler: save checkpoint before SLURM kills the job ──────
@@ -939,6 +919,10 @@ class RadiationEmulatorInference:
             dropout_p=model_config.get('dropout_p', 0.0),  # backward compatible
         ).to(device)
 
+        if torch.cuda.device_count() > 1:
+            print(f"Using {torch.cuda.device_count()} GPUs")
+            self.model = nn.DataParallel(self.model)
+
         try:
             self.model.load_state_dict(checkpoint['model_state_dict'])
         except RuntimeError:
@@ -957,7 +941,7 @@ class RadiationEmulatorInference:
 
         # Optionally compile the model for faster repeated inference
         # (requires PyTorch >= 2.0; falls back silently on older versions)
-        if hasattr(torch, 'compile') and compile == True:
+        if hasattr(torch, 'compile') and compile:
             self.model = torch.compile(self.model)
 
         if not quiet:
