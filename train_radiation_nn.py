@@ -217,10 +217,21 @@ class RadiationDataset(Dataset):
 
         # Output transform + normalization
         self.f0 = float(np.std(self.y_data)) or 1.0
-        y_t = self._transform_y(self.y_data)           # returns a new array
+        y_t = self._transform_y(self.y_data)  # returns a new array
         self.y_mean = float(y_t.mean())
-        self.y_std  = float(y_t.std() + 1e-8)
+        self.y_std = float(y_t.std() + 1e-8)
+
+        # Pre-compute fully normalized outputs and store them.
+        # This avoids recomputing _transform_y() on every __getitem__ call.
+        self.y_norm_data = ((y_t - self.y_mean) / self.y_std).astype(np.float32)
         del y_t
+
+        # Pre-compute fully normalized inputs and store them.
+        # This avoids per-sample subtraction/division in __getitem__.
+        self.X_norm_data = ((self.X_data - self.X_mean) / self.X_std).astype(np.float32)
+
+        # Pre-compute normalized weights.
+        self.w_norm_data = (self.w_data / self.weight_mean).astype(np.float32)
 
         print(f"  weight_mean={self.weight_mean:.3e}  f0={self.f0:.3e}")
 
@@ -242,31 +253,60 @@ class RadiationDataset(Dataset):
 
     def __getitem__(self, idx: int):
         mirrored = self.mirror and (idx >= self.n_valid)
-        raw_idx  = idx - self.n_valid if mirrored else idx
+        raw_idx = idx - self.n_valid if mirrored else idx
 
         # --- inputs ---
-        # np.array() with copy=False returns a view if possible.
-        # torch.from_numpy() on a C-contiguous float32 row is zero-copy.
-        x_raw  = self.X_data[raw_idx]                  # (9,) float32 view
-        x_norm = (x_raw - self.X_mean) / self.X_std    # new (9,) float32 array
+        # Copy the pre-normalized row so we can flip ky if needed.
+        x_norm = self.X_norm_data[raw_idx].copy()
 
         if mirrored:
             x_norm[self.KY_IDX] = -x_norm[self.KY_IDX]
 
-        # --- output ---
-        y_t    = float(self._transform_y(
-                     self.y_data[raw_idx : raw_idx + 1]  # slice keeps it as array
-                 )[0])
-        y_norm = (y_t - self.y_mean) / self.y_std
+        # --- output (pre-computed, just index) ---
+        y_norm = self.y_norm_data[raw_idx]
 
-        # --- weight ---
-        w_norm = float(self.w_data[raw_idx]) / self.weight_mean
+        # --- weight (pre-computed, just index) ---
+        w_norm = self.w_norm_data[raw_idx]
 
         return (
-            torch.from_numpy(x_norm),                              # zero-copy
+            torch.from_numpy(x_norm),  # zero-copy after .copy()
             torch.tensor(y_norm, dtype=torch.float32),
             torch.tensor(w_norm, dtype=torch.float32),
         )
+
+    def __getitems__(self, indices: list[int]) -> list:
+        """
+        Batch fetch — called by DataLoader instead of N separate __getitem__ calls.
+        One vectorized NumPy fancy-index per array rather than N Python call
+        round-trips, which eliminates the per-sample Python overhead entirely.
+        """
+        indices = np.asarray(indices, dtype=np.intp)
+
+        if self.mirror:
+            mirrored_mask = indices >= self.n_valid
+            raw_indices = np.where(mirrored_mask, indices - self.n_valid, indices)
+        else:
+            mirrored_mask = np.zeros(len(indices), dtype=bool)
+            raw_indices = indices
+
+        # Single fancy-index per array — one C-level call each.
+        X_batch = self.X_norm_data[raw_indices].copy()  # (B, 9), copy needed for ky flip
+        y_batch = self.y_norm_data[raw_indices]  # (B,)
+        w_batch = self.w_norm_data[raw_indices]  # (B,)
+
+        # Flip ky for mirrored samples (vectorized).
+        if self.mirror and mirrored_mask.any():
+            X_batch[mirrored_mask, self.KY_IDX] *= -1
+
+        # Return a list of tuples as the DataLoader's default_collate expects.
+        return [
+            (
+                torch.from_numpy(X_batch[i]),
+                torch.tensor(y_batch[i], dtype=torch.float32),
+                torch.tensor(w_batch[i], dtype=torch.float32),
+            )
+            for i in range(len(indices))
+        ]
 
     # ------------------------------------------------------------------
     # Normalization export (unchanged)
@@ -726,8 +766,8 @@ def train_model(config: TrainingConfig):
     if config.run_lr_finder:
         print("\nRunning LR range test...")
         print("-" * 70)
-        lrs, losses = find_learning_rate(model, train_loader, optimizer, config)
-        suggested_lr = plot_lr_finder(lrs, losses)
+        lrs, losses, raw_losses = find_learning_rate(model, train_loader, optimizer, config)
+        suggested_lr = plot_lr_finder(lrs, losses, raw_losses)
         print(f"\nRe-run with --learning-rate {suggested_lr / 3:.2e} (1/3 of suggested)")
         return model, dataset.get_normalization_params()
 
