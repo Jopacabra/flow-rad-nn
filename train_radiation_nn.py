@@ -1205,11 +1205,12 @@ def find_learning_rate(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
-        start_lr: float = 1e-5,
-        end_lr: float = 3e-2,
-        n_steps: int = 20,
-        smoothing: float = 0.3,
-) -> Tuple[list, list]:
+        start_lr: float = 1e-4,    # narrower range start
+        end_lr: float = 1e-1,      # narrower range end
+        n_steps: int = 150,        # far more steps for resolution
+        smoothing: float = 0.9,   # heavy EMA, standard for LR finders
+        diverge_threshold: float = 4.0,  # stop if loss exceeds this × best
+) -> Tuple[list, list, list]:
     """
     Learning rate range test (Smith 2015).
 
@@ -1223,34 +1224,38 @@ def find_learning_rate(
     losses : list of float
         Smoothed loss at each learning rate
     """
-    # Save original model and optimizer state so we can restore after the test
     import copy
-    original_model_state = copy.deepcopy(model.state_dict())
+    original_model_state     = copy.deepcopy(model.state_dict())
     original_optimizer_state = copy.deepcopy(optimizer.state_dict())
 
-    # Set starting LR
     for pg in optimizer.param_groups:
         pg['lr'] = start_lr
 
     lr_multiplier = (end_lr / start_lr) ** (1.0 / n_steps)
 
-    lrs = []
-    losses = []
-    smoothed_loss = None
+    lrs:    list[float] = []
+    losses: list[float] = []
+    raw_losses: list[float] = []
+    smoothed_loss: Optional[float] = None
     best_loss = float('inf')
 
     model.train()
     data_iter = iter(dataloader)
 
+    print(f"  LR range: {start_lr:.1e} → {end_lr:.1e}  |  "
+          f"steps: {n_steps}  |  "
+          f"LR multiplier/step: {lr_multiplier:.4f}")
+    print(f"  {'Step':>5}  {'LR':>10}  {'Raw Loss':>12}  {'Smoothed':>12}")
+    print(f"  {'-'*5}  {'-'*10}  {'-'*12}  {'-'*12}")
+
     for step in range(n_steps):
-        # Get next batch, cycling through dataloader if needed
         try:
             inputs, targets, weights = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
             inputs, targets, weights = next(data_iter)
 
-        inputs = inputs.to(config.device)
+        inputs  = inputs.to(config.device)
         targets = targets.to(config.device)
         weights = weights.to(config.device)
 
@@ -1261,69 +1266,89 @@ def find_learning_rate(
 
         raw_loss = components['mse']
 
-        # Exponential smoothing to reduce noise
+        # Bias-corrected EMA — prevents the first few steps from being
+        # artificially low just because smoothed_loss started at zero.
         if smoothed_loss is None:
             smoothed_loss = raw_loss
         else:
-            smoothed_loss = smoothing * raw_loss + (1.0 - smoothing) * smoothed_loss
+            smoothed_loss = smoothing * smoothed_loss + (1.0 - smoothing) * raw_loss
+        bias_correction = 1.0 - smoothing ** (step + 1)
+        loss_debiased = smoothed_loss / bias_correction
 
         current_lr = optimizer.param_groups[0]['lr']
         lrs.append(current_lr)
-        losses.append(smoothed_loss)
+        losses.append(loss_debiased)
+        raw_losses.append(raw_loss)
 
-        # Stop early if loss has exploded (5x best seen so far)
-        if smoothed_loss < best_loss:
-            best_loss = smoothed_loss
-        if smoothed_loss > 5.0 * best_loss:
-            print(f"  Loss diverged at LR={current_lr:.2e}, stopping early.")
+        if step % 10 == 0:
+            print(f"  {step:>5}  {current_lr:>10.2e}  "
+                  f"{raw_loss:>12.4e}  {loss_debiased:>12.4e}")
+
+        # Track best and stop on divergence
+        if loss_debiased < best_loss:
+            best_loss = loss_debiased
+        if loss_debiased > diverge_threshold * best_loss:
+            print(f"  Loss diverged at step {step}, LR={current_lr:.2e} — stopping early.")
             break
 
-        # Increase LR for next step
         for pg in optimizer.param_groups:
             pg['lr'] *= lr_multiplier
 
-    # Restore model and optimizer to pre-test state
+    # Restore everything
     model.load_state_dict(original_model_state)
     optimizer.load_state_dict(original_optimizer_state)
 
-    return lrs, losses
+    return lrs, losses, raw_losses
 
 
-def plot_lr_finder(lrs: list, losses: list):
+def plot_lr_finder(lrs: list, losses: list, raw_losses: Optional[list] = None):
     """Plot the LR finder curve and print the suggested learning rate."""
     import matplotlib.pyplot as plt
-    import numpy as np
 
-    lrs = np.array(lrs)
+    lrs    = np.array(lrs)
     losses = np.array(losses)
 
-    # Only consider the region before the loss minimum (descending slope)
-    min_loss_idx = np.argmin(losses)
-    lrs_descending = lrs[:min_loss_idx + 1]
-    losses_descending = losses[:min_loss_idx + 1]
+    # Suggested LR: steepest negative gradient on the smoothed curve,
+    # but only in the region before the minimum (ignore the diverging tail)
+    min_idx  = np.argmin(losses)
+    # Clamp the window: ignore the first 10% of steps (EMA not yet settled)
+    # and everything after the minimum
+    start_idx = max(1, len(lrs) // 10)
+    lrs_w    = lrs[start_idx : min_idx + 1]
+    losses_w = losses[start_idx : min_idx + 1]
 
-    # Suggest the LR at the point of steepest negative gradient on the descending slope
-    if len(lrs_descending) > 1:
-        gradients = np.gradient(losses_descending, np.log10(lrs_descending))
-        suggested_idx = np.argmin(gradients)
-        suggested_lr = lrs_descending[suggested_idx]
+    if len(lrs_w) > 1:
+        gradients     = np.gradient(losses_w, np.log10(lrs_w))
+        suggested_idx = np.argmin(gradients) + start_idx
+        suggested_lr  = lrs[suggested_idx]
     else:
-        # Fallback: use the LR just before the minimum
-        suggested_idx = max(0, min_loss_idx - 1)
-        suggested_lr = lrs[suggested_idx]
+        suggested_idx = max(0, min_idx - 1)
+        suggested_lr  = lrs[suggested_idx]
 
     print(f"\nLR Finder Results:")
+    print(f"  Minimum loss at LR:              {lrs[min_idx]:.2e}")
     print(f"  Suggested LR (steepest descent): {suggested_lr:.2e}")
-    print(f"  Loss at suggested LR:            {losses[suggested_idx]:.4e}")
-    print(f"  (Consider using ~1/3 to 1/10 of this as your starting LR)")
+    print(f"  Recommended starting LR (1/3):   {suggested_lr / 3:.2e}")
 
-    fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(lrs, losses, linewidth=2)
-    ax.axvline(suggested_lr, color='red', linestyle='--',
-               label=f'Suggested LR: {suggested_lr:.2e}')
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    # Smoothed curve (primary)
+    ax.plot(lrs, losses, linewidth=2.5, label='Smoothed loss', color='steelblue')
+
+    # Raw curve (secondary)
+    ax.plot(lrs, raw_losses, ls=":", lw=1, label='Raw loss', color='steelblue')
+
+    # Vertical lines
+    ax.axvline(lrs[min_idx], color='gray', linestyle=':', linewidth=1.2,
+               label=f'Loss minimum  ({lrs[min_idx]:.2e})')
+    ax.axvline(suggested_lr, color='red', linestyle='--', linewidth=1.5,
+               label=f'Suggested LR  ({suggested_lr:.2e})')
+    ax.axvline(suggested_lr / 3, color='orange', linestyle='--', linewidth=1.5,
+               label=f'Recommended (÷3)  ({suggested_lr / 3:.2e})')
+
     ax.set_xscale('log')
     ax.set_xlabel('Learning Rate (log scale)')
-    ax.set_ylabel('Smoothed Loss')
+    ax.set_ylabel('Smoothed Loss (bias-corrected EMA)')
     ax.set_title('Learning Rate Range Test')
     ax.legend()
     ax.grid(True, alpha=0.3)
