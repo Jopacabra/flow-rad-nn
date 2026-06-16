@@ -40,7 +40,7 @@ def merge(input_files: list[str], output_file: str):
     with h5py.File(output_file, 'w') as f:
         for key in DATASETS:
             full = combined[key]
-            f.create_dataset(key, data=full)
+            f.create_dataset(key, data=full, chunks=(65_536), compression=None)  # Align chunks to batch reads
         f.attrs['n_samples'] = total_original
         f.attrs['n_original'] = total_original
         f.attrs['source_files'] = [str(fn) for fn in input_files]
