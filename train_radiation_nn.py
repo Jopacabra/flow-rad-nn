@@ -732,9 +732,8 @@ def train_model(config: TrainingConfig):
             pin_memory=True,
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=config.batch_size, shuffle=False,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
+            val_dataset, batch_size=config.batch_size * 4, shuffle=False,
+            num_workers=0,  # No workers needed: no backward pass to overlap with
             pin_memory=True,
         )
     elif config.device == "cpu":
@@ -744,9 +743,8 @@ def train_model(config: TrainingConfig):
             persistent_workers=config.num_workers > 0,
         )
         val_loader = DataLoader(
-            val_dataset, batch_size=config.batch_size, shuffle=False,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
+            val_dataset, batch_size=config.batch_size * 4, shuffle=False,
+            num_workers=0,
         )
 
     # Create model
