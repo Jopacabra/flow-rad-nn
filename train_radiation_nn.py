@@ -644,7 +644,10 @@ def save_training_checkpoint(
 ):
     """Save a full training state for resumption."""
     raw_state_dict = model.state_dict()
-    fixed_state_dict = {k.removeprefix('_orig_mod.'): v for k, v in raw_state_dict.items()}
+    fixed_state_dict = {
+        k.removeprefix('_orig_mod.').removeprefix('module.'): v
+        for k, v in raw_state_dict.items()
+    }
     torch.save({
         'epoch': epoch,
         'model_state_dict': fixed_state_dict,
@@ -668,8 +671,17 @@ def load_training_checkpoint(
     """
     print(f"Resuming from checkpoint: {path}")
     ckpt = torch.load(path, map_location=device)
-    state_dict = {k.removeprefix('_orig_mod.'): v for k, v in ckpt['model_state_dict'].items()}
-    model.load_state_dict(state_dict)
+    # Strip both torch.compile's '_orig_mod.' and DataParallel's 'module.' prefixes.
+    # Checkpoints are always stored in bare (unwrapped) format, so we load into
+    # the bare model first, then let DataParallel/compile wrap it afterwards.
+    bare_state_dict = {
+        k.removeprefix('_orig_mod.').removeprefix('module.'): v
+        for k, v in ckpt['model_state_dict'].items()
+    }
+    # Unwrap the model to load into the bare RadiationEmulator, then re-wrap.
+    bare_model = model.module if isinstance(model, nn.DataParallel) else model
+    bare_model = getattr(bare_model, '_orig_mod', bare_model)  # unwrap torch.compile
+    bare_model.load_state_dict(bare_state_dict)
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     scheduler.load_state_dict(ckpt['scheduler_state_dict'])
     start_epoch    = ckpt['epoch'] + 1          # resume at the *next* epoch
