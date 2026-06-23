@@ -829,11 +829,11 @@ def train_model(config: TrainingConfig):
                 break
 
             # Train
-            print("Training...")
+            # print("Training...")
             train_metrics = train_epoch(model, train_loader, optimizer, config)
 
             # Validate
-            print("Validating...")
+            # print("Validating...")
             val_metrics = validate(model, val_loader, config)
 
             # Update scheduler
