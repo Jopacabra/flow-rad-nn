@@ -24,6 +24,9 @@ import h5py
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict
 import json
@@ -275,11 +278,6 @@ class RadiationDataset(Dataset):
         )
 
     def __getitems__(self, indices: list[int]) -> list:
-        """
-        Batch fetch — called by DataLoader instead of N separate __getitem__ calls.
-        One vectorized NumPy fancy-index per array rather than N Python call
-        round-trips, which eliminates the per-sample Python overhead entirely.
-        """
         indices = np.asarray(indices, dtype=np.intp)
 
         if self.mirror:
@@ -289,23 +287,19 @@ class RadiationDataset(Dataset):
             mirrored_mask = np.zeros(len(indices), dtype=bool)
             raw_indices = indices
 
-        # Single fancy-index per array — one C-level call each.
-        X_batch = self.X_norm_data[raw_indices].copy()  # (B, 9), copy needed for ky flip
-        y_batch = self.y_norm_data[raw_indices]  # (B,)
-        w_batch = self.w_norm_data[raw_indices]  # (B,)
+        X_batch = self.X_norm_data[raw_indices].copy()
+        y_batch = self.y_norm_data[raw_indices]
+        w_batch = self.w_norm_data[raw_indices]
 
-        # Flip ky for mirrored samples (vectorized).
         if self.mirror and mirrored_mask.any():
             X_batch[mirrored_mask, self.KY_IDX] *= -1
 
-        # Return a list of tuples as the DataLoader's default_collate expects.
+        # ✅ Return three tensors — collate_fn receives one "sample" and passes
+        # it straight through without any further stacking.
         return [
-            (
-                torch.from_numpy(X_batch[i]),
-                torch.tensor(y_batch[i], dtype=torch.float32),
-                torch.tensor(w_batch[i], dtype=torch.float32),
-            )
-            for i in range(len(indices))
+            torch.from_numpy(X_batch),
+            torch.from_numpy(y_batch.copy()),  # copy() to own the memory
+            torch.from_numpy(w_batch.copy()),
         ]
 
     # ------------------------------------------------------------------
@@ -327,6 +321,63 @@ class RadiationDataset(Dataset):
     def shutdown(self):
         pass
 
+class RadiationSubset(Dataset):
+    """
+    A view into a RadiationDataset restricted to a subset of *physical* indices.
+
+    Parameters
+    ----------
+    dataset : RadiationDataset
+        The parent dataset (already loaded into RAM).
+    physical_indices : np.ndarray, dtype=np.intp
+        Indices into dataset.X_norm_data / y_norm_data / w_norm_data.
+        Must be in [0, dataset.n_valid).
+    mirror : bool
+        Whether to expose a mirrored (ky → -ky) copy of every sample.
+        Typically True for training, False for validation.
+    """
+
+    def __init__(
+        self,
+        dataset: RadiationDataset,
+        physical_indices: np.ndarray,
+        mirror: bool = True,
+    ):
+        self.ds      = dataset
+        self.idx     = np.asarray(physical_indices, dtype=np.intp)
+        self.mirror  = mirror
+        self.n_phys  = len(self.idx)
+
+    def __len__(self) -> int:
+        return 2 * self.n_phys if self.mirror else self.n_phys
+
+    def __getitems__(self, positions: list[int]) -> list:
+        positions = np.asarray(positions, dtype=np.intp)
+
+        if self.mirror:
+            mirrored_mask = positions >= self.n_phys
+            local_idx     = np.where(mirrored_mask, positions - self.n_phys, positions)
+        else:
+            mirrored_mask = np.zeros(len(positions), dtype=bool)
+            local_idx     = positions
+
+        # Map local positions → physical dataset indices (one fancy-index)
+        phys_idx = self.idx[local_idx]
+
+        # Single C-level read per array — fully contiguous because self.idx
+        # was built from a sorted or pre-shuffled contiguous slice
+        X_batch = self.ds.X_norm_data[phys_idx].copy()   # copy needed for ky flip
+        y_batch = self.ds.y_norm_data[phys_idx].copy()
+        w_batch = self.ds.w_norm_data[phys_idx].copy()
+
+        if self.mirror and mirrored_mask.any():
+            X_batch[mirrored_mask, RadiationDataset.KY_IDX] *= -1
+
+        return [
+            torch.from_numpy(X_batch),
+            torch.from_numpy(y_batch),
+            torch.from_numpy(w_batch),
+        ]
 
 # ==============================================================================
 # Neural Network Model
@@ -703,6 +754,12 @@ def train_model(config: TrainingConfig):
     print(f"Data file: {config.data_file}")
     print()
 
+    # Initialise the process group (SLURM sets RANK/WORLD_SIZE automatically)
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    config.device = f"cuda:{local_rank}"
+
     # Load dataset
     dataset = RadiationDataset(config.data_file, transform_output=config.transform)
 
@@ -712,39 +769,51 @@ def train_model(config: TrainingConfig):
     with open(config.normalization_file, 'w') as f:
         json.dump(norm_params, f, indent=2)
 
-    # Split into train/validation
-    n_train = int(len(dataset) * config.train_fraction)
-    n_val = len(dataset) - n_train
-    train_dataset, val_dataset = random_split(
-        dataset, [n_train, n_val],
-        generator=torch.Generator().manual_seed(42)
-    )
+    # Split on *physical* indices before mirroring, so each subset gets a
+    # contiguous, cache-friendly slice of the underlying arrays.
+    n_phys_train = int(dataset.n_valid * config.train_fraction)
+
+    rng_split = np.random.default_rng(42)
+    perm = rng_split.permutation(dataset.n_valid).astype(np.intp)
+
+    train_idx = perm[:n_phys_train]
+    val_idx = perm[n_phys_train:]
+
+    # Training subset: mirrored (doubles the effective dataset size).
+    # Validation subset: no mirroring — we want unbiased coverage.
+    train_dataset = RadiationSubset(dataset, train_idx, mirror=config.mirror)
+    val_dataset = RadiationSubset(dataset, val_idx, mirror=False)
 
     print(f"Training samples: {n_train}")
     print(f"Validation samples: {n_val}")
 
     # Create dataloaders
+    train_sampler = DistributedSampler(train_dataset, shuffle=True)
     if config.device == "cuda":
         train_loader = DataLoader(
-            train_dataset, batch_size=config.batch_size, shuffle=True,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
+            train_dataset, batch_size=config.batch_size, sampler=train_sampler,
+            num_workers=0,  #config.num_workers,
+            # persistent_workers=config.num_workers > 0,
             pin_memory=True,
+            collate_fn=lambda x: x
         )
         val_loader = DataLoader(
             val_dataset, batch_size=config.batch_size * 4, shuffle=False,
             num_workers=0,  # No workers needed: no backward pass to overlap with
             pin_memory=True,
+            collate_fn=lambda x: x
         )
     elif config.device == "cpu":
         train_loader = DataLoader(
-            train_dataset, batch_size=config.batch_size, shuffle=True,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
+            train_dataset, batch_size=config.batch_size, sampler=train_sampler,
+            num_workers=0,  #config.num_workers,
+            # persistent_workers=config.num_workers > 0,
+            collate_fn=lambda x: x
         )
         val_loader = DataLoader(
             val_dataset, batch_size=config.batch_size * 4, shuffle=False,
             num_workers=0,
+            collate_fn=lambda x: x
         )
 
     # Create model
@@ -860,7 +929,7 @@ def train_model(config: TrainingConfig):
                 # so that the checkpoint is always loadable without torch.compile.
                 raw_state_dict = model.state_dict()
                 fixed_state_dict = {
-                    k.removeprefix('_orig_mod.'): v
+                    k.removeprefix('_orig_mod.').removeprefix('module.'): v
                     for k, v in raw_state_dict.items()
                 }
 
@@ -978,7 +1047,7 @@ class RadiationEmulatorInference:
         except RuntimeError:
             # Strip torch.compile's '_orig_mod.' prefix if present (backward compatible)
             state_dict = {
-                k.removeprefix('_orig_mod.'): v
+                k.removeprefix('_orig_mod.').removeprefix('module.'): v
                 for k, v in checkpoint['model_state_dict'].items()
             }
             self.model.load_state_dict(state_dict)
@@ -1024,10 +1093,14 @@ class RadiationEmulatorInference:
         with torch.no_grad():
             predictions_norm = self.model(inputs_norm).squeeze()
 
+
         # Stay on CPU as a numpy array; avoid an extra .cpu() call
         # by using the tensor directly when device is already CPU.
         pn = predictions_norm if self.device == "cpu" else predictions_norm.cpu()
+        # print(f"normed predictions: {np.mean(pn)}")
+        # print(pn)
         predictions_transformed = pn.numpy() * self.y_std + self.y_mean
+        print(f"denormed: {np.mean(predictions_transformed)}")
 
         if self.transform == "log":
             predictions = np.exp(np.abs(predictions_transformed)) - self.epsilon
@@ -1037,6 +1110,7 @@ class RadiationEmulatorInference:
         else:
             predictions = predictions_transformed
 
+        print(f"after transform: {np.mean(predictions)}")
         return predictions
 
     def predict_raw(self, inputs: np.ndarray) -> np.ndarray:
