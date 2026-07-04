@@ -633,7 +633,10 @@ def train_epoch(
     total_mse = 0.0
     n_batches = 0
 
-    for inputs, targets, weights in dataloader:
+    for i, (inputs, targets, weights) in enumerate(dataloader):
+        if i % 100 == 0:
+            print(f"  Batch {i}/{len(dataloader)}  [{time.time() - t0:.3f}s/batch]")
+        t0 = time.time()
         inputs = inputs.to(config.device)
         targets = targets.to(config.device)
         weights = weights.to(config.device)
