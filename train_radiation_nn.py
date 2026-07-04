@@ -834,8 +834,8 @@ def train_model(config: TrainingConfig):
         train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size, sampler=train_sampler,
             shuffle=shuffle_train,
-            num_workers=0,  #config.num_workers,
-            # persistent_workers=config.num_workers > 0,
+            num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0,
             pin_memory=True,
             collate_fn=lambda x: x
         )
@@ -849,8 +849,8 @@ def train_model(config: TrainingConfig):
         train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size, sampler=train_sampler,
             shuffle=shuffle_train,
-            num_workers=0,  #config.num_workers,
-            # persistent_workers=config.num_workers > 0,
+            num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0,
             collate_fn=lambda x: x
         )
         val_loader = DataLoader(
