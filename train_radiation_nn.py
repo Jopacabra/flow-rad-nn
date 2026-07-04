@@ -875,9 +875,7 @@ def train_model(config: TrainingConfig):
         # Local machine with multiple GPUs but not launched via torchrun —
         # DataParallel is the fallback here, or you can just use one GPU.
         print(f"Multiple GPUs available but not running under torchrun. "
-              f"Using single GPU: {config.device}")
-
-    if torch.cuda.device_count() > 1:
+              f"Using DataParallel.")
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = nn.DataParallel(model)
 
