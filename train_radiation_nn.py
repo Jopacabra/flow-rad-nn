@@ -868,6 +868,17 @@ def train_model(config: TrainingConfig):
         dropout_p=config.dropout_p,
     ).to(config.device)
 
+    # ── Resume from checkpoint if one exists ──────────────────────────────
+    if os.path.exists(config.checkpoint_file):
+        start_epoch, best_val_loss, patience_counter = load_training_checkpoint(
+            config.checkpoint_file, model, optimizer, scheduler, config.device
+        )
+    else:
+        print("No checkpoint found – starting from scratch.")
+        best_val_loss = float('inf')
+        patience_counter = 0
+        start_epoch = 0
+
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
         print(f"[rank {local_rank}] DDP model ready")
@@ -907,18 +918,6 @@ def train_model(config: TrainingConfig):
     )
 
     # Training loop
-    best_val_loss = float('inf')
-    patience_counter = 0
-    start_epoch = 0
-
-    # ── Resume from checkpoint if one exists ──────────────────────────────
-    if os.path.exists(config.checkpoint_file):
-        start_epoch, best_val_loss, patience_counter = load_training_checkpoint(
-            config.checkpoint_file, model, optimizer, scheduler, config.device
-        )
-    else:
-        print("No checkpoint found – starting from scratch.")
-
     if hasattr(torch, 'compile') and config.compile:
         model = torch.compile(model)
 
