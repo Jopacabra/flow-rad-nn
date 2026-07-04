@@ -945,6 +945,10 @@ def train_model(config: TrainingConfig):
         for epoch in range(start_epoch, config.n_epochs):
             current_epoch[0] = epoch
 
+            # Update the epoch in the sampler -- different order each epoch.
+            if is_distributed:
+                train_sampler.set_epoch(epoch)
+
             if _sigterm_received[0]:
                 print("Exiting cleanly after SIGTERM.")
                 break
