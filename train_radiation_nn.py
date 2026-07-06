@@ -876,6 +876,12 @@ def train_model(config: TrainingConfig):
         weight_decay=config.weight_decay,
     )
 
+    # Scheduler -- controls the variation of learning rate over training epochs
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='min', factor=0.5, patience=10,
+        min_lr=6.24e-5,
+    )
+
     # ── Resume from checkpoint if one exists ──────────────────────────────
     if os.path.exists(config.checkpoint_file):
         start_epoch, best_val_loss, patience_counter = load_training_checkpoint(
@@ -887,6 +893,7 @@ def train_model(config: TrainingConfig):
         patience_counter = 0
         start_epoch = 0
 
+    # --- Wrap model in appropriate parallelization method ---
     if is_distributed:
         model = DDP(model, device_ids=[local_rank])
         print(f"[rank {local_rank}] DDP model ready")
@@ -910,12 +917,6 @@ def train_model(config: TrainingConfig):
         suggested_lr = plot_lr_finder(lrs, losses, raw_losses)
         print(f"\nRe-run with --learning-rate {suggested_lr / 3:.2e} (1/3 of suggested)")
         return model, dataset.get_normalization_params()
-
-    # Scheduler -- controls the variation of learning rate over training epochs
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=10,
-        min_lr=6.24e-5,
-    )
 
     # Training loop
     if hasattr(torch, 'compile') and config.compile:
