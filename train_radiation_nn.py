@@ -634,14 +634,17 @@ def train_epoch(
     total_mse = 0.0
     n_batches = 0
 
+    t0 = time.time()
     for i, (inputs, targets, weights) in enumerate(dataloader):
-        if i % 100 == 0 and i != 0:
-            print(f"  Batch {i}/{len(dataloader)}  [{time.time() - t0:.3f}s/batch]")
-        t0 = time.time()
+        # if i % 10000 == 0 and i != 0:
+        #     print(f"  Batch {i}/{len(dataloader)}  [avg {(time.time() - t0)/i:.3f}s/batch]")
+
+        # Send tensors to device
         inputs = inputs.to(config.device)
         targets = targets.to(config.device)
         weights = weights.to(config.device)
 
+        # Compute loss and step optimizer
         optimizer.zero_grad()
         loss, components = compute_loss(model, inputs, targets, weights, config)
         loss.backward()
