@@ -868,6 +868,14 @@ def train_model(config: TrainingConfig):
         dropout_p=config.dropout_p,
     ).to(config.device)
 
+    # Optimizer -- applies various strategies that change the way we use our neurons
+    # Controls usage of dropout and L2 regularization to encourage generalization instead of memorization
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=config.learning_rate,
+        weight_decay=config.weight_decay,
+    )
+
     # ── Resume from checkpoint if one exists ──────────────────────────────
     if os.path.exists(config.checkpoint_file):
         start_epoch, best_val_loss, patience_counter = load_training_checkpoint(
@@ -892,14 +900,6 @@ def train_model(config: TrainingConfig):
 
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
-
-    # Optimizer -- applies various strategies that change the way we use our neurons
-    # Controls usage of dropout and L2 regularization to encourage generalization instead of memorization
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.learning_rate,
-        weight_decay=config.weight_decay,
-    )
 
     # LR finder -- to be run before the main training loop, finds optimal learning rate
     # Looks for minima in the loss as function of learning rate, returns rate just before minima in loss function
