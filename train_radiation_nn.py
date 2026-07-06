@@ -765,36 +765,48 @@ def setup_device(config: TrainingConfig) -> tuple[bool, int]:
     local_rank : int
         The rank of this process on the current node (0 if not distributed).
     """
-    is_distributed = (
-        "LOCAL_RANK" in os.environ       # torchrun sets this
-        and torch.cuda.is_available()
-        # and torch.cuda.device_count() > 1  # LOCAL_RANK being available already proves we're in a distributed setting
-    )
-
-    if is_distributed:
-        print(f"  Running distributed training with torchrun / SLURM.  LOCAL_RANK: {os.environ['LOCAL_RANK']}, ")
-        local_rank = int(os.environ["LOCAL_RANK"])
-        dist.init_process_group(backend="nccl")
-        torch.cuda.set_device(local_rank)
-        config.device = f"cuda:{local_rank}"
-        if local_rank == 0:
-            print(f"Distributed training: {dist.get_world_size()} GPUs")
-    else:
+    if "LOCAL_RANK" not in os.environ:
+        # Not launched via torchrun — single process
         local_rank = 0
         if torch.cuda.is_available():
-            config.device = "cuda"
+            config.device = "cuda:0"
             print("Single-GPU training")
         else:
             config.device = "cpu"
             print("CPU training")
+        return False, local_rank
 
-    return is_distributed, local_rank
+        # Launched via torchrun — always treat as distributed
+    local_rank = int(os.environ["LOCAL_RANK"])
+    world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+    if world_size > 1 and torch.cuda.is_available():
+        # MUST set device before init_process_group
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        config.device = f"cuda:{local_rank}"
+        if local_rank == 0:
+            print(f"Distributed training: {dist.get_world_size()} GPUs")
+        return True, local_rank
+    else:
+        # torchrun with 1 process, or no GPU
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            config.device = f"cuda:{local_rank}"
+            print("Single-GPU training (via torchrun)")
+        else:
+            config.device = "cpu"
+            print("CPU training")
+        return False, local_rank
 
 # ==============================================================================
 # Main training function
 # ==============================================================================
 def train_model(config: TrainingConfig):
     """Train the radiation emulator model."""
+    print(f"[rank {os.environ.get('LOCAL_RANK', '?')}] "
+          f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'NOT SET')} "
+          f"device_count={torch.cuda.device_count()}")
 
     print("=" * 70)
     print("RADIATION EMULATOR TRAINING")
