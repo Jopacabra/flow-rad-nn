@@ -240,8 +240,8 @@ def make_comparison_plot(
     param_str = (
         f"$x={params['x']:.2f}$, "
         f"$E={params['E']:.1f}$ GeV, "
-        f"$z_0={params['z0']:.1f}$ fm, "
-        f"$z_f={params['zf']:.1f}$ fm, "
+        f"$z_0={params['z0']:.1f}$ GeV^-1, "
+        f"$z_f={params['zf']:.1f}$ GeV^-1, "
         f"$u_\\perp={params['u_perp']:.2f}$, "
         f"$T={params['T']:.3f}$ GeV, "
         f"$g={params['g']:.2f}$"
@@ -368,8 +368,8 @@ def make_combined_plot(
     param_str = (
         # f"$x={params['x']:.2f}$, "
         f"$E={params['E']:.1f}$ GeV, "
-        f"$z_0={params['z0']:.1f}$ fm, "
-        f"$z_f={params['zf']:.1f}$ fm, "
+        f"$z_0={params['z0']:.1f}$ GeV^-1, "
+        f"$z_f={params['zf']:.1f}$ GeV^-1, "
         f"$u_\\perp={params['u_perp']:.2f}$, "
         f"$T={params['T']:.3f}$ GeV, "
         f"$g={params['g']:.2f}$"
@@ -390,8 +390,8 @@ def main():
     )
     parser.add_argument('--x',       type=float, default=DEFAULTS['x'],      help='Momentum fraction x')
     parser.add_argument('--E',       type=float, default=DEFAULTS['E'],      help='Parton energy (GeV)')
-    parser.add_argument('--z0',      type=float, default=DEFAULTS['z0'],     help='Initial longitudinal position (fm)')
-    parser.add_argument('--zf',      type=float, default=DEFAULTS['zf'],     help='Final longitudinal position (fm)')
+    parser.add_argument('--z0',      type=float, default=DEFAULTS['z0'],     help='Initial longitudinal position (invGeV)')
+    parser.add_argument('--zf',      type=float, default=DEFAULTS['zf'],     help='Final longitudinal position (invGeV)')
     parser.add_argument('--u-perp',  type=float, default=DEFAULTS['u_perp'], help='Transverse flow magnitude')
     parser.add_argument('--T',       type=float, default=DEFAULTS['T'],      help='Temperature (GeV)')
     parser.add_argument('--g',       type=float, default=DEFAULTS['g'],      help='Coupling constant')
@@ -455,6 +455,10 @@ def main():
         kx_values=kx_values,
         ky_values=ky_values,
     )
+    print(f"  NN Prediction max: {np.amax(I_nn)}")
+    print(f"  NN Prediction min: {np.amin(I_nn)}")
+    print(f"  NN Prediction mean: {np.mean(I_nn)}")
+    print(f"  NN Prediction nanmean: {np.nanmean(I_nn)}")
     print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms "
           f"for {args.n_kx * args.n_ky} points")
 
