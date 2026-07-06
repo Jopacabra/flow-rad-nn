@@ -733,15 +733,24 @@ def load_training_checkpoint(
         k.removeprefix('_orig_mod.').removeprefix('module.'): v
         for k, v in ckpt['model_state_dict'].items()
     }
+
     # Unwrap the model to load into the bare RadiationEmulator, then re-wrap.
     bare_model = model.module if isinstance(model, nn.DataParallel) else model
     bare_model = getattr(bare_model, '_orig_mod', bare_model)  # unwrap torch.compile
     bare_model.load_state_dict(bare_state_dict)
+
+    # Force model to device passed to this function
+    bare_model.to(device)
+
+    # Setup optimizer and scheduler from the checkpoint.
     optimizer.load_state_dict(ckpt['optimizer_state_dict'])
     scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+
+    # Set counters
     start_epoch    = ckpt['epoch'] + 1          # resume at the *next* epoch
     best_val_loss  = ckpt['best_val_loss']
     patience_counter = ckpt['patience_counter']
+
     print(f"  Resumed from epoch {ckpt['epoch'] + 1}  |  best val loss: {best_val_loss:.4e}")
     return start_epoch, best_val_loss, patience_counter
 
@@ -763,6 +772,7 @@ def setup_device(config: TrainingConfig) -> tuple[bool, int]:
     )
 
     if is_distributed:
+        print(f"  Running distributed training with torchrun / SLURM.  LOCAL_RANK: {os.environ['LOCAL_RANK']}, ")
         local_rank = int(os.environ["LOCAL_RANK"])
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
@@ -896,6 +906,7 @@ def train_model(config: TrainingConfig):
 
     # --- Wrap model in appropriate parallelization method ---
     if is_distributed:
+        print(f"[rank {local_rank}] model device: {next(model.parameters()).device}")
         model = DDP(model, device_ids=[local_rank])
         print(f"[rank {local_rank}] DDP model ready")
     elif torch.cuda.device_count() > 1:
