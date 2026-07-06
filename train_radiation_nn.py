@@ -39,6 +39,7 @@ import queue
 
 # Set use of float32 for matmuls to improve performance. Trial feature -- may impact accuracy, depending on problem.
 torch.set_float32_matmul_precision('high')
+torch.serialization.add_safe_globals([dict])  # save to load a nested dictionary with weights_only
 
 # ==============================================================================
 # Configuration
@@ -724,7 +725,7 @@ def load_training_checkpoint(
     Load a training checkpoint.  Returns (start_epoch, best_val_loss, patience_counter).
     """
     print(f"Resuming from checkpoint: {path}")
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=True)
     # Strip both torch.compile's '_orig_mod.' and DataParallel's 'module.' prefixes.
     # Checkpoints are always stored in bare (unwrapped) format, so we load into
     # the bare model first, then let DataParallel/compile wrap it afterwards.
@@ -758,7 +759,7 @@ def setup_device(config: TrainingConfig) -> tuple[bool, int]:
     is_distributed = (
         "LOCAL_RANK" in os.environ       # torchrun sets this
         and torch.cuda.is_available()
-        and torch.cuda.device_count() > 1
+        # and torch.cuda.device_count() > 1  # LOCAL_RANK being available already proves we're in a distributed setting
     )
 
     if is_distributed:
@@ -830,7 +831,20 @@ def train_model(config: TrainingConfig):
     else:
         train_sampler = None
         shuffle_train = True
-    if config.device == "cuda":
+    if config.device == "cpu":
+        train_loader = DataLoader(
+            train_dataset, batch_size=config.batch_size, sampler=train_sampler,
+            shuffle=shuffle_train,
+            num_workers=config.num_workers,
+            persistent_workers=config.num_workers > 0,
+            collate_fn=lambda x: x
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=config.batch_size * 4, shuffle=False,
+            num_workers=0,
+            collate_fn=lambda x: x
+        )
+    else:
         train_loader = DataLoader(
             train_dataset, batch_size=config.batch_size, sampler=train_sampler,
             shuffle=shuffle_train,
@@ -843,19 +857,6 @@ def train_model(config: TrainingConfig):
             val_dataset, batch_size=config.batch_size * 4, shuffle=False,
             num_workers=0,  # No workers needed: no backward pass to overlap with
             pin_memory=True,
-            collate_fn=lambda x: x
-        )
-    elif config.device == "cpu":
-        train_loader = DataLoader(
-            train_dataset, batch_size=config.batch_size, sampler=train_sampler,
-            shuffle=shuffle_train,
-            num_workers=config.num_workers,
-            persistent_workers=config.num_workers > 0,
-            collate_fn=lambda x: x
-        )
-        val_loader = DataLoader(
-            val_dataset, batch_size=config.batch_size * 4, shuffle=False,
-            num_workers=0,
             collate_fn=lambda x: x
         )
 
@@ -1082,7 +1083,7 @@ class RadiationEmulatorInference:
         self.epsilon = self.norm_params['epsilon']
 
         # Load model
-        checkpoint = torch.load(model_file, map_location=device)
+        checkpoint = torch.load(model_file, map_location=device, weights_only=True)
         model_config = checkpoint['config']
 
         self.model = RadiationEmulator(
