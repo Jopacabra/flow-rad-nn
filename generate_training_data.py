@@ -23,26 +23,10 @@ from pynndescent import NNDescent
 from dataclasses import dataclass
 from typing import Optional, Tuple, List
 import time
-import sys
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import numpy as np
-import vegas
 import h5py
-from pathlib import Path
-
-# Import medium property functions from plasma_interaction
-ape_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(ape_dir)
-import plasma_interaction
-
-
-# ==============================================================================
-# Physical constants
-# ==============================================================================
-NC = 3
-
-# Soft parton species for rho0 summation
-SOFT_PIDS = [1, -1, 2, -2, 3, -3, 21]
+from integration import _integrate_one, SOFT_PIDS
 
 
 # ==============================================================================
@@ -66,12 +50,6 @@ class SamplingConfig:
     T_range: Tuple[float, float] = (0.150, 0.500)  # Temperature in GeV
     g_range: Tuple[float, float] = (1.5, 2.5)  # Coupling constant g = sqrt(4*pi*alpha_s)
 
-    # Integration settings
-    q_lim_factor: float = 0.3  # q integration limits = ±factor * E
-    nitn_warmup: int = 5
-    nitn: int = 8
-    neval: int = 3000
-
     # Sampling settings
     n_initial: int = 1000  # Initial LHS samples
     n_adaptive_per_round: int = 500  # Samples per adaptive round
@@ -89,168 +67,6 @@ class SamplingConfig:
     # Output
     output_file: str = "radiation_training_data.h5"
     checkpoint_every: int = 2  # Save checkpoint every N rounds
-
-
-# ==============================================================================
-# Medium property helpers
-# ==============================================================================
-def compute_rho0(T: float) -> float:
-    """
-    Compute total density rho0 by summing over all soft parton species.
-    Uses plasma_interaction.rho() for each species.
-    """
-    rho0 = 0.0
-    for soft_pid in SOFT_PIDS:
-        rho0 += plasma_interaction.rho(T, soft_pid=soft_pid)
-    return rho0
-
-
-def compute_mu(T: float, g: float) -> float:
-    """
-    Compute Debye mass using plasma_interaction.mu_DeBye().
-    """
-    return plasma_interaction.mu_DeBye(T, g=g)
-
-
-# ==============================================================================
-# Integrand (adapted from radiation.py)
-# ==============================================================================
-def make_batch_integrand(x, kx, ky, E, T, g, u_perp):
-    """
-    Constructs a vegas batch integrand for the medium-induced gluon radiation
-    intensity at fixed (x, kx, ky, E, T, g, u_perp), integrating over (qx, qy, z).
-
-    Assumes u_y = 0 (flow along +x only).
-
-    Note: The Casimir factor (CF) is NOT included. Multiply by CF at runtime
-          depending on the hard particle flavor (4/3 for quarks, 3 for gluons).
-    """
-    # Compute alpha_s from g
-    alpha_s = g**2 / (4 * np.pi)
-
-    # Medium properties derived from T and g
-    rho0 = compute_rho0(T)
-    mu = compute_mu(T, g)
-    _mu2 = mu ** 2
-
-    # Flow (u_y = 0 by assumption)
-    ux = u_perp
-    uy = 0.0
-
-    # Constants WITHOUT CF factor (user will multiply by CF later)
-    _constants = alpha_s / (16 * (np.pi ** 2))
-
-    kk = kx * kx + ky * ky
-    ku = kx * ux + ky * uy
-    uu = ux * ux + uy * uy
-
-    # Protect against kk = 0
-    if kk < 1e-10:
-        kk = 1e-10
-
-    # Precompute g^4 for scattering potential
-    g4 = g ** 4
-
-    @vegas.batchintegrand
-    def integrand(pts):
-        qx = pts[:, 0]
-        qy = pts[:, 1]
-        z = pts[:, 2]
-
-        kmqx = kx - qx
-        kmqy = ky - qy
-
-        qq = qx * qx + qy * qy
-        kq = kx * qx + ky * qy
-        qu = qx * ux + qy * uy
-        kmqu = kmqx * ux + kmqy * uy
-        kmqq = kmqx * qx + kmqy * qy
-        kmqkmq = kmqx ** 2 + kmqy ** 2
-
-        # Protect against division by zero
-        kmqkmq = np.maximum(kmqkmq, 1e-10)
-
-        q2_mu2 = qq + _mu2
-        R_sq = qq + _mu2 - qu ** 2
-        R_sq = np.maximum(R_sq, 1e-10)  # Numerical protection
-        R = np.sqrt(R_sq)
-
-        # Scattering potential (uses g^4)
-        v2 = g4 / (q2_mu2 ** 2)
-        vm2dv2 = -2.0 / q2_mu2
-
-        # Term 1
-        t1 = (
-            (
-                (4.0 * kq / (kk * kmqkmq))
-                - (2.0 / (x * E)) * (1.0 / (kk * kmqkmq)) * (
-                    2.0 * kmqu * kk
-                    + 2.0 * ku * kmqq
-                    + kq * qu * (2.0 * kk - kmqkmq) * vm2dv2
-                )
-            )
-            * (1 - np.cos((kmqkmq / (2.0 * x * E)) * z))
-        )
-
-        # Term 2
-        t2 = (
-            (1.0 / (x * E)) * (ku / kk)
-            * (4.0 + qq * vm2dv2)
-            * (1 - np.cos((kk / (2.0 * x * E)) * z))
-        )
-
-        # Term 3
-        t3 = (
-            (-1)
-            * (1.0 / (4 * (R ** 3) * x * E))
-            * (_mu2 * ((qu ** 4) + 6 * (qu ** 2) * (R ** 2) - 3 * R ** 4)
-               - 2 * (R ** 2) * ((qu ** 4) - (R ** 4)))
-            * vm2dv2
-            * np.sin((kk / (2.0 * x * E)) * z)
-        )
-
-        # Term 4
-        t4 = (
-            (1 / (x * E))
-            * ((kk * (1 - uu) + (ku ** 2)) / (kk ** 2))
-            * ((((R ** 2) + (qu ** 2)) ** 2) / (R ** 3))
-            * np.sin((kk / (2.0 * x * E)) * z)
-        )
-
-        return _constants * rho0 * v2 * (t1 + t2 + t3 + t4)
-
-    return integrand
-
-
-def integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf, config: SamplingConfig):
-    """
-    Integrate the radiation intensity for a single parameter point.
-    Returns (mean, sdev).
-    """
-    q_lim = config.q_lim_factor * E
-    integration_region = [(-q_lim, q_lim), (-q_lim, q_lim), (z0, zf)]
-
-    integ = vegas.Integrator(integration_region)
-    integrand = make_batch_integrand(x, kx, ky, E, T, g, u_perp)
-
-    # Warm-up
-    integ(integrand, nitn=config.nitn_warmup, neval=config.neval)
-
-    # Production
-    result = integ(integrand, nitn=config.nitn, neval=config.neval)
-
-    return result.mean, result.sdev
-
-
-def _integrate_one(task):
-    """Top-level worker function for parallel integration. Must be module-level for pickling."""
-    idx, x, kx, ky, E, z0, zf, u_perp, T, g, config = task
-    try:
-        mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf, config)
-        return idx, mean, sdev
-    except Exception as e:
-        print(f"  Warning: Integration failed at index {idx}: {e}")
-        return idx, np.nan, np.nan
 
 
 # ==============================================================================
@@ -609,7 +425,7 @@ class TrainingDataGenerator:
         errors = np.full(n, np.nan)
 
         tasks = [
-            (i, *points[i], self.config)  # (idx, x, kx, ky, E, z0, zf, u_perp, T, g, config)
+            (i, *points[i])  # (idx, x, kx, ky, E, z0, zf, u_perp, T, g, config)
             for i in range(n)
         ]
 
@@ -942,12 +758,6 @@ if __name__ == "__main__":
         # Medium parameter ranges
         T_range=(0.150, 0.650),  # Temperature range in GeV
         g_range=(1.5, 2.5),  # Coupling g = sqrt(4*pi*alpha_s)
-
-        # Integration
-        q_lim_factor=0.3,
-        nitn_warmup=10,
-        nitn=10,
-        neval=10_000,
 
         # Sampling
         n_initial=args.n_initial,

@@ -21,19 +21,17 @@ Usage:
 
 import argparse
 import sys
-import os
 from pathlib import Path
 import time
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.colors as mcolors
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 # Allow running from the flow-rad-nn directory
 ape_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.append(ape_dir)
 
-from generate_training_data import integrate_point, SamplingConfig
+from integration import integrate_point
 from train_radiation_nn import RadiationEmulatorInference
 
 # ==============================================================================
@@ -54,15 +52,6 @@ DEFAULTS = dict(
     x_values = [0.3, 0.7],   # fixed x values for the x-slice plots
 )
 
-# Integration config — use moderate accuracy for the test grid.
-# Increase nitn/neval for smoother reference at the cost of runtime.
-INTEG_CONFIG = SamplingConfig(
-    q_lim_factor = 0.3,
-    nitn_warmup  = 5,
-    nitn         = 8,
-    neval        = 3000,
-)
-
 
 # ==============================================================================
 # Reference computation
@@ -70,7 +59,7 @@ INTEG_CONFIG = SamplingConfig(
 def _integrate_one(args):
     """Top-level wrapper required for ProcessPoolExecutor pickling."""
     ix, iky, x, kx, ky, E, T, g, u_perp, z0, zf = args
-    mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf, INTEG_CONFIG)
+    mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf)
     return ix, iky, mean, sdev
 
 
