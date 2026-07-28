@@ -25,21 +25,30 @@ from integration import integrate_point, SOFT_PIDS
 
 
 # ==============================================================================
+# Constants
+# ==============================================================================
+HBARC = 0.197327  # GeV·fm
+
+
+# ==============================================================================
 # Parameter space
 # ==============================================================================
-# Order: [x, kx, ky, E, z0, zf, u_perp, T, g]
+# Order: [x, kx, ky, E, z0, u_perp, T, g]
+# zf is hardcoded as z0 + 0.1/HBARC
 PARAM_RANGES = [
     (0.01, 0.99),   # x
     (-5.0, 5.0),    # kx  (GeV)
     (0.0,  5.0),    # ky  (GeV) — positive half only; mirrored at save time
     (1.0,  100.0),  # E   (GeV)
-    (0.0,  50.0),   # z0  (fm)
-    (0.0,  50.0),   # zf  (fm)
-    (0.0,  0.9),    # u_perp
+    (0.0,  50.0),   # z0  (GeV)
+    (0.0,  0.99),   # u_perp
     (0.150, 0.650), # T   (GeV)
     (1.5,  2.5),    # g
 ]
 N_DIMS = len(PARAM_RANGES)
+
+# Fixed proper-time step in GeV (dtau = 0.1 fm)
+DTAU_GEV = 0.1 / HBARC
 
 
 # ==============================================================================
@@ -47,7 +56,8 @@ N_DIMS = len(PARAM_RANGES)
 # ==============================================================================
 def _worker(task):
     """Integrate one point. Returns (idx, mean, sdev)."""
-    idx, x, kx, ky, E, z0, zf, u_perp, T, g = task
+    idx, x, kx, ky, E, z0, u_perp, T, g = task
+    zf = z0 + DTAU_GEV
     try:
         mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf)
         return idx, mean, sdev
@@ -85,14 +95,12 @@ def run_batch(n_points: int, batch_id: int, n_workers: int, output_file: str):
     # --- Sample ---
     print("Sampling Sobol points...", flush=True)
     points = sobol_batch(n_points, batch_id)
-
-    # Enforce z0 < zf (indices 4 and 5)
-    swap = points[:, 4] >= points[:, 5]
-    points[swap, 4], points[swap, 5] = points[swap, 5].copy(), points[swap, 4].copy()
+    # points columns: [x, kx, ky, E, z0, u_perp, T, g]
+    # zf is NOT sampled; it is derived from z0 at integration time
 
     print(f"  {len(points)} points sampled.", flush=True)
 
-    # --- Integrate (serially) ---
+    # --- Integrate ---
     values = np.full(n_points, np.nan)
     errors = np.full(n_points, np.nan)
 
@@ -129,20 +137,17 @@ def run_batch(n_points: int, batch_id: int, n_workers: int, output_file: str):
     vals_v = values[valid]
     errs_v = errors[valid]
 
-    # # --- Mirror ky symmetry ---
-    # pts_mirror      = pts_v.copy()
-    # pts_mirror[:, 2] = -pts_mirror[:, 2]   # ky → −ky
-    #
-    # pts_full  = np.vstack([pts_v,  pts_mirror])
-    # vals_full = np.concatenate([vals_v, vals_v])
-    # errs_full = np.concatenate([errs_v, errs_v])
-
     pts_full  = pts_v
     vals_full = vals_v
     errs_full = errs_v
     weights   = np.ones(len(vals_full))
 
+    # Derive zf column for storage (z0 is column index 4)
+    zf_full = pts_full[:, 4] + DTAU_GEV
+
     # --- Save ---
+    # Columns: [x, kx, ky, E, z0, u_perp, T, g]
+    #           0   1   2  3   4    5     6  7
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(output_file, "w") as f:
         f.create_dataset("x",      data=pts_full[:, 0])
@@ -150,10 +155,10 @@ def run_batch(n_points: int, batch_id: int, n_workers: int, output_file: str):
         f.create_dataset("ky",     data=pts_full[:, 2])
         f.create_dataset("E",      data=pts_full[:, 3])
         f.create_dataset("z0",     data=pts_full[:, 4])
-        f.create_dataset("zf",     data=pts_full[:, 5])
-        f.create_dataset("u_perp", data=pts_full[:, 6])
-        f.create_dataset("T",      data=pts_full[:, 7])
-        f.create_dataset("g",      data=pts_full[:, 8])
+        f.create_dataset("zf", data=zf_full)  # derived, stored for reference
+        f.create_dataset("u_perp", data=pts_full[:, 5])
+        f.create_dataset("T",      data=pts_full[:, 6])
+        f.create_dataset("g",      data=pts_full[:, 7])
         f.create_dataset("I",      data=vals_full)
         f.create_dataset("I_err",  data=errs_full)
         f.create_dataset("weight", data=weights)
@@ -162,9 +167,12 @@ def run_batch(n_points: int, batch_id: int, n_workers: int, output_file: str):
         f.attrs["n_original"] = n_valid
         f.attrs["n_samples"]  = len(vals_full)
         f.attrs["soft_pids"]  = SOFT_PIDS
+        f.attrs["HBARC"]      = HBARC
+        f.attrs["dtau_fm"]    = 0.1
         f.attrs["description"] = (
             "Sobol-sampled training data for radiation PINN. "
-            "Includes original ky >= 0 samples only."
+            "zf is hardcoded as z0 + 0.1/HBARC (dtau=0.1 fm) and stored for reference only. "
+            "Includes original ky >= 0 samples only. "
             "CF factor NOT included (multiply by 4/3 quarks, 3 gluons at runtime)."
         )
 
@@ -199,8 +207,8 @@ if __name__ == "__main__":
     )
 
     run_batch(
-        n_points   = args.n_points,
-        batch_id   = args.batch_id,
-        n_workers  = args.n_workers,
+        n_points    = args.n_points,
+        batch_id    = args.batch_id,
+        n_workers   = args.n_workers,
         output_file = output_file,
     )
