@@ -38,9 +38,9 @@ HBARC = 0.197327  # GeV·fm
 PARAM_RANGES = [
     (0.01, 0.99),   # x
     (-5.0, 5.0),    # kx  (GeV)
-    (0.0,  5.0),    # ky  (GeV) — positive half only; mirrored at save time
+    (0.0,  5.0),    # ky  (GeV)
     (1.0,  100.0),  # E   (GeV)
-    (0.0,  50.0),   # z0  (GeV)
+    (0.0,  50.0),   # z0  (invGeV)  # Up to 10 fmish
     (0.0,  0.99),   # u_perp
     (0.150, 0.650), # T   (GeV)
     (1.5,  2.5),    # g
