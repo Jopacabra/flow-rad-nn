@@ -534,7 +534,7 @@ def compute_loss(
         # Tile the other 7 parameters from random rows of the training batch
         idx = torch.randint(0, B, (n_uv_samples,), device=device)
         uv_params = inputs[idx].clone()  # (n_uv_samples, 8)
-        energy_params = uv_params[:, 3].numpy()
+        energy_params = uv_params[:, 3].cpu().numpy()
 
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
         log_k = []
