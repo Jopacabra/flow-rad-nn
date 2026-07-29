@@ -539,9 +539,12 @@ def compute_loss(
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
         log_k = []
         for i in np.arange(0, len(energy_params)):
-            log_k.append(rng.uniform(math.log(max_frac * (energy_params[i])**2),  # Begin penalizing at 0.25 *E^2
-            math.log((energy_params[i])**2),  # use E^2 as maximum k_perp.
-        ))
+            try:
+                log_k.append(rng.uniform(math.log(max_frac * (energy_params[i])**2),  # Begin penalizing at 0.25 *E^2
+                math.log((energy_params[i])**2),  # use E^2 as maximum k_perp.
+                ))
+            except:  # If you get something crazy, just use the energy squared.
+                log_k.append((energy_params[i])**2)
         log_k = torch.tensor(log_k, device=device)  # Make list into torch tensor
         k_perp = torch.exp(log_k)
 
