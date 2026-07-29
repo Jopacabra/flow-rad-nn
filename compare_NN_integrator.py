@@ -14,7 +14,7 @@ Usage:
     python test_kxky_density.py
 
     # Custom parameters
-    python test_kxky_density.py --x 0.2 --E 50.0 --z0 0.0 --zf 5.0 \
+    python test_kxky_density.py --x 0.2 --E 50.0 --z0 0.0 \
         --u-perp 0.3 --T 0.3 --g 2.0 --n-kx 25 --n-ky 25 \
         --kx-max 4.0 --ky-max 4.0 --output kxky_comparison.png
 """
@@ -37,11 +37,11 @@ from train_radiation_nn import RadiationEmulatorInference
 # ==============================================================================
 # Defaults
 # ==============================================================================
+HBARC = 0.197327  # GeV·fm
 DEFAULTS = dict(
     x       = 0.01,
     E       = 10.0,
-    z0      = 0.0,
-    zf      = 25.0,  # ~ 5 fm
+    z0      = 0.0,  # in inverse GeV!!!
     u_perp  = 0.3,
     T       = 0.3,
     g       = 2.0,
@@ -51,7 +51,8 @@ DEFAULTS = dict(
     ky_max  = 4.0,
     x_values = [0.3, 0.7],   # fixed x values for the x-slice plots
 )
-
+DTAU = 5/HBARC
+DEFAULTS["zf"] = DEFAULTS["z0"] + DTAU  # dtau = 0.1 fm
 
 # ==============================================================================
 # Reference computation
@@ -119,7 +120,7 @@ def compute_reference_grid(
 # ==============================================================================
 def compute_nn_grid(
     emulator: RadiationEmulatorInference,
-    x, E, z0, zf, u_perp, T, g,
+    x, E, z0, u_perp, T, g,
     kx_values: np.ndarray,
     ky_values: np.ndarray,
 ) -> np.ndarray:
@@ -139,7 +140,7 @@ def compute_nn_grid(
         ky     = ky_grid.ravel(),
         E      = np.full(n_pts, E),
         z0     = np.full(n_pts, z0),
-        zf     = np.full(n_pts, zf),
+        zf     = np.full(n_pts, z0 + DTAU),
         u_perp = np.full(n_pts, u_perp),
         T      = np.full(n_pts, T),
         g      = np.full(n_pts, g),
@@ -380,7 +381,6 @@ def main():
     parser.add_argument('--x',       type=float, default=DEFAULTS['x'],      help='Momentum fraction x')
     parser.add_argument('--E',       type=float, default=DEFAULTS['E'],      help='Parton energy (GeV)')
     parser.add_argument('--z0',      type=float, default=DEFAULTS['z0'],     help='Initial longitudinal position (invGeV)')
-    parser.add_argument('--zf',      type=float, default=DEFAULTS['zf'],     help='Final longitudinal position (invGeV)')
     parser.add_argument('--u-perp',  type=float, default=DEFAULTS['u_perp'], help='Transverse flow magnitude')
     parser.add_argument('--T',       type=float, default=DEFAULTS['T'],      help='Temperature (GeV)')
     parser.add_argument('--g',       type=float, default=DEFAULTS['g'],      help='Coupling constant')
@@ -401,7 +401,7 @@ def main():
     args = parser.parse_args()
 
     params = dict(
-        x=args.x, E=args.E, z0=args.z0, zf=args.zf,
+        x=args.x, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
         u_perp=args.u_perp, T=args.T, g=args.g,
     )
 
@@ -422,7 +422,7 @@ def main():
     # --- Reference ---
     print("Step 1: Computing reference (Vegas integrator)")
     I_ref, I_err = compute_reference_grid(
-        x=args.x, E=args.E, z0=args.z0, zf=args.zf,
+        x=args.x, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
         u_perp=args.u_perp, T=args.T, g=args.g,
         kx_values=kx_values,
         ky_values=ky_values,
@@ -439,7 +439,7 @@ def main():
     t0 = time.time()
     I_nn = compute_nn_grid(
         emulator=emulator,
-        x=args.x, E=args.E, z0=args.z0, zf=args.zf,
+        x=args.x, E=args.E, z0=args.z0,
         u_perp=args.u_perp, T=args.T, g=args.g,
         kx_values=kx_values,
         ky_values=ky_values,
@@ -465,7 +465,7 @@ def main():
 
             print("  Computing reference grid...")
             I_ref_x, I_err_x = compute_reference_grid(
-                x=x_val, E=args.E, z0=args.z0, zf=args.zf,
+                x=x_val, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
                 u_perp=args.u_perp, T=args.T, g=args.g,
                 kx_values=kx_values,
                 ky_values=ky_values,
@@ -476,7 +476,7 @@ def main():
             t0 = time.time()
             I_nn_x = compute_nn_grid(
                 emulator=emulator,
-                x=x_val, E=args.E, z0=args.z0, zf=args.zf,
+                x=x_val, E=args.E, z0=args.z0,
                 u_perp=args.u_perp, T=args.T, g=args.g,
                 kx_values=kx_values,
                 ky_values=ky_values,

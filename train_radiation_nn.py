@@ -23,7 +23,7 @@ import numpy as np
 import h5py
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
+from torch.utils.data import Dataset, DataLoader
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -34,12 +34,14 @@ import signal
 import os
 import time
 from pathlib import Path
-import threading
-import queue
 
 # Set use of float32 for matmuls to improve performance. Trial feature -- may impact accuracy, depending on problem.
 torch.set_float32_matmul_precision('high')
 torch.serialization.add_safe_globals([dict])  # save to load a nested dictionary with weights_only
+
+def _collate_passthrough(x):
+    """Passthrough collate function for DataLoader. Must be module-level to be picklable."""
+    return x
 
 # ==============================================================================
 # Configuration
@@ -124,7 +126,7 @@ class RadiationDataset(Dataset):
     is duplicated in memory.
     """
 
-    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'zf', 'u_perp', 'T', 'g']
+    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g']
     N_FEATURES    = len(FEATURE_NAMES)
     KY_IDX        = 2
 
@@ -392,7 +394,7 @@ class RadiationEmulator(nn.Module):
 
     def __init__(
             self,
-            input_dim: int = 9,
+            input_dim: int = 8,
             hidden_dim: int = 256,
             n_layers: int = 5,
             activation: str = "silu",
@@ -458,6 +460,7 @@ class RadiationEmulator(nn.Module):
         h = self.input_act(self.input_layer(x))
 
         # Hidden layers with skip connections every 2 layers
+        h_block_in = h
         for i, (layer, act, drop) in enumerate(zip(self.hidden_layers, self.hidden_acts, self.dropouts)):
             if i % 2 == 0:
                 h_block_in = h  # Save block input at the start of each 2-layer block
@@ -520,18 +523,26 @@ def compute_loss(
     Enforces f(params, k_x, k_y) -> 0 as k_perp -> inf.
     """
     if config.lambda_uv > 0.0:
-        k_perp_max = 1e4  # Maximum k_perp value to consider
+        max_frac = 0.25  # fraction of kperp^2_max at which to start penalizing.
+        rng = np.random.default_rng()
         n_uv_samples = 64  # Number of samples to draw from UV region
 
         # Get shape and device of inputs
         B = inputs.shape[0]
         device = inputs.device
 
-        # Sample k_perp log-uniformly in the UV region
-        log_k = torch.empty(n_uv_samples, device=device).uniform_(
-            math.log(config.uv_kt_threshold),
-            math.log(k_perp_max),
-        )
+        # Tile the other 7 parameters from random rows of the training batch
+        idx = torch.randint(0, B, (n_uv_samples,), device=device)
+        uv_params = inputs[idx].clone()  # (n_uv_samples, 8)
+        energy_params = uv_params[:, 3].numpy()
+
+        # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
+        log_k = []
+        for i in np.arange(0, len(energy_params)):
+            log_k.append(rng.uniform(math.log(max_frac * (energy_params[i])**2),  # Begin penalizing at 0.25 *E^2
+            math.log((energy_params[i])**2),  # use E^2 as maximum k_perp.
+        ))
+        log_k = torch.tensor(log_k, device=device)  # Make list into torch tensor
         k_perp = torch.exp(log_k)
 
         # Isotropic: random azimuthal angle phi
@@ -542,16 +553,14 @@ def compute_loss(
         else:
             k_y_uv = np.abs(k_perp * torch.sin(phi))  # make k_y always positive
 
-        # Tile the other 7 parameters from random rows of the training batch
-        idx = torch.randint(0, B, (n_uv_samples,), device=device)
-        uv_params = inputs[idx].clone()  # (n_uv_samples, 9)
         uv_params[:, 1] = k_x_uv  # overwrite k_x
         uv_params[:, 2] = k_y_uv  # overwrite k_y
 
         uv_output = model(uv_params).squeeze(-1)  # (n_uv_samples,) or (n_uv_samples, 1)
 
         # Use log weight to penalize nonzero result at larger k_perp values more
-        log_weight = 2 * log_k - 2 * math.log(config.uv_kt_threshold)
+        log_esqr = torch.tensor(np.log(max_frac * energy_params**2), device=device)
+        log_weight = 2 * log_k - 2 * log_esqr
         uv_decay = (log_weight * uv_output ** 2).mean()
     else:
         uv_decay = torch.tensor(0.0, device=inputs.device)
@@ -594,7 +603,7 @@ def compute_loss(
         expected_ratio = alpha ** (-power)
         # Use log-ratio loss for numerical stability; avoids division-by-zero
         log_ratio = torch.log(torch.abs(f_high) + 1e-30) - torch.log(torch.abs(f_low) + 1e-30)
-        target_log_ratio = torch.full_like(log_ratio, torch.log(torch.tensor(expected_ratio)))
+        target_log_ratio = torch.full_like(log_ratio, torch.log(torch.tensor(expected_ratio)).item())
 
         uv_power_law = nn.functional.mse_loss(log_ratio, target_log_ratio)
     else:
@@ -862,12 +871,12 @@ def train_model(config: TrainingConfig):
             shuffle=shuffle_train,
             num_workers=config.num_workers,
             persistent_workers=config.num_workers > 0,
-            collate_fn=lambda x: x
+            collate_fn=_collate_passthrough
         )
         val_loader = DataLoader(
             val_dataset, batch_size=config.batch_size * 4, shuffle=False,
             num_workers=0,
-            collate_fn=lambda x: x
+            collate_fn=_collate_passthrough
         )
     else:
         train_loader = DataLoader(
@@ -876,13 +885,13 @@ def train_model(config: TrainingConfig):
             num_workers=config.num_workers,
             persistent_workers=config.num_workers > 0,
             pin_memory=True,
-            collate_fn=lambda x: x
+            collate_fn=_collate_passthrough
         )
         val_loader = DataLoader(
             val_dataset, batch_size=config.batch_size * 4, shuffle=False,
             num_workers=0,  # No workers needed: no backward pass to overlap with
             pin_memory=True,
-            collate_fn=lambda x: x
+            collate_fn=_collate_passthrough
         )
 
     # Create model
@@ -1070,7 +1079,7 @@ class RadiationEmulatorInference:
     Handles normalization and inverse transforms automatically.
     """
 
-    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'zf', 'u_perp', 'T', 'g']
+    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g']
 
     def __init__(
             self,
@@ -1156,15 +1165,14 @@ class RadiationEmulatorInference:
             kx: np.ndarray,  # in GeV
             ky: np.ndarray,  # in GeV
             E: np.ndarray,  # in GeV
-            z0: np.ndarray,  # in invGeV
-            zf: np.ndarray,  # in invGeV
+            z0: np.ndarray,  # in invGeV -- zf hardcoded at dtau = 0.1 fm
             u_perp: np.ndarray,  # unitless
             T: np.ndarray,  # in GeV
             g: np.ndarray,  # unitless
     ) -> np.ndarray:
         # Stack inputs directly into a contiguous float32 C-array,
         # then wrap with from_numpy (zero-copy) before sending to device.
-        inputs = np.column_stack([x, kx, ky, E, z0, zf, u_perp, T, g]).astype(
+        inputs = np.column_stack([x, kx, ky, E, z0, u_perp, T, g]).astype(
             np.float32, order='C', copy=False
         )
         inputs_tensor = torch.from_numpy(inputs).to(self.device, non_blocking=True)
@@ -1198,7 +1206,7 @@ class RadiationEmulatorInference:
     def predict_raw(self, inputs: np.ndarray) -> np.ndarray:
         """
         Faster entry-point when the caller can supply a pre-stacked
-        (N, 9) float32 array in feature order [x, kx, ky, E, z0, zf, u_perp, T, g].
+        (N, 9) float32 array in feature order [x, kx, ky, E, z0, u_perp, T, g].
 
         Skips the np.column_stack overhead, which matters when predict()
         is called thousands of times with the same grid layout.
@@ -1245,7 +1253,6 @@ class RadiationEmulatorInference:
             ky=inputs['ky'],
             E=inputs['E'],
             z0=inputs['z0'],
-            zf=inputs['zf'],
             u_perp=inputs['u_perp'],
             T=inputs['T'],
             g=inputs['g'],
@@ -1254,7 +1261,6 @@ class RadiationEmulatorInference:
     def compute_dNd3k_grid(self,
                            E: float,
                            z0: float,
-                           zf: float,
                            u_perp: float,
                            T: float,
                            g: float,
@@ -1274,7 +1280,7 @@ class RadiationEmulatorInference:
         # Build input grid once
         grid_inputs = np.column_stack([
             x_grid.ravel(), kx_grid.ravel(), ky_grid.ravel(),
-            np.full(n_pts, E), np.full(n_pts, z0), np.full(n_pts, zf),
+            np.full(n_pts, E), np.full(n_pts, z0),
             np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
         ]).astype(np.float32)
 
@@ -1303,13 +1309,12 @@ class RadiationEmulatorInference:
     def sample_emission(self,
                         E: np.ndarray,
                         z0: np.ndarray,
-                        zf: np.ndarray,
                         u_perp: np.ndarray,
                         T: np.ndarray,
                         g: np.ndarray,
                         N_samples: int = 1,
                         rng: np.random.Generator = np.random.default_rng()
-                        ) -> (float, np.ndarray):
+                        ) -> tuple[float, np.ndarray]:
         """
         Computes a complete grid in x, kx, ky and returns a 3D inverse CDF sample value for x, kx, ky vector.
         """
@@ -1325,7 +1330,7 @@ class RadiationEmulatorInference:
         # Build input grid once
         grid_inputs = np.column_stack([
             x_grid.ravel(), kx_grid.ravel(), ky_grid.ravel(),
-            np.full(n_pts, E), np.full(n_pts, z0), np.full(n_pts, zf),
+            np.full(n_pts, E), np.full(n_pts, z0),
             np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
         ]).astype(np.float32)
 
@@ -1528,7 +1533,7 @@ def plot_lr_finder(lrs: list, losses: list, raw_losses: Optional[list] = None):
         suggested_idx = np.argmin(gradients) + start_idx
         suggested_lr  = lrs[suggested_idx]
     else:
-        suggested_idx = max(0, min_idx - 1)
+        suggested_idx = max(0, int(min_idx - 1))
         suggested_lr  = lrs[suggested_idx]
 
     print(f"\nLR Finder Results:")
@@ -1593,7 +1598,6 @@ def demo_inference(config: TrainingConfig):
         'ky': rng.uniform(-3.0, 3.0, n_points),
         'E': rng.uniform(10.0, 80.0, n_points),
         'z0': rng.uniform(0.0, 3.0, n_points),
-        'zf': rng.uniform(3.0, 8.0, n_points),
         'u_perp': rng.uniform(0.0, 0.5, n_points),
         'T': rng.uniform(0.2, 0.4, n_points),
         'g': rng.uniform(1.8, 2.2, n_points),
@@ -1633,7 +1637,6 @@ def demo_inference(config: TrainingConfig):
         ky=np.array([0.5]),
         E=np.array([50.0]),
         z0=np.array([0.0]),
-        zf=np.array([5.0]),
         u_perp=np.array([0.3]),
         T=np.array([0.3]),
         g=np.array([2.0]),
@@ -1651,7 +1654,6 @@ def demo_inference(config: TrainingConfig):
 if __name__ == "__main__":
     default_config = TrainingConfig()  # Load default values from class description
     parser = argparse.ArgumentParser(description="Train or run inference with radiation emulator")
-    parser.add_argument("--inference-only", action="store_true", help="Skip training, demo inference only")
     parser.add_argument("--data-file", type=str, default=default_config.data_file, help="Training data file")
     parser.add_argument("--model-file", type=str, default=default_config.model_file, help="Model output file")
     parser.add_argument("--transform", type=str, default=default_config.transform, help="Whether to log transform data")
@@ -1705,13 +1707,5 @@ if __name__ == "__main__":
     # Make data directory, if not present
     Path(config.model_file).parent.mkdir(exist_ok=True)
 
-    if args.inference_only:
-        # Demo inference only
-        demo_inference(config)
-    else:
-        # Train the model
-        train_model(config)
-
-        # Then demo inference
-        print("\n")
-        demo_inference(config)
+    # Train the model
+    train_model(config)
