@@ -51,7 +51,7 @@ DEFAULTS = dict(
     ky_max  = 4.0,
     x_values = [0.3, 0.7],   # fixed x values for the x-slice plots
 )
-DTAU = 5/HBARC
+DTAU = 0.1/HBARC
 DEFAULTS["zf"] = DEFAULTS["z0"] + DTAU  # dtau = 0.1 fm
 
 # ==============================================================================
