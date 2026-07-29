@@ -140,7 +140,6 @@ def compute_nn_grid(
         ky     = ky_grid.ravel(),
         E      = np.full(n_pts, E),
         z0     = np.full(n_pts, z0),
-        zf     = np.full(n_pts, z0 + DTAU),
         u_perp = np.full(n_pts, u_perp),
         T      = np.full(n_pts, T),
         g      = np.full(n_pts, g),
