@@ -481,6 +481,8 @@ def compute_loss(
         targets: torch.Tensor,
         weights: torch.Tensor,
         config: TrainingConfig,
+        X_mean: torch.Tensor,
+        X_std: torch.Tensor,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute weighted MSE loss with physics constraints.
@@ -523,7 +525,7 @@ def compute_loss(
     Enforces f(params, k_x, k_y) -> 0 as k_perp -> inf.
     """
     if config.lambda_uv > 0.0:
-        max_frac = 0.25  # fraction of kperp^2_max at which to start penalizing.
+        max_frac = 0.05  # fraction of kperp^2_max at which to start penalizing.
         rng = np.random.default_rng()
         n_uv_samples = 64  # Number of samples to draw from UV region
 
@@ -534,17 +536,27 @@ def compute_loss(
         # Tile the other 7 parameters from random rows of the training batch
         idx = torch.randint(0, B, (n_uv_samples,), device=device)
         uv_params = inputs[idx].clone()  # (n_uv_samples, 8)
-        energy_params = uv_params[:, 3].cpu().numpy()
+
+        # Denormalize the E column (index 3) to recover raw GeV values
+        E_mean = X_mean[3].to(device)
+        E_std = X_std[3].to(device)
+        energy_params = (uv_params[:, 3] * E_std + E_mean).cpu().numpy()
 
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
         log_k = []
         for i in np.arange(0, len(energy_params)):
             try:
-                log_k.append(rng.uniform(math.log(max_frac * (energy_params[i])**2),  # Begin penalizing at 0.25 *E^2
-                math.log((energy_params[i])**2),  # use E^2 as maximum k_perp.
-                ))
-            except:  # If you get something crazy, just use the energy squared.
-                log_k.append((energy_params[i])**2)
+                # 2 * log(energy) = log(energy^2) -- Use minimum of uv_kt_threshold to avoid penalizing structure at low pT
+                log_lo = np.amax([math.log(max_frac) + 2 * math.log(energy_params[i]), math.log(config.uv_kt_threshold)])
+                log_hi = 2 * math.log(energy_params[i])
+            except ValueError:
+                print(energy_params[i])
+                print(energy_params)
+                raise Exception
+            if log_lo < log_hi:
+                log_k.append(rng.uniform(log_lo, log_hi))
+            else:
+                log_k.append(log_lo)  # energy == 1.0 exactly: both bounds equal, just use it
         log_k = torch.tensor(log_k, device=device)  # Make list into torch tensor
         k_perp = torch.exp(log_k)
 
@@ -554,7 +566,7 @@ def compute_loss(
         if config.mirror:
             k_y_uv = k_perp * torch.sin(phi)  # k_y positive or negative
         else:
-            k_y_uv = np.abs(k_perp * torch.sin(phi))  # make k_y always positive
+            k_y_uv = (k_perp * torch.sin(phi)).abs()  # make k_y always positive
 
         uv_params[:, 1] = k_x_uv  # overwrite k_x
         uv_params[:, 2] = k_y_uv  # overwrite k_y
@@ -562,8 +574,8 @@ def compute_loss(
         uv_output = model(uv_params).squeeze(-1)  # (n_uv_samples,) or (n_uv_samples, 1)
 
         # Use log weight to penalize nonzero result at larger k_perp values more
-        log_esqr = torch.tensor(np.log(max_frac * energy_params**2), device=device)
-        log_weight = 2 * log_k - 2 * log_esqr
+        log_esqr = torch.tensor(math.log(max_frac) + 2* np.log(energy_params), device=device)
+        log_weight = 2 * log_k - 2 * (log_k - log_esqr)  # == 2 * log_esqr, kept verbose for clarity
         uv_decay = (log_weight * uv_output ** 2).mean()
     else:
         uv_decay = torch.tensor(0.0, device=inputs.device)
@@ -639,6 +651,8 @@ def train_epoch(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
+        X_mean: torch.Tensor,
+        X_std: torch.Tensor,
 ) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
@@ -658,7 +672,7 @@ def train_epoch(
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, targets, weights, config)
+        loss, components = compute_loss(model, inputs, targets, weights, config, X_mean, X_std)
         loss.backward()
         optimizer.step()
 
@@ -676,6 +690,8 @@ def validate(
         model: nn.Module,
         dataloader: DataLoader,
         config: TrainingConfig,
+        X_mean: torch.Tensor,
+        X_std: torch.Tensor,
 ) -> Dict[str, float]:
     """Validate the model."""
     model.eval()
@@ -689,7 +705,7 @@ def validate(
             targets = targets.to(config.device)
             weights = weights.to(config.device)
 
-            _, components = compute_loss(model, inputs, targets, weights, config)
+            _, components = compute_loss(model, inputs, targets, weights, config, X_mean, X_std)
 
             total_loss += components['total']
             total_mse += components['mse']
@@ -975,6 +991,10 @@ def train_model(config: TrainingConfig):
     current_epoch = [start_epoch]
     signal.signal(signal.SIGTERM, _sigterm_handler)
 
+    # Pre-move normalization tensors to device once, for use in loss computation
+    X_mean_t = torch.tensor(dataset.X_mean, dtype=torch.float32).to(config.device)
+    X_std_t = torch.tensor(dataset.X_std, dtype=torch.float32).to(config.device)
+
     print("\nStarting training...")
     print("-" * 70)
 
@@ -992,11 +1012,11 @@ def train_model(config: TrainingConfig):
 
             # Train
             # print("Training...")
-            train_metrics = train_epoch(model, train_loader, optimizer, config)
+            train_metrics = train_epoch(model, train_loader, optimizer, config, X_mean_t, X_std_t)
 
             # Validate
             # print("Validating...")
-            val_metrics = validate(model, val_loader, config)
+            val_metrics = validate(model, val_loader, config, X_mean_t, X_std_t)
 
             # Update scheduler
             scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
