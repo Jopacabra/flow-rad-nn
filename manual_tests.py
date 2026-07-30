@@ -34,6 +34,29 @@ def check_training_data(data_file="radiation_training_data.h5"):
         print(f"Fraction with |I| < 1e-10: {(np.abs(I) < 1e-10).mean():.1%}")
 
 
+def check_training_data_all_keys(data_file="radiation_training_data.h5"):
+    """
+    Check training data for problems.
+
+    Some considerations:
+    Fraction with I_err > |I|: Integration did not converge at these points. These points are noise.
+    Fraction with I < 0: Negative values. Should see a good deal of these, since this is modification to vac. spectrum
+    Fraction with |I| < 1e-10: Very small values for which log transformation will cause problems.
+
+    """
+    with h5py.File(data_file, 'r') as f:
+        for key in f.keys():
+            print(key)
+            I = f[key][:]
+
+            print(f"Total samples: {len(I)}")
+            print(f"NaN values: {np.isnan(I).sum()}")
+            print(f"Inf values: {np.isinf(I).sum()}")
+            print(f"I range: [{I.min():.4e}, {I.max():.4e}]")
+            print(f"Fraction with I < 0: {(I < 0).mean():.1%}")
+            print(f"Fraction with |I| < 1e-10: {(np.abs(I) < 1e-10).mean():.1%}")
+
+
 def diagnose_model(
         data_file: str = "radiation_training_data.h5",
         model_file: str = "radiation_emulator.pt",

@@ -28,6 +28,7 @@ def merge(input_files: list[str], output_file: str):
             total_original += n_original
 
     # Concatenate all batches
+    print("Concatenating arrays...")
     combined = {key: np.concatenate(arrays[key]) for key in DATASETS}
 
     # # Re-create ky mirror
