@@ -575,7 +575,7 @@ def compute_loss(
 
         # Use log weight to penalize nonzero result at larger k_perp values more
         log_esqr = torch.tensor(math.log(max_frac) + 2* np.log(energy_params), device=device)
-        log_weight = 2 * log_k - 2 * (log_k - log_esqr)  # == 2 * log_esqr, kept verbose for clarity
+        log_weight = 2 * log_k - 2 * log_esqr  # == 2 * log_esqr, kept verbose for clarity
         uv_decay = (log_weight * uv_output ** 2).mean()
     else:
         uv_decay = torch.tensor(0.0, device=inputs.device)
