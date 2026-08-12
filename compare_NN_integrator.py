@@ -39,7 +39,7 @@ from train_radiation_nn import RadiationEmulatorInference
 # ==============================================================================
 HBARC = 0.197327  # GeV·fm
 DEFAULTS = dict(
-    x       = 0.01,
+    x       = 0.001,
     E       = 10.0,
     z0      = 0.0,  # in inverse GeV!!!
     u_perp  = 0.3,
@@ -49,7 +49,7 @@ DEFAULTS = dict(
     n_ky    = 30,
     kx_max  = 4.0,
     ky_max  = 4.0,
-    x_values = [0.3, 0.7],   # fixed x values for the x-slice plots
+    x_values = [0.01, 0.1],   # fixed x values for the x-slice plots
 )
 DTAU = 0.1/HBARC
 DEFAULTS["zf"] = DEFAULTS["z0"] + DTAU  # dtau = 0.1 fm
