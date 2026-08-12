@@ -56,6 +56,7 @@ class TrainingConfig:
     data_file: str = "data/radiation_training_data.h5"
     train_fraction: float = 0.8
     transform: str = "arcsinh"
+    transform_f0: float | None = None  # Scale for transformation, if applicable. None uses std of y_data.
     mirror: bool = True  # Whether to mirror data in ky.
 
     # Architecture
@@ -74,7 +75,7 @@ class TrainingConfig:
     # Physics constraints
     lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
     lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
-    lambda_uv: float = 0.01  # Weight for UV decay loss term
+    lambda_uv: float = 0.0  # Weight for UV decay loss term
     lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
@@ -222,7 +223,10 @@ class RadiationDataset(Dataset):
         self.weight_mean = float(self.w_data.mean())
 
         # Output transform + normalization
-        self.f0 = float(np.std(self.y_data)) or 1.0
+        if config.transform_f0 is None:
+            self.f0 = float(np.std(self.y_data))
+        else:
+            self.f0 = float(config.transform_f0)
         y_t = self._transform_y(self.y_data)  # returns a new array
         self.y_mean = float(y_t.mean())
         self.y_std = float(y_t.std() + 1e-8)
@@ -1679,7 +1683,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or run inference with radiation emulator")
     parser.add_argument("--data-file", type=str, default=default_config.data_file, help="Training data file")
     parser.add_argument("--model-file", type=str, default=default_config.model_file, help="Model output file")
-    parser.add_argument("--transform", type=str, default=default_config.transform, help="Whether to log transform data")
+    parser.add_argument("--normalization-file", type=str, default=default_config.normalization_file, help="Model normalization output file")
+    parser.add_argument("--transform", type=str, default=default_config.transform, help="Type of transform on data")
     parser.add_argument("--epochs", type=int, default=default_config.n_epochs, help="Number of training epochs")
     parser.add_argument("--hidden-dim", type=int, default=default_config.hidden_dim, help="Hidden layer dimension")
     parser.add_argument("--n-layers", type=int, default=default_config.n_layers, help="Number of hidden layers")
@@ -1699,6 +1704,7 @@ if __name__ == "__main__":
     config = TrainingConfig(
         data_file=args.data_file,
         model_file=args.model_file,
+        normalization_file=args.normalization_file,
         n_epochs=args.epochs,
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
