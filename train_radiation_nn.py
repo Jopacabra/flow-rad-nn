@@ -8,7 +8,7 @@ Features:
 - Loads training data from HDF5 file
 - Normalizes inputs and log-transforms outputs
 - Uses importance sampling weights for unbiased training
-- Enforces soft physics constraints (positivity, k_y symmetry)
+- Enforces soft physics constraints
 - Saves trained model for deployment
 - Demonstrates batch inference
 
@@ -73,7 +73,6 @@ class TrainingConfig:
     patience: int = 20  # Early stopping patience
 
     # Physics constraints
-    lambda_positivity: float = 0.0  # Weight for positivity penalty -- 0 so that we don't enforce positivity
     lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
     lambda_uv: float = 0.0  # Weight for UV decay loss term
     lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
@@ -501,14 +500,6 @@ def compute_loss(
     mse = (weights * (predictions - targets) ** 2).mean()
 
     """
-    Positivity enforcement loss
-
-    (in normalized space, this is approximate)
-    We don't use this, it's just here as a sample loss term
-    """
-    positivity = torch.relu(-predictions - 2.0).mean()  # Threshold at -2 std
-
-    """
     k_y symmetry enforcement loss 
 
     k_y symmetry is already built into the training data (mirrored samples).
@@ -631,7 +622,6 @@ def compute_loss(
     # Total loss
     total_loss = (
             mse
-            + config.lambda_positivity * positivity
             + config.lambda_ky_symmetry * ky_symmetry
             + config.lambda_uv * uv_decay
             + config.lambda_uv_power * uv_power_law
@@ -640,7 +630,6 @@ def compute_loss(
     # Return loss components for logging
     components = {
         'mse': mse.item(),
-        'positivity': positivity.item(),
         'ky_symmetry': ky_symmetry.item(),
         'uv_decay': uv_decay.item(),
         'uv_power_law': uv_power_law.item(),
