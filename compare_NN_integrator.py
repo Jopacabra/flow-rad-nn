@@ -134,7 +134,7 @@ def compute_nn_grid(
     kx_grid, ky_grid = np.meshgrid(kx_values, ky_values, indexing='ij')
     n_pts = kx_grid.size
 
-    I_nn_flat = emulator.predict(
+    I_nn_flat = emulator.predict_kxky(
         x      = np.full(n_pts, x),
         kx     = kx_grid.ravel(),
         ky     = ky_grid.ravel(),

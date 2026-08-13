@@ -57,7 +57,6 @@ class TrainingConfig:
     train_fraction: float = 0.8
     transform: str = "arcsinh"
     transform_f0: float | None = None  # Scale for transformation, if applicable. None uses std of y_data.
-    mirror: bool = True  # Whether to mirror data in ky.
 
     # Architecture
     hidden_dim: int = 256
@@ -73,12 +72,11 @@ class TrainingConfig:
     patience: int = 20  # Early stopping patience
 
     # Physics constraints
-    lambda_ky_symmetry: float = 0.0  # Weight for k_y symmetry penalty -- data enforces it -- data is mirrored.
     lambda_uv: float = 0.0  # Weight for UV decay loss term
     lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
-    # A safe default is 4.0 GeV^2 (kt > 2 GeV).
+    # A safe default is 10.0 GeV^2 (kperp > ~3.16 GeV).
     uv_kt_threshold: float = 10.0
 
     # Output
@@ -111,42 +109,29 @@ class RadiationDataset(Dataset):
 
     Memory layout
     -------------
-    self.X_data : np.ndarray, shape (N_valid, 9), float32   — input features
-    self.y_data : np.ndarray, shape (N_valid,),   float32   — raw intensity
-    self.w_data : np.ndarray, shape (N_valid,),   float32   — importance weights
-
-    For 127M valid rows at float32:
-      X_data  ~  4.6 GB  (127M × 9 × 4 bytes)
-      y_data  ~  0.5 GB  (127M × 4 bytes)
-      w_data  ~  0.5 GB  (127M × 4 bytes)
-      total   ~  5.6 GB
-
-    Mirroring in k_y is virtual (same as before): logical index i >= n_valid
-    returns the same row as i - n_valid with the ky column negated. No data
-    is duplicated in memory.
+    self.X_data : np.ndarray, shape (N_valid, 9), float32   -- input features
+    self.y_data : np.ndarray, shape (N_valid,),   float32   -- raw intensity
+    self.w_data : np.ndarray, shape (N_valid,),   float32   -- importance weights
+    self.phi_data : np.ndarray, shape (N_valid,), float32   -- phi values for loss computation
     """
 
-    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g']
-    N_FEATURES    = len(FEATURE_NAMES)
-    KY_IDX        = 2
+    FEATURE_NAMES = ['x', 'k_perp', 'E', 'z0', 'u_perp', 'T', 'g']
+    RAW_FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g']
+    N_FEATURES = len(FEATURE_NAMES)
 
     def __init__(
-        self,
-        data_file: str,
-        transform_output: str = "arcsinh",
-        mirror: bool = True,
+            self,
+            data_file: str,
+            transform_output: str = "arcsinh",
     ):
         self.data_file = data_file
         self.transform = transform_output
-        self.mirror    = mirror
-        self.epsilon   = 1e-10
+        self.epsilon = 1e-10
 
         print(f"Loading {data_file} into RAM ...")
         self._scan_file()
 
-        n_logical = 2 * self.n_valid if self.mirror else self.n_valid
-        print(f"Dataset ready  |  valid={self.n_valid:,}  "
-              f"logical={n_logical:,}  transform={self.transform}")
+        print(f"Dataset ready  |  valid={self.n_valid:,}  transform={self.transform}")
 
     # ------------------------------------------------------------------
     # Full load into RAM — no copies, no HDF5 handles kept open
@@ -156,90 +141,84 @@ class RadiationDataset(Dataset):
             n_raw = int(f['I'].shape[0])
             print(f"  Reading {n_raw:,} rows from HDF5 ...")
 
-            # ----------------------------------------------------------
-            # Step 1 — allocate output arrays ONCE, read directly into them.
-            # h5py supports out= for direct no-copy reads.
-            # ----------------------------------------------------------
-            X_raw = np.empty((n_raw, self.N_FEATURES), dtype=np.float32)
-            for j, name in enumerate(self.FEATURE_NAMES):
-                f[name].read_direct(X_raw, dest_sel=np.s_[:, j])
+            # Read raw (unmodified) columns straight from disk
+            # Allocate arrays, then use h5py to read into them
+            raw_cols = {}
+            for name in self.RAW_FEATURE_NAMES:
+                buf = np.empty(n_raw, dtype=np.float32)
+                f[name].read_direct(buf)
+                raw_cols[name] = buf
 
-            y_raw  = np.empty(n_raw, dtype=np.float32)
+            y_raw = np.empty(n_raw, dtype=np.float32)
             f['I'].read_direct(y_raw)
 
-            w_raw  = np.empty(n_raw, dtype=np.float32)
+            w_raw = np.empty(n_raw, dtype=np.float32)
             f['weight'].read_direct(w_raw)
 
-            i_err  = np.empty(n_raw, dtype=np.float32)
+            i_err = np.empty(n_raw, dtype=np.float32)
             f['I_err'].read_direct(i_err)
 
-        # ----------------------------------------------------------
-        # Step 2 — validity mask; filter once, then immediately
-        # let the raw arrays go out of scope so GC can free them.
-        # ----------------------------------------------------------
+        # Compute k_perp and phi from kx, ky. phi is kept for loss reconstruction
+        # only — it is never part of the network input.
+        kx_raw = raw_cols['kx']
+        ky_raw = raw_cols['ky']
+        k_perp_raw = np.sqrt(kx_raw ** 2 + ky_raw ** 2).astype(np.float32)
+        phi_raw = np.arctan2(ky_raw, kx_raw).astype(np.float32)
+
+        # Stack the raw inputs
+        X_raw = np.column_stack([
+            raw_cols['x'], k_perp_raw, raw_cols['E'], raw_cols['z0'],
+            raw_cols['u_perp'], raw_cols['T'], raw_cols['g'],
+        ]).astype(np.float32)
+
+        # Mask off any points where the integration when awry
         print("  Filtering invalid rows ...")
         ok = (
-            np.isfinite(y_raw)
-            & np.isfinite(i_err)
-            & np.all(np.isfinite(X_raw), axis=1)
+                np.isfinite(y_raw)
+                & np.isfinite(i_err)
+                & np.isfinite(phi_raw)
+                & np.all(np.isfinite(X_raw), axis=1)
         )
-        # i_err is only needed for the validity check — drop it now
-        del i_err
+        del i_err  # Trash the integration error to save memory
 
         n_valid = int(ok.sum())
         print(f"  {n_raw:,} raw  →  {n_valid:,} valid")
 
-        # Fancy-index once per array to keep only valid rows.
-        # This creates new contiguous arrays; the originals are then deleted.
-        self.X_data = X_raw[ok]   # (N_valid, 9)  float32
-        del X_raw
+        # Apply mask to cut arrays
+        self.X_data = X_raw[ok]
+        self.phi_data = phi_raw[ok]
+        del X_raw, raw_cols, kx_raw, ky_raw, k_perp_raw, phi_raw
 
-        self.y_data = y_raw[ok]   # (N_valid,)    float32
+        self.y_data = y_raw[ok]
         del y_raw
 
-        self.w_data = w_raw[ok]   # (N_valid,)    float32
+        self.w_data = w_raw[ok]
         del w_raw
-
-        # Boolean mask is no longer needed either
         del ok
 
         self.n_valid = n_valid
 
-        # ----------------------------------------------------------
-        # Step 3 — normalization stats (no extra data copies needed;
-        # computed directly from self.X_data / self.y_data)
-        # ----------------------------------------------------------
+        # Compute and print some normalization statistics
         print("  Computing normalization statistics ...")
-
-        # Input features: mean and std in float64 for numerical precision,
-        # then cast back to float32 for storage.
-        X64 = self.X_data.astype(np.float64)          # temporary; freed below
+        X64 = self.X_data.astype(np.float64)
         self.X_mean = X64.mean(axis=0).astype(np.float32)
-        self.X_std  = (X64.std(axis=0) + 1e-8).astype(np.float32)
+        self.X_std = (X64.std(axis=0) + 1e-8).astype(np.float32)
         del X64
 
-        # Importance weight normalization scalar
         self.weight_mean = float(self.w_data.mean())
 
-        # Output transform + normalization
         if config.transform_f0 is None:
             self.f0 = float(np.std(self.y_data))
         else:
             self.f0 = float(config.transform_f0)
-        y_t = self._transform_y(self.y_data)  # returns a new array
+        y_t = self._transform_y(self.y_data)
         self.y_mean = float(y_t.mean())
         self.y_std = float(y_t.std() + 1e-8)
 
-        # Pre-compute fully normalized outputs and store them.
-        # This avoids recomputing _transform_y() on every __getitem__ call.
         self.y_norm_data = ((y_t - self.y_mean) / self.y_std).astype(np.float32)
         del y_t
 
-        # Pre-compute fully normalized inputs and store them.
-        # This avoids per-sample subtraction/division in __getitem__.
         self.X_norm_data = ((self.X_data - self.X_mean) / self.X_std).astype(np.float32)
-
-        # Pre-compute normalized weights.
         self.w_norm_data = (self.w_data / self.weight_mean).astype(np.float32)
 
         print(f"  weight_mean={self.weight_mean:.3e}  f0={self.f0:.3e}")
@@ -257,54 +236,39 @@ class RadiationDataset(Dataset):
     # ------------------------------------------------------------------
     # Dataset protocol
     # ------------------------------------------------------------------
+    # Check the number of points in the dataset
     def __len__(self) -> int:
-        return 2 * self.n_valid if self.mirror else self.n_valid
+        return self.n_valid
 
+    # Get a single data point by index
     def __getitem__(self, idx: int):
-        mirrored = self.mirror and (idx >= self.n_valid)
-        raw_idx = idx - self.n_valid if mirrored else idx
-
-        # --- inputs ---
-        # Copy the pre-normalized row so we can flip ky if needed.
-        x_norm = self.X_norm_data[raw_idx].copy()
-
-        if mirrored:
-            x_norm[self.KY_IDX] = -x_norm[self.KY_IDX]
-
-        # --- output (pre-computed, just index) ---
-        y_norm = self.y_norm_data[raw_idx]
-
-        # --- weight (pre-computed, just index) ---
-        w_norm = self.w_norm_data[raw_idx]
+        x_norm = self.X_norm_data[idx]
+        phi = self.phi_data[idx]
+        y_norm = self.y_norm_data[idx]
+        w_norm = self.w_norm_data[idx]
 
         return (
-            torch.from_numpy(x_norm),  # zero-copy after .copy()
+            torch.from_numpy(x_norm),
+            torch.tensor(phi, dtype=torch.float32),
             torch.tensor(y_norm, dtype=torch.float32),
             torch.tensor(w_norm, dtype=torch.float32),
         )
 
+    # Get a group of points by a list of indices. Uses fancy indexing to avoid loop overhead.
     def __getitems__(self, indices: list[int]) -> list:
         indices = np.asarray(indices, dtype=np.intp)
 
-        if self.mirror:
-            mirrored_mask = indices >= self.n_valid
-            raw_indices = np.where(mirrored_mask, indices - self.n_valid, indices)
-        else:
-            mirrored_mask = np.zeros(len(indices), dtype=bool)
-            raw_indices = indices
+        X_batch = self.X_norm_data[indices]
+        phi_batch = self.phi_data[indices]
+        y_batch = self.y_norm_data[indices]
+        w_batch = self.w_norm_data[indices]
 
-        X_batch = self.X_norm_data[raw_indices].copy()
-        y_batch = self.y_norm_data[raw_indices]
-        w_batch = self.w_norm_data[raw_indices]
-
-        if self.mirror and mirrored_mask.any():
-            X_batch[mirrored_mask, self.KY_IDX] *= -1
-
-        # ✅ Return three tensors — collate_fn receives one "sample" and passes
+        # Return four tensors — collate_fn receives one "sample" and passes
         # it straight through without any further stacking.
         return [
             torch.from_numpy(X_batch),
-            torch.from_numpy(y_batch.copy()),  # copy() to own the memory
+            torch.from_numpy(phi_batch.copy()),
+            torch.from_numpy(y_batch.copy()),
             torch.from_numpy(w_batch.copy()),
         ]
 
@@ -338,51 +302,34 @@ class RadiationSubset(Dataset):
     physical_indices : np.ndarray, dtype=np.intp
         Indices into dataset.X_norm_data / y_norm_data / w_norm_data.
         Must be in [0, dataset.n_valid).
-    mirror : bool
-        Whether to expose a mirrored (ky → -ky) copy of every sample.
-        Typically True for training, False for validation.
     """
 
     def __init__(
-        self,
-        dataset: RadiationDataset,
-        physical_indices: np.ndarray,
-        mirror: bool = True,
+            self,
+            dataset: RadiationDataset,
+            physical_indices: np.ndarray,
     ):
-        self.ds      = dataset
-        self.idx     = np.asarray(physical_indices, dtype=np.intp)
-        self.mirror  = mirror
-        self.n_phys  = len(self.idx)
+        self.ds = dataset
+        self.idx = np.asarray(physical_indices, dtype=np.intp)
+        self.n_phys = len(self.idx)
 
     def __len__(self) -> int:
-        return 2 * self.n_phys if self.mirror else self.n_phys
+        return self.n_phys
 
     def __getitems__(self, positions: list[int]) -> list:
         positions = np.asarray(positions, dtype=np.intp)
+        phys_idx = self.idx[positions]
 
-        if self.mirror:
-            mirrored_mask = positions >= self.n_phys
-            local_idx     = np.where(mirrored_mask, positions - self.n_phys, positions)
-        else:
-            mirrored_mask = np.zeros(len(positions), dtype=bool)
-            local_idx     = positions
-
-        # Map local positions → physical dataset indices (one fancy-index)
-        phys_idx = self.idx[local_idx]
-
-        # Single C-level read per array — fully contiguous because self.idx
-        # was built from a sorted or pre-shuffled contiguous slice
-        X_batch = self.ds.X_norm_data[phys_idx].copy()   # copy needed for ky flip
-        y_batch = self.ds.y_norm_data[phys_idx].copy()
-        w_batch = self.ds.w_norm_data[phys_idx].copy()
-
-        if self.mirror and mirrored_mask.any():
-            X_batch[mirrored_mask, RadiationDataset.KY_IDX] *= -1
+        X_batch = self.ds.X_norm_data[phys_idx]
+        phi_batch = self.ds.phi_data[phys_idx]
+        y_batch = self.ds.y_norm_data[phys_idx]
+        w_batch = self.ds.w_norm_data[phys_idx]
 
         return [
-            torch.from_numpy(X_batch),
-            torch.from_numpy(y_batch),
-            torch.from_numpy(w_batch),
+            torch.from_numpy(X_batch.copy()),
+            torch.from_numpy(phi_batch.copy()),
+            torch.from_numpy(y_batch.copy()),
+            torch.from_numpy(w_batch.copy()),
         ]
 
 # ==============================================================================
@@ -397,7 +344,7 @@ class RadiationEmulator(nn.Module):
 
     def __init__(
             self,
-            input_dim: int = 8,
+            input_dim: int = 7,
             hidden_dim: int = 256,
             n_layers: int = 5,
             activation: str = "silu",
@@ -431,8 +378,10 @@ class RadiationEmulator(nn.Module):
             self.hidden_acts.append(act_fn())
             self.dropouts.append(nn.Dropout(p=dropout_p))
 
-        # Output layer
-        self.output_layer = nn.Linear(hidden_dim, 1)
+        # Output layer -- 3 features: A0, A1, & A2 fourier harmonic factors.
+        # Each head predicts the harmonic amplitude scaled by 1/f0 (same scale
+        # convention as the arcsinh transform used on the training targets).
+        self.output_layer = nn.Linear(hidden_dim, 3)
 
         # Initialize weights
         self._init_weights()
@@ -452,12 +401,14 @@ class RadiationEmulator(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of shape (batch_size, 9) with normalized features
+            Input tensor of shape (batch_size, 7) with normalized features
+            [x, k_perp, E, z0, u_perp, T, g]
 
         Returns
         -------
         torch.Tensor
-            Output tensor of shape (batch_size, 1) with normalized log-intensity
+            Output tensor of shape (batch_size, 3): (A0, A1, A2) harmonic
+            amplitudes, in units of 1/f0 (physical amplitude = output * f0).
         """
         # Input layer
         h = self.input_act(self.input_layer(x))
@@ -478,21 +429,42 @@ class RadiationEmulator(nn.Module):
 # ==============================================================================
 # Training utilities
 # ==============================================================================
+def combine_harmonics(A_heads: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+    """
+    Reconstruct I/f0 = A0 + A1*cos(phi) + A2*cos(2*phi) from the 3 network heads.
+
+    A_heads : (B, 3) tensor of (A0, A1, A2), each already in units of 1/f0.
+    phi     : (B,)   tensor of azimuthal angle.
+    """
+    return A_heads[:, 0] + A_heads[:, 1] * torch.cos(phi) + A_heads[:, 2] * torch.cos(2 * phi)
+
+
 def compute_loss(
         model: nn.Module,
         inputs: torch.Tensor,
+        phi: torch.Tensor,
         targets: torch.Tensor,
         weights: torch.Tensor,
         config: TrainingConfig,
         X_mean: torch.Tensor,
         X_std: torch.Tensor,
+        y_mean: float,
+        y_std: float,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute weighted MSE loss with physics constraints.
 
+    The model outputs 3 harmonic heads (A0, A1, A2). These are combined via
+    A0 + A1*cos(phi) + A2*cos(2*phi) to reconstruct I/f0, then arcsinh-transformed
+    and standardized to match the (pre-transformed) targets.
+
     Returns total loss and dictionary of individual loss components.
     """
-    predictions = model(inputs).squeeze(-1)
+    # Get head outputs and compute predicted values at phi points
+    A_heads = model(inputs)                       # (B, 3)
+    I_over_f0_pred = combine_harmonics(A_heads, phi)
+    pred_transformed = torch.arcsinh(I_over_f0_pred)
+    predictions = (pred_transformed - y_mean) / y_std
 
     """
     Weighted MSE loss
@@ -500,29 +472,15 @@ def compute_loss(
     mse = (weights * (predictions - targets) ** 2).mean()
 
     """
-    k_y symmetry enforcement loss 
-
-    k_y symmetry is already built into the training data (mirrored samples).
-    This is an optional soft loss penalty on top.
-    """
-    if config.lambda_ky_symmetry > 0.0:
-        # Create inputs with flipped k_y (index 2 in feature list)
-        inputs_ky_flipped = inputs.clone()
-        inputs_ky_flipped[:, 2] = -inputs_ky_flipped[:, 2]  # ky -> -ky
-        predictions_flipped = model(inputs_ky_flipped).squeeze(-1)
-        ky_symmetry = ((predictions - predictions_flipped) ** 2).mean()
-    else:
-        ky_symmetry = torch.tensor(0.0, device=inputs.device)
-
-    """
     UV decay enforcement loss
 
-    Enforces f(params, k_x, k_y) -> 0 as k_perp -> inf.
+    Enforces each harmonic head -> 0 as k_perp -> inf. Applied per-head since
+    every harmonic amplitude should vanish independently in the UV.
     """
     if config.lambda_uv > 0.0:
-        max_frac = 0.05  # fraction of kperp^2_max at which to start penalizing.
+        max_frac = 0.05
         rng = np.random.default_rng()
-        n_uv_samples = 64  # Number of samples to draw from UV region
+        n_uv_samples = 64
 
         # Get shape and device of inputs
         B = inputs.shape[0]
@@ -530,56 +488,43 @@ def compute_loss(
 
         # Tile the other 7 parameters from random rows of the training batch
         idx = torch.randint(0, B, (n_uv_samples,), device=device)
-        uv_params = inputs[idx].clone()  # (n_uv_samples, 8)
+        uv_params = inputs[idx].clone()  # (n_uv_samples, 7)
 
-        # Denormalize the E column (index 3) to recover raw GeV values
-        E_mean = X_mean[3].to(device)
-        E_std = X_std[3].to(device)
-        energy_params = (uv_params[:, 3] * E_std + E_mean).cpu().numpy()
+        E_mean = X_mean[2].to(device)   # index 2 == 'E'
+        E_std = X_std[2].to(device)
+        energy_params = (uv_params[:, 2] * E_std + E_mean).cpu().numpy()
 
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
         log_k = []
         for i in np.arange(0, len(energy_params)):
-            try:
-                # 2 * log(energy) = log(energy^2) -- Use minimum of uv_kt_threshold to avoid penalizing structure at low pT
-                log_lo = np.amax([math.log(max_frac) + 2 * math.log(energy_params[i]), math.log(config.uv_kt_threshold)])
-                log_hi = 2 * math.log(energy_params[i])
-            except ValueError:
-                print(energy_params[i])
-                print(energy_params)
-                raise Exception
+            # 2 * log(energy) = log(energy^2) -- Use minimum of uv_kt_threshold to avoid penalizing structure at low pT
+            log_lo = np.amax([math.log(max_frac) + 2 * math.log(energy_params[i]),
+                               math.log(config.uv_kt_threshold)])
+            log_hi = 2 * math.log(energy_params[i])
             if log_lo < log_hi:
                 log_k.append(rng.uniform(log_lo, log_hi))
             else:
-                log_k.append(log_lo)  # energy == 1.0 exactly: both bounds equal, just use it
-        log_k = torch.tensor(log_k, device=device)  # Make list into torch tensor
-        k_perp = torch.exp(log_k)
+                log_k.append(log_lo)
+        log_k = torch.tensor(log_k, device=device)
+        k_perp_uv = torch.exp(log_k)
 
-        # Isotropic: random azimuthal angle phi
-        phi = torch.empty(n_uv_samples, device=device).uniform_(0, 2 * math.pi)
-        k_x_uv = k_perp * torch.cos(phi)
-        if config.mirror:
-            k_y_uv = k_perp * torch.sin(phi)  # k_y positive or negative
-        else:
-            k_y_uv = (k_perp * torch.sin(phi)).abs()  # make k_y always positive
+        uv_params[:, 1] = k_perp_uv  # index 1 == 'k_perp'
 
-        uv_params[:, 1] = k_x_uv  # overwrite k_x
-        uv_params[:, 2] = k_y_uv  # overwrite k_y
-
-        uv_output = model(uv_params).squeeze(-1)  # (n_uv_samples,) or (n_uv_samples, 1)
+        uv_heads = model(uv_params)  # shape (n_uv_samples, 3)
 
         # Use log weight to penalize nonzero result at larger k_perp values more
-        log_esqr = torch.tensor(math.log(max_frac) + 2* np.log(energy_params), device=device)
-        log_weight = 2 * log_k - 2 * log_esqr  # == 2 * log_esqr, kept verbose for clarity
-        uv_decay = (log_weight * uv_output ** 2).mean()
+        log_esqr = torch.tensor(math.log(max_frac) + 2 * np.log(energy_params), device=device)
+        log_weight = 2 * log_k - 2 * log_esqr
+
+        # Penalize all three heads
+        uv_decay = (log_weight.unsqueeze(1) * uv_heads ** 2).mean()
     else:
         uv_decay = torch.tensor(0.0, device=inputs.device)
 
     """
     UV power law behavior enforcement loss
 
-    Enforces f(alpha * k_perp) / f(k_perp) ~ alpha^{-power}.
-    Robust to overall normalisation; constrains the UV shape directly.
+    Enforces A_n(alpha * k_perp) / A_n(k_perp) ~ alpha^{-power} for each head.
     """
     if config.lambda_uv_power > 0.0:
         B = inputs.shape[0]
@@ -593,27 +538,22 @@ def compute_loss(
         base_params = inputs[idx].clone()
 
         # Randomise k_perp_base point in a moderate UV range
-        k_perp = k_perp_base * torch.exp(
+        k_perp_sample = k_perp_base * torch.exp(
             torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 3)
         )
-        phi = torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 2 * torch.pi)
 
         # Low-k point
-        base_params[:, 1] = k_perp * torch.cos(phi)
-        base_params[:, 2] = k_perp * torch.sin(phi)
-        f_low = model(base_params).squeeze()
+        base_params[:, 1] = k_perp_sample
+        heads_low = model(base_params)  # (n, 3)
 
         # High-k point (same direction, same other params)
         high_params = base_params.clone()
-        high_params[:, 1] = (alpha * k_perp) * torch.cos(phi)
-        high_params[:, 2] = (alpha * k_perp) * torch.sin(phi)
-        f_high = model(high_params).squeeze()
+        high_params[:, 1] = alpha * k_perp_sample
+        heads_high = model(high_params)  # (n, 3)
 
-        # Target ratio: f(alpha*k) / f(k) = alpha^{-power}
         expected_ratio = alpha ** (-power)
-        # Use log-ratio loss for numerical stability; avoids division-by-zero
-        log_ratio = torch.log(torch.abs(f_high) + 1e-30) - torch.log(torch.abs(f_low) + 1e-30)
-        target_log_ratio = torch.full_like(log_ratio, torch.log(torch.tensor(expected_ratio)).item())
+        log_ratio = torch.log(torch.abs(heads_high) + 1e-30) - torch.log(torch.abs(heads_low) + 1e-30)
+        target_log_ratio = torch.full_like(log_ratio, math.log(expected_ratio))
 
         uv_power_law = nn.functional.mse_loss(log_ratio, target_log_ratio)
     else:
@@ -622,15 +562,12 @@ def compute_loss(
     # Total loss
     total_loss = (
             mse
-            + config.lambda_ky_symmetry * ky_symmetry
             + config.lambda_uv * uv_decay
             + config.lambda_uv_power * uv_power_law
     )
 
-    # Return loss components for logging
     components = {
         'mse': mse.item(),
-        'ky_symmetry': ky_symmetry.item(),
         'uv_decay': uv_decay.item(),
         'uv_power_law': uv_power_law.item(),
         'total': total_loss.item(),
@@ -646,6 +583,8 @@ def train_epoch(
         config: TrainingConfig,
         X_mean: torch.Tensor,
         X_std: torch.Tensor,
+        y_mean: float,
+        y_std: float,
 ) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
@@ -654,25 +593,28 @@ def train_epoch(
     n_batches = 0
 
     t0 = time.time()
-    for i, (inputs, targets, weights) in enumerate(dataloader):
+    for i, (inputs, phi, targets, weights) in enumerate(dataloader):
         # if i % 10000 == 0 and i != 0:
         #     print(f"  Batch {i}/{len(dataloader)}  [avg {(time.time() - t0)/i:.3f}s/batch]")
 
         # Send tensors to device
         inputs = inputs.to(config.device)
+        phi = phi.to(config.device)
         targets = targets.to(config.device)
         weights = weights.to(config.device)
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, targets, weights, config, X_mean, X_std)
+        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
         loss.backward()
         optimizer.step()
 
+        # Add to running sum of loss and MSE
         total_loss += components['total']
         total_mse += components['mse']
         n_batches += 1
 
+    # Return loss and MSE
     return {
         'loss': total_loss / n_batches,
         'mse': total_mse / n_batches,
@@ -685,6 +627,8 @@ def validate(
         config: TrainingConfig,
         X_mean: torch.Tensor,
         X_std: torch.Tensor,
+        y_mean: float,
+        y_std: float,
 ) -> Dict[str, float]:
     """Validate the model."""
     model.eval()
@@ -693,17 +637,22 @@ def validate(
     n_batches = 0
 
     with torch.no_grad():
-        for inputs, targets, weights in dataloader:
+        for inputs, phi, targets, weights in dataloader:
+            # Send tensors to device
             inputs = inputs.to(config.device)
+            phi = phi.to(config.device)
             targets = targets.to(config.device)
             weights = weights.to(config.device)
 
-            _, components = compute_loss(model, inputs, targets, weights, config, X_mean, X_std)
+            # Compute loss
+            _, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
 
+            # Add to running sum of loss and MSE
             total_loss += components['total']
             total_mse += components['mse']
             n_batches += 1
 
+    # Return loss and MSE
     return {
         'loss': total_loss / n_batches,
         'mse': total_mse / n_batches,
@@ -852,7 +801,7 @@ def train_model(config: TrainingConfig):
         with open(config.normalization_file, 'w') as f:
             json.dump(norm_params, f, indent=2)
 
-    # Split on *physical* indices before mirroring, so each subset gets a
+    # Split on *physical* indices, so each subset gets a
     # contiguous, cache-friendly slice of the underlying arrays.
     n_phys_train = int(dataset.n_valid * config.train_fraction)
 
@@ -862,10 +811,9 @@ def train_model(config: TrainingConfig):
     train_idx = perm[:n_phys_train]
     val_idx = perm[n_phys_train:]
 
-    # Training subset: mirrored (doubles the effective dataset size).
-    # Validation subset: no mirroring — we want unbiased coverage.
-    train_dataset = RadiationSubset(dataset, train_idx, mirror=config.mirror)
-    val_dataset = RadiationSubset(dataset, val_idx, mirror=False)
+    # Split training and validation datasets
+    train_dataset = RadiationSubset(dataset, train_idx)
+    val_dataset = RadiationSubset(dataset, val_idx)
 
     # print(f"Training samples: {n_train}")
     # print(f"Validation samples: {n_val}")
@@ -987,6 +935,8 @@ def train_model(config: TrainingConfig):
     # Pre-move normalization tensors to device once, for use in loss computation
     X_mean_t = torch.tensor(dataset.X_mean, dtype=torch.float32).to(config.device)
     X_std_t = torch.tensor(dataset.X_std, dtype=torch.float32).to(config.device)
+    y_mean_t = dataset.y_mean
+    y_std_t = dataset.y_std
 
     print("\nStarting training...")
     print("-" * 70)
@@ -1004,12 +954,10 @@ def train_model(config: TrainingConfig):
                 break
 
             # Train
-            # print("Training...")
-            train_metrics = train_epoch(model, train_loader, optimizer, config, X_mean_t, X_std_t)
+            train_metrics = train_epoch(model, train_loader, optimizer, config, X_mean_t, X_std_t, y_mean_t, y_std_t)
 
             # Validate
-            # print("Validating...")
-            val_metrics = validate(model, val_loader, config, X_mean_t, X_std_t)
+            val_metrics = validate(model, val_loader, config, X_mean_t, X_std_t, y_mean_t, y_std_t)
 
             # Update scheduler
             scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
@@ -1095,7 +1043,7 @@ class RadiationEmulatorInference:
     Handles normalization and inverse transforms automatically.
     """
 
-    FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g']
+    FEATURE_NAMES = ['x', 'k_perp', 'E', 'z0', 'u_perp', 'T', 'g']
 
     def __init__(
             self,
@@ -1177,55 +1125,71 @@ class RadiationEmulatorInference:
 
     def predict(
             self,
-            x: np.ndarray,  # unitless
-            kx: np.ndarray,  # in GeV
-            ky: np.ndarray,  # in GeV
-            E: np.ndarray,  # in GeV
-            z0: np.ndarray,  # in invGeV -- zf hardcoded at dtau = 0.1 fm
-            u_perp: np.ndarray,  # unitless
-            T: np.ndarray,  # in GeV
-            g: np.ndarray,  # unitless
+            x: np.ndarray,
+            k_perp: np.ndarray,
+            phi: np.ndarray,
+            E: np.ndarray,
+            z0: np.ndarray,
+            u_perp: np.ndarray,
+            T: np.ndarray,
+            g: np.ndarray,
     ) -> np.ndarray:
-        # Stack inputs directly into a contiguous float32 C-array,
-        # then wrap with from_numpy (zero-copy) before sending to device.
-        inputs = np.column_stack([x, kx, ky, E, z0, u_perp, T, g]).astype(
-            np.float32, order='C', copy=False
-        )
-        inputs_tensor = torch.from_numpy(inputs).to(self.device, non_blocking=True)
-
-        # Normalize (X_mean / X_std are already on self.device)
-        inputs_norm = (inputs_tensor - self.X_mean) / self.X_std
-
-        with torch.no_grad():
-            predictions_norm = self.model(inputs_norm).squeeze()
-
-
-        # Stay on CPU as a numpy array; avoid an extra .cpu() call
-        # by using the tensor directly when device is already CPU.
-        pn = predictions_norm if self.device == "cpu" else predictions_norm.cpu()
-        # print(f"normed predictions: {np.mean(pn)}")
-        # print(pn)
-        predictions_transformed = pn.numpy() * self.y_std + self.y_mean
-        print(f"denormed: {np.mean(predictions_transformed)}")
-
-        if self.transform == "log":
-            predictions = np.exp(np.abs(predictions_transformed)) - self.epsilon
-            predictions = np.sign(predictions_transformed) * predictions
-        elif self.transform == "arcsinh":
-            predictions = self.f0 * np.sinh(predictions_transformed)
-        else:
-            predictions = predictions_transformed
-
-        print(f"after transform: {np.mean(predictions)}")
+        """
+        Physical-facing entry point -- returns the combined scalar intensity
+        """
+        A0, A1, A2 = self.predict_harmonics(x, k_perp, E, z0, u_perp, T, g)
+        predictions = A0 + A1 * np.cos(phi) + A2 * np.cos(2 * phi)
         return predictions
 
-    def predict_raw(self, inputs: np.ndarray) -> np.ndarray:
+    def predict_kxky(
+            self,
+            x: np.ndarray,
+            kx: np.ndarray,
+            ky: np.ndarray,
+            E: np.ndarray,
+            z0: np.ndarray,
+            u_perp: np.ndarray,
+            T: np.ndarray,
+            g: np.ndarray,
+    ) -> np.ndarray:
         """
-        Faster entry-point when the caller can supply a pre-stacked
-        (N, 9) float32 array in feature order [x, kx, ky, E, z0, u_perp, T, g].
+        Legacy entry point: still accepts kx, ky (as callers expect),
+        derives k_perp/phi internally, and returns the combined scalar
+        intensity — same public contract as before.
+        """
+        k_perp = np.sqrt(kx ** 2 + ky ** 2)
+        phi = np.arctan2(ky, kx)
 
-        Skips the np.column_stack overhead, which matters when predict()
-        is called thousands of times with the same grid layout.
+        A0, A1, A2 = self.predict_harmonics(x, k_perp, E, z0, u_perp, T, g)
+        predictions = A0 + A1 * np.cos(phi) + A2 * np.cos(2 * phi)
+        return predictions
+
+    def predict_harmonics(
+            self,
+            x: np.ndarray,
+            k_perp: np.ndarray,
+            E: np.ndarray,
+            z0: np.ndarray,
+            u_perp: np.ndarray,
+            T: np.ndarray,
+            g: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Returns physical (A0, A1, A2) harmonic amplitudes for the given
+        (x, k_perp, ...) points — no phi dependence, so callers can evaluate
+        this on a much coarser grid than the full 3D (kx, ky, kz) grid.
+        """
+        inputs = np.column_stack([x, k_perp, E, z0, u_perp, T, g]).astype(
+            np.float32, order='C', copy=False
+        )
+        A_heads = self.predict_harmonics_raw(inputs)
+        return A_heads[:, 0], A_heads[:, 1], A_heads[:, 2]
+
+    def predict_harmonics_raw(self, inputs: np.ndarray) -> np.ndarray:
+        """
+        Fast entry-point for pre-stacked (N, 7) float32 arrays in feature
+        order [x, k_perp, E, z0, u_perp, T, g]. Returns physical (N, 3)
+        array of (A0, A1, A2) harmonic amplitudes (phi not yet applied).
         """
         inputs_tensor = torch.from_numpy(
             np.asarray(inputs, dtype=np.float32, order='C')
@@ -1234,20 +1198,10 @@ class RadiationEmulatorInference:
         inputs_norm = (inputs_tensor - self.X_mean) / self.X_std
 
         with torch.no_grad():
-            predictions_norm = self.model(inputs_norm).squeeze()
+            A_heads = self.model(inputs_norm)  # (N, 3), units of 1/f0
 
-        pn = predictions_norm if self.device == "cpu" else predictions_norm.cpu()
-        predictions_transformed = pn.numpy() * self.y_std + self.y_mean
-
-        if self.transform == "log":
-            predictions = np.exp(np.abs(predictions_transformed)) - self.epsilon
-            predictions = np.sign(predictions_transformed) * predictions
-        elif self.transform == "arcsinh":
-            predictions = self.f0 * np.sinh(predictions_transformed)
-        else:
-            predictions = predictions_transformed
-
-        return predictions
+        A_heads = A_heads if self.device == "cpu" else A_heads.cpu()
+        return self.f0 * A_heads.numpy()
 
     def predict_dict(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
         """
@@ -1265,8 +1219,8 @@ class RadiationEmulatorInference:
         """
         return self.predict(
             x=inputs['x'],
-            kx=inputs['kx'],
-            ky=inputs['ky'],
+            k_perp=inputs['k_perp'],
+            phi=inputs['phi'],
             E=inputs['E'],
             z0=inputs['z0'],
             u_perp=inputs['u_perp'],
@@ -1281,45 +1235,59 @@ class RadiationEmulatorInference:
                            T: float,
                            g: float,
                            kz_values: np.ndarray,
-                           kx_values: np.ndarray,
-                           ky_values: np.ndarray
+                           k_perp_values: np.ndarray,
+                           phi_values: np.ndarray,
                            ) -> (np.ndarray):
         """
-        Computes a complete grid of dN/(dxdkxdky) shaped as (kx, ky, kz) and returns the grid, sans CR
-        """
+        Computes a complete grid of dN/d^3k shaped as (k_perp, phi, kz).
 
-        # Create a meshgrid and compute x values for each grid point
-        kx_grid, ky_grid, kz_grid = np.meshgrid(kx_values, ky_values, kz_values, indexing='ij')
-        x_grid = (1 / ((E**2 )*np.sqrt(2))) * (E*kz_grid + np.sqrt(E**2 * (kz_grid**2 + kx_grid**2 + ky_grid**2)))
-        n_pts = x_grid.size
+        Since x = x(k_perp, kz) has no phi dependence, the network is
+        evaluated only on the 2D (k_perp, kz) grid; phi dependence is
+        reconstructed analytically via A0 + A1*cos(phi) + A2*cos(2*phi).
+        """
+        # create a 2D meshgrid in the only two variables the network needs
+        kperp_grid2d, kz_grid2d = np.meshgrid(k_perp_values, kz_values, indexing='ij')  # (n_kperp, n_kz)
+        x_grid2d = (1 / (E ** 2 * np.sqrt(2))) * (
+                E * kz_grid2d + np.sqrt(E ** 2 * (kz_grid2d ** 2 + kperp_grid2d ** 2))
+        )
 
         # Build input grid once
+        n_pts = x_grid2d.size
         grid_inputs = np.column_stack([
-            x_grid.ravel(), kx_grid.ravel(), ky_grid.ravel(),
+            x_grid2d.ravel(), kperp_grid2d.ravel(),
             np.full(n_pts, E), np.full(n_pts, z0),
             np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
         ]).astype(np.float32)
 
-        # Get predictions -- returns as flat array of dI/dxd^2k_perp points
-        I_nn_flat = self.predict_raw(grid_inputs)
+        # Single batched network call over the (k_perp, kz) grid -- no phi dependence yet
+        A_flat = self.predict_harmonics_raw(grid_inputs)  # (n_pts, 3)
+        A0_2d = A_flat[:, 0].reshape(x_grid2d.shape)
+        A1_2d = A_flat[:, 1].reshape(x_grid2d.shape)
+        A2_2d = A_flat[:, 2].reshape(x_grid2d.shape)
 
-        # Reshape flat predictions back onto the 3D grid
-        I_nn = I_nn_flat.reshape(x_grid.shape)  # shape: (n_kx, n_ky, n_x)
+        # Reconstruct full angular dependence via broadcasting -- shape (n_kperp, n_phi, n_kz)
+        cos_phi = np.cos(phi_values)[None, :, None]
+        cos_2phi = np.cos(2 * phi_values)[None, :, None]
+        I_nn = A0_2d[:, None, :] + A1_2d[:, None, :] * cos_phi + A2_2d[:, None, :] * cos_2phi
+
+        x_grid3d = np.broadcast_to(x_grid2d[:, None, :], I_nn.shape)
+        kperp_grid3d = np.broadcast_to(kperp_grid2d[:, None, :], I_nn.shape)
 
         # Set any unphysical x coordinate values to zero
-        I_nn[x_grid > 1.0] = 0
+        mask = x_grid3d > 1.0
+        if np.amax(mask) > 0:
+            print("Oh no!!! (x > 1)!!!")
+            I_nn[x_grid3d > 1.0] = 0
 
         # Compute dN/dxd^2k_perp by dividing out energy of each grid point
-        N_nn = I_nn / (E*x_grid)  # Still needs casimir factor
+        N_nn = I_nn / (E * x_grid3d)  # Still needs casimir factor
 
-        # Convert to dN/d^3k
-        # Compute and apply Jacobian for x -> kz : dN/dkz = (dN/dx) * |dx/dkz|
-        # Broadcast shapes: kx/ky -> (m, 1, 1) and (1, m, 1), x -> (1, 1, n)
-        dkz_dx = (1 / np.sqrt(2)) * (E + (kx_grid ** 2 + ky_grid ** 2) / (2 * x_grid ** 2 * E))
-        jacobian = 1.0 / dkz_dx  # |dx/dkz|, shape broadcasts to (m, m, n)
+        # Convert to dN/d^3k via the x -> kz Jacobian
+        dkz_dx = (1 / np.sqrt(2)) * (E + kperp_grid3d ** 2 / (2 * x_grid3d ** 2 * E))
+        jacobian = 1.0 / dkz_dx
         N_nn = N_nn * jacobian
 
-        # Return as dN/d^3k
+        # Returned grid is (k_perp, phi, kz), NOT (kx, ky, kz)
         return N_nn
 
     def sample_emission(self,
@@ -1332,91 +1300,80 @@ class RadiationEmulatorInference:
                         rng: np.random.Generator = np.random.default_rng()
                         ) -> tuple[float, np.ndarray]:
         """
-        Computes a complete grid in x, kx, ky and returns a 3D inverse CDF sample value for x, kx, ky vector.
+        Computes a grid in (x, k_perp, phi) and returns an inverse-CDF
+        sample, converted to a Cartesian (kx, ky, kz) momentum vector.
         """
 
-        # Grid of x, kx, ky values
-        max_kx_ky = 5  # Maybe should be dependent on energy, needs testing.
+        # Grid of x, k_perp, phi values
+        max_k_perp = 5  # Maybe should be dependent on energy, needs testing.
         x_values = np.logspace(-4, 0, 10)
-        kx_values = np.linspace(-max_kx_ky, max_kx_ky, 50)
-        ky_values = np.linspace(0, max_kx_ky, 50)
-        x_grid, kx_grid, ky_grid = np.meshgrid(x_values, kx_values, ky_values, indexing='ij')
-        n_pts = x_grid.size
+        k_perp_values = np.linspace(0, max_k_perp, 50)
+        phi_values = np.linspace(0, 2 * np.pi, 64, endpoint=False)
 
-        # Build input grid once
+        # 2D grid in the only two variables the network needs
+        x_grid2d, kperp_grid2d = np.meshgrid(x_values, k_perp_values, indexing='ij')  # (n_x, n_kperp)
+        n_pts = x_grid2d.size
         grid_inputs = np.column_stack([
-            x_grid.ravel(), kx_grid.ravel(), ky_grid.ravel(),
+            x_grid2d.ravel(), kperp_grid2d.ravel(),
             np.full(n_pts, E), np.full(n_pts, z0),
             np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
         ]).astype(np.float32)
 
-        # Get predictions
-        I_nn_flat = self.predict_raw(grid_inputs)
+        # Single batched network call over the (x, k_perp) grid -- no phi dependence yet
+        A_flat = self.predict_harmonics_raw(grid_inputs)
+        A0_2d = A_flat[:, 0].reshape(x_grid2d.shape)
+        A1_2d = A_flat[:, 1].reshape(x_grid2d.shape)
+        A2_2d = A_flat[:, 2].reshape(x_grid2d.shape)
 
-        # --- Reshape flat predictions back onto the 3D grid ---
-        I_nn = I_nn_flat.reshape(x_grid.shape)  # shape: (n_x, n_kx, n_ky)
+        # Reconstruct full (x, k_perp, phi) grid via broadcasting
+        cos_phi = np.cos(phi_values)[None, None, :]
+        cos_2phi = np.cos(2 * phi_values)[None, None, :]
+        I_nn = A0_2d[:, :, None] + A1_2d[:, :, None] * cos_phi + A2_2d[:, :, None] * cos_2phi
+        # shape: (n_x, n_kperp, n_phi)
 
         # -------------------------------------------------------
         # 1. INTEGRATION
-        #    Integrate over ky first, then kx, then x (in log-space).
-        #    np.trapz(y, x) integrates y along the last axis by default.
+        #    d^2k_perp = k_perp dk_perp dphi -- the k_perp Jacobian must be
+        #    folded in explicitly since we're integrating in polar coords.
         # -------------------------------------------------------
-        # Integrate over ky (axis 2)
-        I_kx_x = 2 * np.trapezoid(I_nn, ky_values,
-                                  axis=2)  # shape: (n_x, n_kx), multiply by two for symmetric -ky half of grid
-        # Integrate over kx (axis 1)
-        I_x = np.trapezoid(I_kx_x, kx_values, axis=1)  # shape: (n_x,)
+        I_x_kperp = np.trapezoid(I_nn, phi_values, axis=2)  # integrate over phi -> (n_x, n_kperp)
+        I_x = np.trapezoid(I_x_kperp * k_perp_values[None, :], k_perp_values, axis=1)  # -> (n_x,)
         # Integrate over x in log-space (accounts for log-spaced grid) -- includes Jacobian, factor of x
         total_integral = np.trapezoid(I_x * x_values, np.log(x_values))  # scalar
 
-        # print(f"Total integral: {total_integral:.6e}")
-
         # -------------------------------------------------------
         # 2. SAMPLING
-        #    Treat I_nn as an (unnormalized) 3D probability density
-        #    and draw N_samples points (x, kx, ky) from it.
+        #    Treat I_nn (weighted by the k_perp Jacobian) as an
+        #    (unnormalized) 3D probability density over (x, k_perp, phi)
+        #    and draw N_samples points from it.
         # -------------------------------------------------------
-
-        # Build a normalized flat PDF, then a CDF
-        I_flat = I_nn.ravel()
-        I_flat_pos = np.clip(I_flat, 0, None)  # ensure non-negative
-        pdf = I_flat_pos / I_flat_pos.sum()  # normalize to sum to 1
+        weight_grid = I_nn * k_perp_values[None, :, None]  # polar area element
+        weight_flat = np.clip(weight_grid, 0, None).ravel()  # ensure non-negative
+        pdf = weight_flat / weight_flat.sum()  # normalize to sum to 1
         cdf = np.cumsum(pdf)  # build CDF
         cdf[-1] = 1.0  # Force exact upper bound — removes all floating point slop
 
         # Draw uniform samples and find where they land in the CDF
-        uniform_samples = rng.uniform(size=N_samples)  # Should use the global RNG...
-        sign_samples = rng.choice([-1, 1], size=N_samples)
+        uniform_samples = rng.uniform(size=N_samples)
         flat_indices = np.searchsorted(cdf, uniform_samples)  # shape: (N_samples,)
 
         # Convert flat indices back to 3D grid indices
-        ix, ikx, iky = np.unravel_index(flat_indices, I_nn.shape)
+        ix, ikperp, iphi = np.unravel_index(flat_indices, I_nn.shape)
 
         # Look up the corresponding coordinate values
         sampled_x = x_values[ix]
-        sampled_kx = kx_values[ikx]
-        sampled_ky = sign_samples * ky_values[
-            iky]  # Apply a random sign to the ky values to simulate symmetric -ky values
+        sampled_kperp = k_perp_values[ikperp]
+        sampled_phi = phi_values[iphi]  # full 0..2pi range -- no sign-flip hack needed
+
+        # Convert back to Cartesian transverse components
+        sampled_kx = sampled_kperp * np.cos(sampled_phi)
+        sampled_ky = sampled_kperp * np.sin(sampled_phi)
 
         # Actual longitudinal component of the momentum vector
         # We know $k^+ = x p^+$, so we apply the lightcone non-diagonal metric and the on-shell condition, $k^2 = 0$
-        sampled_kz = (1 / np.sqrt(2)) * (sampled_x * E - ((sampled_kx ** 2 + sampled_ky ** 2) / (2 * sampled_x * E)))
+        sampled_kz = (1 / np.sqrt(2)) * (sampled_x * E - (sampled_kperp ** 2) / (2 * sampled_x * E))
 
-        # sampled_kz = 0  # Just give zero kz for now
-        # mag = np.sqrt(sampled_kx**2 + sampled_ky**2 + sampled_kz**2)
-        # emission_momentum = total_integral * np.column_stack([sampled_kx/mag, sampled_ky/mag, sampled_kz/mag])
-        # emission_momentum =  np.column_stack([sampled_x*E * sampled_kx / mag, sampled_x*E * sampled_ky / mag, sampled_x*E * sampled_kz / mag])
         emission_momentum = np.column_stack([sampled_kx, sampled_ky, sampled_kz])
-
-        # # Apply random uniform jitter to point, to simulate continuous sampling
-        # sampled_x += np.random.uniform(-dx / 2, dx / 2, size=N_samples)
-        # sampled_kx += np.random.uniform(-dkx / 2, dkx / 2, size=N_samples)
-        # sampled_ky += np.random.uniform(-dky / 2, dky / 2, size=N_samples)
-
-        # print(f"Sampled {N_samples} points.")
-        # print(f"  x  range: [{sampled_x.min():.4e},  {sampled_x.max():.4e}]")
-        # print(f"  kx range: [{sampled_kx.min():.3f}, {sampled_kx.max():.3f}]")
-        # print(f"  ky range: [{sampled_ky.min():.3f}, {sampled_ky.max():.3f}]")
 
         if N_samples == 1:
             return total_integral, np.reshape(emission_momentum, 3)
