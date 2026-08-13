@@ -1228,28 +1228,27 @@ class RadiationEmulatorInference:
             g=inputs['g'],
         )
 
-    def compute_dNd3k_grid(self,
-                           E: float,
-                           z0: float,
-                           u_perp: float,
-                           T: float,
-                           g: float,
-                           kz_values: np.ndarray,
-                           k_perp_values: np.ndarray,
-                           phi_values: np.ndarray,
-                           ) -> (np.ndarray):
+    def compute_dNdxd2k_grid(self,
+                             E: float,
+                             z0: float,
+                             u_perp: float,
+                             T: float,
+                             g: float,
+                             x_values: np.ndarray,
+                             k_perp_values: np.ndarray,
+                             phi_values: np.ndarray,
+                             ) -> (np.ndarray):
         """
-        Computes a complete grid of dN/d^3k shaped as (k_perp, phi, kz).
+        Computes a complete grid of (1/CR) dN/(dx d^2k_perp) shaped as (k_perp, phi, x).
 
-        Since x = x(k_perp, kz) has no phi dependence, the network is
-        evaluated only on the 2D (k_perp, kz) grid; phi dependence is
-        reconstructed analytically via A0 + A1*cos(phi) + A2*cos(2*phi).
+        Note that this is actually differential in (dx d^2k_perp), not (dx d|k_perp|, dphi).
+        Apply the Jacobian later when you need it!
+
+        The network is evaluated only on the 2D (k_perp, x) grid; phi dependence
+        is reconstructed analytically via A0 + A1*cos(phi) + A2*cos(2*phi).
         """
         # create a 2D meshgrid in the only two variables the network needs
-        kperp_grid2d, kz_grid2d = np.meshgrid(k_perp_values, kz_values, indexing='ij')  # (n_kperp, n_kz)
-        x_grid2d = (1 / (E ** 2 * np.sqrt(2))) * (
-                E * kz_grid2d + np.sqrt(E ** 2 * (kz_grid2d ** 2 + kperp_grid2d ** 2))
-        )
+        kperp_grid2d, x_grid2d = np.meshgrid(k_perp_values, x_values, indexing='ij')  # (n_kperp, n_x)
 
         # Build input grid once
         n_pts = x_grid2d.size
@@ -1259,19 +1258,19 @@ class RadiationEmulatorInference:
             np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
         ]).astype(np.float32)
 
-        # Single batched network call over the (k_perp, kz) grid -- no phi dependence yet
+        # Single batched network call over the (k_perp, x) grid -- no phi dependence yet
         A_flat = self.predict_harmonics_raw(grid_inputs)  # (n_pts, 3)
         A0_2d = A_flat[:, 0].reshape(x_grid2d.shape)
         A1_2d = A_flat[:, 1].reshape(x_grid2d.shape)
         A2_2d = A_flat[:, 2].reshape(x_grid2d.shape)
 
-        # Reconstruct full angular dependence via broadcasting -- shape (n_kperp, n_phi, n_kz)
+        # Reconstruct full angular dependence via broadcasting -- shape (n_kperp, n_phi, n_x)
         cos_phi = np.cos(phi_values)[None, :, None]
         cos_2phi = np.cos(2 * phi_values)[None, :, None]
         I_nn = A0_2d[:, None, :] + A1_2d[:, None, :] * cos_phi + A2_2d[:, None, :] * cos_2phi
 
         x_grid3d = np.broadcast_to(x_grid2d[:, None, :], I_nn.shape)
-        kperp_grid3d = np.broadcast_to(kperp_grid2d[:, None, :], I_nn.shape)
+        # kperp_grid3d = np.broadcast_to(kperp_grid2d[:, None, :], I_nn.shape)
 
         # Set any unphysical x coordinate values to zero
         mask = x_grid3d > 1.0
@@ -1282,12 +1281,7 @@ class RadiationEmulatorInference:
         # Compute dN/dxd^2k_perp by dividing out energy of each grid point
         N_nn = I_nn / (E * x_grid3d)  # Still needs casimir factor
 
-        # Convert to dN/d^3k via the x -> kz Jacobian
-        dkz_dx = (1 / np.sqrt(2)) * (E + kperp_grid3d ** 2 / (2 * x_grid3d ** 2 * E))
-        jacobian = 1.0 / dkz_dx
-        N_nn = N_nn * jacobian
-
-        # Returned grid is (k_perp, phi, kz), NOT (kx, ky, kz)
+        # Returned grid is (k_perp, phi, x), differential in x and d^2k_perp
         return N_nn
 
     def sample_emission(self,
