@@ -429,14 +429,18 @@ class RadiationEmulator(nn.Module):
 # ==============================================================================
 # Training utilities
 # ==============================================================================
-def combine_harmonics(A_heads: torch.Tensor, phi: torch.Tensor) -> torch.Tensor:
+def combine_harmonics(A_heads: torch.Tensor, phi: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     Reconstruct I/f0 = A0 + A1*cos(phi) + A2*cos(2*phi) from the 3 network heads.
 
-    A_heads : (B, 3) tensor of (A0, A1, A2), each already in units of 1/f0.
+    A_heads : (B, 3) tensor of (A0, x*A1, A2), each already in units of 1/f0.
+              Note: head 1 is x*A1, not A1 -- it is divided by x below.
     phi     : (B,)   tensor of azimuthal angle.
+    x       : (B,)   tensor of physical x values (undoes the x*A1 normalization).
     """
-    return A_heads[:, 0] + A_heads[:, 1] * torch.cos(phi) + A_heads[:, 2] * torch.cos(2 * phi)
+    eps = 1e-6
+    A1 = A_heads[:, 1] / (x + eps)
+    return A_heads[:, 0] + A1 * torch.cos(phi) + A_heads[:, 2] * torch.cos(2 * phi)
 
 
 def compute_loss(
@@ -461,8 +465,9 @@ def compute_loss(
     Returns total loss and dictionary of individual loss components.
     """
     # Get head outputs and compute predicted values at phi points
-    A_heads = model(inputs)                       # (B, 3)
-    I_over_f0_pred = combine_harmonics(A_heads, phi)
+    A_heads = model(inputs)  # (B, 3)
+    x_phys = inputs[:, 0] * X_std[0] + X_mean[0]
+    I_over_f0_pred = combine_harmonics(A_heads, phi, x_phys)
     pred_transformed = torch.arcsinh(I_over_f0_pred)
     predictions = (pred_transformed - y_mean) / y_std
 
@@ -1191,17 +1196,23 @@ class RadiationEmulatorInference:
         order [x, k_perp, E, z0, u_perp, T, g]. Returns physical (N, 3)
         array of (A0, A1, A2) harmonic amplitudes (phi not yet applied).
         """
-        inputs_tensor = torch.from_numpy(
-            np.asarray(inputs, dtype=np.float32, order='C')
-        ).to(self.device, non_blocking=True)
+        inputs_arr = np.asarray(inputs, dtype=np.float32, order='C')
+        inputs_tensor = torch.from_numpy(inputs_arr).to(self.device, non_blocking=True)
 
         inputs_norm = (inputs_tensor - self.X_mean) / self.X_std
 
         with torch.no_grad():
-            A_heads = self.model(inputs_norm)  # (N, 3), units of 1/f0
+            A_heads = self.model(inputs_norm)  # (N, 3), units of 1/f0; head 1 is x*A1
 
         A_heads = A_heads if self.device == "cpu" else A_heads.cpu()
-        return self.f0 * A_heads.numpy()
+        A_heads = A_heads.numpy()
+
+        # Undo the x*A1 normalization to recover physical A1
+        eps = 1e-6
+        x_phys = inputs_arr[:, 0]
+        A_heads[:, 1] = A_heads[:, 1] / (x_phys + eps)
+
+        return self.f0 * A_heads
 
     def predict_dict(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
         """
