@@ -1248,6 +1248,7 @@ class RadiationEmulatorInference:
                              x_values: np.ndarray,
                              k_perp_values: np.ndarray,
                              phi_values: np.ndarray,
+                             mu: float,
                              ) -> (np.ndarray):
         """
         Computes a complete grid of (1/CR) dN/(dx d^2k_perp) shaped as (k_perp, phi, x).
@@ -1257,6 +1258,9 @@ class RadiationEmulatorInference:
 
         The network is evaluated only on the 2D (k_perp, x) grid; phi dependence
         is reconstructed analytically via A0 + A1*cos(phi) + A2*cos(2*phi).
+
+        Points outside the kinematic region mu/E <= x <= 1 - mu/E and
+        mu <= k_perp <= sqrt(E^2 * min(x^2, (1-x)^2) - mu^2) are set to zero.
         """
         # create a 2D meshgrid in the only two variables the network needs
         kperp_grid2d, x_grid2d = np.meshgrid(k_perp_values, x_values, indexing='ij')  # (n_kperp, n_x)
@@ -1280,17 +1284,24 @@ class RadiationEmulatorInference:
         cos_2phi = np.cos(2 * phi_values)[None, :, None]
         I_nn = A0_2d[:, None, :] + A1_2d[:, None, :] * cos_phi + A2_2d[:, None, :] * cos_2phi
 
-        x_grid3d = np.broadcast_to(x_grid2d[:, None, :], I_nn.shape)
-        # kperp_grid3d = np.broadcast_to(kperp_grid2d[:, None, :], I_nn.shape)
+        # Perform kinematic cuts on the 2D (k_perp, x) grid -- the cut is
+        # phi-independent, so evaluating it here (instead of on the full 3D
+        # grid) avoids redundant sqrt/compare work across the phi axis.
+        x_min = mu / E
+        x_max = 1.0 - mu / E
+        kperp_min = mu
+        kperp_max_sq = (E ** 2) * np.minimum(x_grid2d ** 2, (1.0 - x_grid2d) ** 2) - mu ** 2
+        kperp_max = np.sqrt(np.clip(kperp_max_sq, 0.0, None))
 
-        # Set any unphysical x coordinate values to zero
-        mask = x_grid3d > 1.0
-        if np.amax(mask) > 0:
-            print("Oh no!!! (x > 1)!!!")
-            I_nn[x_grid3d > 1.0] = 0
+        valid_2d = (
+                (x_grid2d > x_min) & (x_grid2d < x_max) &
+                (kperp_grid2d > kperp_min) & (kperp_grid2d < kperp_max)
+        )  # shape (n_kperp, n_x), broadcasts over the phi axis below
+
+        I_nn *= valid_2d[:, None, :]
 
         # Compute dN/dxd^2k_perp by dividing out energy of each grid point
-        N_nn = I_nn / (E * x_grid3d)  # Still needs casimir factor
+        N_nn = I_nn / (E * x_grid2d[:, None, :])  # Still needs casimir factor
 
         # Returned grid is (k_perp, phi, x), differential in x and d^2k_perp
         return N_nn
