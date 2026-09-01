@@ -10,11 +10,9 @@ Features:
 - Uses importance sampling weights for unbiased training
 - Enforces soft physics constraints
 - Saves trained model for deployment
-- Demonstrates batch inference
 
 Usage:
     python train_radiation_nn.py                    # Train the model
-    python train_radiation_nn.py --inference-only   # Demo inference with saved model
 """
 
 import argparse
@@ -94,6 +92,45 @@ class TrainingConfig:
     run_lr_finder: bool = False
 
 
+#########################
+# Input feature control #
+#########################
+def compute_input_features(x: np.ndarray, k_perp: np.ndarray, E: np.ndarray, z0: np.ndarray, u_perp: np.ndarray,
+                           mu: np.ndarray):
+    """
+    Single source for computing NN-input features.
+    Returns a dict of {name: array}, in the order they should be fed to the network.
+
+    Everywhere should call this function to collate inputs for a NN pass.
+    """
+    HBARC = 0.197327
+    DELTA_Z = 0.1 / HBARC  # hardcoded 0.1 fm to GeV^{-1}
+
+    # Cast to arrays
+
+
+    # Oscillatory phases
+    omega_k = (k_perp**2) / (2 * x * E)
+    omega_k_dz = omega_k * DELTA_Z / 2
+    omega_k_midz = omega_k * (z0 + DELTA_Z / 2)
+    omega_width = (mu**2) * DELTA_Z / (2 * x * E)
+
+    # Create dictionary
+    input_dict = {
+        'x': x,
+        'k_perp': k_perp,
+        'E': E,
+        'z0': z0,
+        'u_perp': u_perp,
+        'mu': mu,
+        'omega_k_dz': omega_k_dz,
+        'omega_k_midz': omega_k_midz,
+        'omega_width': omega_width,
+    }
+
+    return input_dict
+
+
 # ==============================================================================
 # Dataset
 # ==============================================================================
@@ -115,8 +152,12 @@ class RadiationDataset(Dataset):
     self.phi_data : np.ndarray, shape (N_valid,), float32   -- phi values for loss computation
     """
 
-    FEATURE_NAMES = ['x', 'k_perp', 'E', 'z0', 'u_perp', 'T', 'g']
-    RAW_FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g']
+    # Get feature names as we should find in the data files
+    RAW_FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g', 'mu', 'k_perp', 'k_phi']
+
+    # Get the input feature names and number of features
+    FEATURE_NAMES = list(compute_input_features(x=np.array([]), k_perp=np.array([]), E=np.array([]), z0=np.array([]),
+                                                u_perp=np.array([]), mu=np.array([])).keys())
     N_FEATURES = len(FEATURE_NAMES)
 
     def __init__(
@@ -158,18 +199,14 @@ class RadiationDataset(Dataset):
             i_err = np.empty(n_raw, dtype=np.float32)
             f['I_err'].read_direct(i_err)
 
-        # Compute k_perp and phi from kx, ky. phi is kept for loss reconstruction
-        # only — it is never part of the network input.
-        kx_raw = raw_cols['kx']
-        ky_raw = raw_cols['ky']
-        k_perp_raw = np.sqrt(kx_raw ** 2 + ky_raw ** 2).astype(np.float32)
-        phi_raw = np.arctan2(ky_raw, kx_raw).astype(np.float32)
+        phi_raw = raw_cols['k_phi']
 
-        # Stack the raw inputs
-        X_raw = np.column_stack([
-            raw_cols['x'], k_perp_raw, raw_cols['E'], raw_cols['z0'],
-            raw_cols['u_perp'], raw_cols['T'], raw_cols['g'],
-        ]).astype(np.float32)
+        # Compute the input paramter dictionary
+        X_raw_dict = compute_input_features(raw_cols['x'], raw_cols['k_perp'], raw_cols['E'], raw_cols['z0'],
+            raw_cols['u_perp'], raw_cols['mu'])
+
+        # Stack into a an array of input arrays shape (N_points, N_FEATURES)
+        X_raw = np.column_stack(list(X_raw_dict.values())).astype(np.float32)
 
         # Mask off any points where the integration when awry
         print("  Filtering invalid rows ...")
@@ -187,7 +224,7 @@ class RadiationDataset(Dataset):
         # Apply mask to cut arrays
         self.X_data = X_raw[ok]
         self.phi_data = phi_raw[ok]
-        del X_raw, raw_cols, kx_raw, ky_raw, k_perp_raw, phi_raw
+        del X_raw, raw_cols, phi_raw
 
         self.y_data = y_raw[ok]
         del y_raw
@@ -401,8 +438,8 @@ class RadiationEmulator(nn.Module):
         Parameters
         ----------
         x : torch.Tensor
-            Input tensor of shape (batch_size, 7) with normalized features
-            [x, k_perp, E, z0, u_perp, T, g]
+            Input tensor of shape (batch_size, N_FEATURES) with normalized features as defined in
+            `compute_input_features`.
 
         Returns
         -------
@@ -464,9 +501,14 @@ def compute_loss(
 
     Returns total loss and dictionary of individual loss components.
     """
+    # Find the indices of the names features we want
+    IDX_X = RadiationDataset.FEATURE_NAMES.index('x')
+    IDX_K_PERP = RadiationDataset.FEATURE_NAMES.index('k_perp')
+    IDX_E = RadiationDataset.FEATURE_NAMES.index('E')
+
     # Get head outputs and compute predicted values at phi points
     A_heads = model(inputs)  # (B, 3)
-    x_phys = inputs[:, 0] * X_std[0] + X_mean[0]
+    x_phys = inputs[:, IDX_X] * X_std[IDX_X] + X_mean[IDX_X]
     I_over_f0_pred = combine_harmonics(A_heads, phi, x_phys)
     pred_transformed = torch.arcsinh(I_over_f0_pred)
     predictions = (pred_transformed - y_mean) / y_std
@@ -495,9 +537,9 @@ def compute_loss(
         idx = torch.randint(0, B, (n_uv_samples,), device=device)
         uv_params = inputs[idx].clone()  # (n_uv_samples, 7)
 
-        E_mean = X_mean[2].to(device)   # index 2 == 'E'
-        E_std = X_std[2].to(device)
-        energy_params = (uv_params[:, 2] * E_std + E_mean).cpu().numpy()
+        E_mean = X_mean[IDX_E].to(device)
+        E_std = X_std[IDX_E].to(device)
+        energy_params = (uv_params[:, IDX_E] * E_std + E_mean).cpu().numpy()
 
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
         log_k = []
@@ -513,7 +555,7 @@ def compute_loss(
         log_k = torch.tensor(log_k, device=device)
         k_perp_uv = torch.exp(log_k)
 
-        uv_params[:, 1] = k_perp_uv  # index 1 == 'k_perp'
+        uv_params[:, IDX_K_PERP] = k_perp_uv  # Overwrite k_perp vals
 
         uv_heads = model(uv_params)  # shape (n_uv_samples, 3)
 
@@ -548,12 +590,12 @@ def compute_loss(
         )
 
         # Low-k point
-        base_params[:, 1] = k_perp_sample
+        base_params[:, IDX_K_PERP] = k_perp_sample
         heads_low = model(base_params)  # (n, 3)
 
         # High-k point (same direction, same other params)
         high_params = base_params.clone()
-        high_params[:, 1] = alpha * k_perp_sample
+        high_params[:, IDX_K_PERP] = alpha * k_perp_sample
         heads_high = model(high_params)  # (n, 3)
 
         expected_ratio = alpha ** (-power)
@@ -909,12 +951,19 @@ def train_model(config: TrainingConfig):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
+    # Pre-move normalization tensors to device once, for use in loss computation
+    X_mean_t = torch.tensor(dataset.X_mean, dtype=torch.float32).to(config.device)
+    X_std_t = torch.tensor(dataset.X_std, dtype=torch.float32).to(config.device)
+    y_mean_t = dataset.y_mean
+    y_std_t = dataset.y_std
+
     # LR finder -- to be run before the main training loop, finds optimal learning rate
     # Looks for minima in the loss as function of learning rate, returns rate just before minima in loss function
     if config.run_lr_finder:
         print("\nRunning LR range test...")
         print("-" * 70)
-        lrs, losses, raw_losses = find_learning_rate(model, train_loader, optimizer, config)
+        lrs, losses, raw_losses = find_learning_rate(model, train_loader, optimizer, config, X_mean_t, X_std_t,
+                                                     y_mean_t, y_std_t)
         suggested_lr = plot_lr_finder(lrs, losses, raw_losses)
         print(f"\nRe-run with --learning-rate {suggested_lr / 3:.2e} (1/3 of suggested)")
         return model, dataset.get_normalization_params()
@@ -936,12 +985,6 @@ def train_model(config: TrainingConfig):
 
     current_epoch = [start_epoch]
     signal.signal(signal.SIGTERM, _sigterm_handler)
-
-    # Pre-move normalization tensors to device once, for use in loss computation
-    X_mean_t = torch.tensor(dataset.X_mean, dtype=torch.float32).to(config.device)
-    X_std_t = torch.tensor(dataset.X_std, dtype=torch.float32).to(config.device)
-    y_mean_t = dataset.y_mean
-    y_std_t = dataset.y_std
 
     print("\nStarting training...")
     print("-" * 70)
@@ -1048,7 +1091,8 @@ class RadiationEmulatorInference:
     Handles normalization and inverse transforms automatically.
     """
 
-    FEATURE_NAMES = ['x', 'k_perp', 'E', 'z0', 'u_perp', 'T', 'g']
+    FEATURE_NAMES = list(compute_input_features(x=np.array([]), k_perp=np.array([]), E=np.array([]), z0=np.array([]),
+                                                u_perp=np.array([]), mu=np.array([])).keys())
 
     def __init__(
             self,
@@ -1136,36 +1180,12 @@ class RadiationEmulatorInference:
             E: np.ndarray,
             z0: np.ndarray,
             u_perp: np.ndarray,
-            T: np.ndarray,
-            g: np.ndarray,
+            mu: np.ndarray,
     ) -> np.ndarray:
         """
         Physical-facing entry point -- returns the combined scalar intensity
         """
-        A0, A1, A2 = self.predict_harmonics(x, k_perp, E, z0, u_perp, T, g)
-        predictions = A0 + A1 * np.cos(phi) + A2 * np.cos(2 * phi)
-        return predictions
-
-    def predict_kxky(
-            self,
-            x: np.ndarray,
-            kx: np.ndarray,
-            ky: np.ndarray,
-            E: np.ndarray,
-            z0: np.ndarray,
-            u_perp: np.ndarray,
-            T: np.ndarray,
-            g: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Legacy entry point: still accepts kx, ky (as callers expect),
-        derives k_perp/phi internally, and returns the combined scalar
-        intensity — same public contract as before.
-        """
-        k_perp = np.sqrt(kx ** 2 + ky ** 2)
-        phi = np.arctan2(ky, kx)
-
-        A0, A1, A2 = self.predict_harmonics(x, k_perp, E, z0, u_perp, T, g)
+        A0, A1, A2 = self.predict_harmonics(x, k_perp, E, z0, u_perp, mu)
         predictions = A0 + A1 * np.cos(phi) + A2 * np.cos(2 * phi)
         return predictions
 
@@ -1176,16 +1196,17 @@ class RadiationEmulatorInference:
             E: np.ndarray,
             z0: np.ndarray,
             u_perp: np.ndarray,
-            T: np.ndarray,
-            g: np.ndarray,
+            mu: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Returns physical (A0, A1, A2) harmonic amplitudes for the given
         (x, k_perp, ...) points — no phi dependence, so callers can evaluate
         this on a much coarser grid than the full 3D (kx, ky, kz) grid.
         """
-        inputs = np.column_stack([x, k_perp, E, z0, u_perp, T, g]).astype(
-            np.float32, order='C', copy=False
+        inputs = np.column_stack(
+            list(compute_input_features(
+                x=x, k_perp=k_perp, E=E, z0=z0, u_perp=u_perp, mu=mu).values()
+                                 )).astype(np.float32, order='C', copy=False
         )
         A_heads = self.predict_harmonics_raw(inputs)
         return A_heads[:, 0], A_heads[:, 1], A_heads[:, 2]
@@ -1196,20 +1217,27 @@ class RadiationEmulatorInference:
         order [x, k_perp, E, z0, u_perp, T, g]. Returns physical (N, 3)
         array of (A0, A1, A2) harmonic amplitudes (phi not yet applied).
         """
+        # Find the indices of the names features we want
+        IDX_X = RadiationDataset.FEATURE_NAMES.index('x')
+
+        # Collect the inputs as a torch tensor
         inputs_arr = np.asarray(inputs, dtype=np.float32, order='C')
         inputs_tensor = torch.from_numpy(inputs_arr).to(self.device, non_blocking=True)
 
+        # Normalize
         inputs_norm = (inputs_tensor - self.X_mean) / self.X_std
 
+        # Get the model prediction
         with torch.no_grad():
             A_heads = self.model(inputs_norm)  # (N, 3), units of 1/f0; head 1 is x*A1
 
+        # Cast predictions of harmonics to CPU
         A_heads = A_heads if self.device == "cpu" else A_heads.cpu()
         A_heads = A_heads.numpy()
 
         # Undo the x*A1 normalization to recover physical A1
         eps = 1e-6
-        x_phys = inputs_arr[:, 0]
+        x_phys = inputs_arr[:, IDX_X]
         A_heads[:, 1] = A_heads[:, 1] / (x_phys + eps)
 
         return self.f0 * A_heads
@@ -1235,8 +1263,7 @@ class RadiationEmulatorInference:
             E=inputs['E'],
             z0=inputs['z0'],
             u_perp=inputs['u_perp'],
-            T=inputs['T'],
-            g=inputs['g'],
+            mu=inputs['mu'],
         )
 
     def compute_dNdxd2k_grid(self,
@@ -1315,6 +1342,10 @@ def find_learning_rate(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
+        X_mean,
+        X_std,
+        y_mean,
+        y_std,
         start_lr: float = 1e-4,    # narrower range start
         end_lr: float = 1e-1,      # narrower range end
         n_steps: int = 150,        # far more steps for resolution
@@ -1370,7 +1401,7 @@ def find_learning_rate(
         weights = weights.to(config.device)
 
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, targets, weights, config)
+        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
         loss.backward()
         optimizer.step()
 
@@ -1468,83 +1499,6 @@ def plot_lr_finder(lrs: list, losses: list, raw_losses: Optional[list] = None):
     plt.show()
 
     return suggested_lr
-
-
-# ==============================================================================
-# Demo inference
-# ==============================================================================
-def demo_inference(config: TrainingConfig):
-    """Demonstrate how to load and use the trained model."""
-
-    print("=" * 70)
-    print("RADIATION EMULATOR INFERENCE DEMO")
-    print("=" * 70)
-
-    # Load the trained model
-    emulator = RadiationEmulatorInference(
-        model_file=config.model_file,
-        normalization_file=config.normalization_file,
-        device="cpu",  # Use CPU for inference demo
-    )
-
-    # Generate some test points
-    n_points = 1000
-    rng = np.random.default_rng(123)
-
-    test_inputs = {
-        'x': rng.uniform(0.1, 0.9, n_points),
-        'kx': rng.uniform(-3.0, 3.0, n_points),
-        'ky': rng.uniform(-3.0, 3.0, n_points),
-        'E': rng.uniform(10.0, 80.0, n_points),
-        'z0': rng.uniform(0.0, 3.0, n_points),
-        'u_perp': rng.uniform(0.0, 0.5, n_points),
-        'T': rng.uniform(0.2, 0.4, n_points),
-        'g': rng.uniform(1.8, 2.2, n_points),
-    }
-
-    # Run inference
-    print(f"\nRunning inference on {n_points} test points...")
-
-    import time
-    t0 = time.time()
-    predictions = emulator.predict_dict(test_inputs)
-    dt = time.time() - t0
-
-    print(f"Inference time: {dt * 1000:.2f} ms ({dt / n_points * 1e6:.2f} µs per point)")
-    print(f"Prediction shape: {predictions.shape}")
-    print(f"Prediction range: [{predictions.min():.4e}, {predictions.max():.4e}]")
-
-    # Example: Apply Casimir factor for quarks
-    CF_QUARK = 4 / 3
-    CF_GLUON = 3
-
-    I_quark = CF_QUARK * predictions
-    I_gluon = CF_GLUON * predictions
-
-    print(f"\nWith Casimir factors applied:")
-    print(f"  Quark (CF=4/3): [{I_quark.min():.4e}, {I_quark.max():.4e}]")
-    print(f"  Gluon (CF=3):   [{I_gluon.min():.4e}, {I_gluon.max():.4e}]")
-
-    # Example: Single point query
-    print("\n" + "-" * 70)
-    print("Single point query example:")
-    print("-" * 70)
-
-    single_pred = emulator.predict(
-        x=np.array([0.3]),
-        kx=np.array([1.0]),
-        ky=np.array([0.5]),
-        E=np.array([50.0]),
-        z0=np.array([0.0]),
-        u_perp=np.array([0.3]),
-        T=np.array([0.3]),
-        g=np.array([2.0]),
-    )
-
-    print(f"Input: x=0.3, kx=1.0, ky=0.5, E=50, z0=0, zf=5, u_perp=0.3, T=0.3, g=2.0")
-    print(f"Predicted I (no CF): {single_pred:.4e}")
-    print(f"Predicted I (quark): {CF_QUARK * single_pred:.4e}")
-    print(f"Predicted I (gluon): {CF_GLUON * single_pred:.4e}")
 
 
 # ==============================================================================

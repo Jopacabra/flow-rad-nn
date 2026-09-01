@@ -43,8 +43,7 @@ DEFAULTS = dict(
     E       = 10.0,
     z0      = 0.0,  # in inverse GeV!!!
     u_perp  = 0.3,
-    T       = 0.3,
-    g       = 2.0,
+    mu       = 0.6,
     n_kx    = 30,
     n_ky    = 30,
     kx_max  = 4.0,
@@ -78,6 +77,9 @@ def compute_reference_grid(
     I_ref : ndarray, shape (n_kx, n_ky)
     I_err : ndarray, shape (n_kx, n_ky)
     """
+    print("!" * 70)
+    print("WARNING -- MISMATCHED MU DEFINITION")
+    print("!" * 70)
     n_kx = len(kx_values)
     n_ky = len(ky_values)
     n_total = n_kx * n_ky
@@ -120,7 +122,7 @@ def compute_reference_grid(
 # ==============================================================================
 def compute_nn_grid(
     emulator: RadiationEmulatorInference,
-    x, E, z0, u_perp, T, g,
+    x, E, z0, u_perp, mu,
     kx_values: np.ndarray,
     ky_values: np.ndarray,
 ) -> np.ndarray:
@@ -131,18 +133,22 @@ def compute_nn_grid(
     -------
     I_nn : ndarray, shape (n_kx, n_ky)
     """
+    # Evaluation grid in kx, ky
     kx_grid, ky_grid = np.meshgrid(kx_values, ky_values, indexing='ij')
-    n_pts = kx_grid.size
 
-    I_nn_flat = emulator.predict_kxky(
+    # Relabeled evaluation grid in k_perp, phi
+    k_perp_grid = np.sqrt(kx_grid ** 2 + ky_grid ** 2).astype(np.float32)
+    phi_grid = np.arctan2(ky_grid, kx_grid).astype(np.float32)
+    n_pts = k_perp_grid.size
+
+    I_nn_flat = emulator.predict(
         x      = np.full(n_pts, x),
-        kx     = kx_grid.ravel(),
-        ky     = ky_grid.ravel(),
+        k_perp = k_perp_grid.ravel(),
+        phi    = phi_grid.ravel(),
         E      = np.full(n_pts, E),
         z0     = np.full(n_pts, z0),
         u_perp = np.full(n_pts, u_perp),
-        T      = np.full(n_pts, T),
-        g      = np.full(n_pts, g),
+        mu      = np.full(n_pts, mu),
     )
     return I_nn_flat.reshape(len(kx_values), len(ky_values))
 
@@ -232,8 +238,7 @@ def make_comparison_plot(
         f"$z_0={params['z0']:.1f}$ GeV^-1, "
         f"$z_f={params['zf']:.1f}$ GeV^-1, "
         f"$u_\\perp={params['u_perp']:.2f}$, "
-        f"$T={params['T']:.3f}$ GeV, "
-        f"$g={params['g']:.2f}$"
+        f"$mu={params['mu']:.3f}$ GeV, "
     )
     fig.suptitle(param_str, fontsize=11, y=1.01)
 
@@ -360,8 +365,7 @@ def make_combined_plot(
         f"$z_0={params['z0']:.1f}$ GeV^-1, "
         f"$z_f={params['zf']:.1f}$ GeV^-1, "
         f"$u_\\perp={params['u_perp']:.2f}$, "
-        f"$T={params['T']:.3f}$ GeV, "
-        f"$g={params['g']:.2f}$"
+        f"$mu={params['mu']:.3f}$ GeV, "
     )
     fig.suptitle(param_str, fontsize=9)
     plt.tight_layout()
@@ -381,8 +385,7 @@ def main():
     parser.add_argument('--E',       type=float, default=DEFAULTS['E'],      help='Parton energy (GeV)')
     parser.add_argument('--z0',      type=float, default=DEFAULTS['z0'],     help='Initial longitudinal position (invGeV)')
     parser.add_argument('--u-perp',  type=float, default=DEFAULTS['u_perp'], help='Transverse flow magnitude')
-    parser.add_argument('--T',       type=float, default=DEFAULTS['T'],      help='Temperature (GeV)')
-    parser.add_argument('--g',       type=float, default=DEFAULTS['g'],      help='Coupling constant')
+    parser.add_argument('--mu',       type=float, default=DEFAULTS['mu'],    help='Debye mass (GeV)')
     parser.add_argument('--n-kx',    type=int,   default=DEFAULTS['n_kx'],   help='Number of kx grid points')
     parser.add_argument('--n-ky',    type=int,   default=DEFAULTS['n_ky'],   help='Number of ky grid points (ky >= 0)')
     parser.add_argument('--kx-max',  type=float, default=DEFAULTS['kx_max'], help='kx grid range [-kx_max, kx_max] (GeV)')
@@ -401,7 +404,7 @@ def main():
 
     params = dict(
         x=args.x, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
-        u_perp=args.u_perp, T=args.T, g=args.g,
+        u_perp=args.u_perp, mu=args.mu,
     )
 
     print("=" * 70)
@@ -422,7 +425,7 @@ def main():
     print("Step 1: Computing reference (Vegas integrator)")
     I_ref, I_err = compute_reference_grid(
         x=args.x, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
-        u_perp=args.u_perp, T=args.T, g=args.g,
+        u_perp=args.u_perp, T=(args.mu/np.sqrt(1 + 2/6))/2, g=2,
         kx_values=kx_values,
         ky_values=ky_values,
         n_workers=args.workers,
@@ -439,7 +442,7 @@ def main():
     I_nn = compute_nn_grid(
         emulator=emulator,
         x=args.x, E=args.E, z0=args.z0,
-        u_perp=args.u_perp, T=args.T, g=args.g,
+        u_perp=args.u_perp, mu=args.mu,
         kx_values=kx_values,
         ky_values=ky_values,
     )
@@ -465,7 +468,7 @@ def main():
             print("  Computing reference grid...")
             I_ref_x, I_err_x = compute_reference_grid(
                 x=x_val, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
-                u_perp=args.u_perp, T=args.T, g=args.g,
+                u_perp=args.u_perp, T=(args.mu**2 - 2/6)/2, g=2,
                 kx_values=kx_values,
                 ky_values=ky_values,
                 n_workers=args.workers,
@@ -476,7 +479,7 @@ def main():
             I_nn_x = compute_nn_grid(
                 emulator=emulator,
                 x=x_val, E=args.E, z0=args.z0,
-                u_perp=args.u_perp, T=args.T, g=args.g,
+                u_perp=args.u_perp, mu=args.mu,
                 kx_values=kx_values,
                 ky_values=ky_values,
             )
