@@ -19,7 +19,7 @@ import h5py
 from pathlib import Path
 from scipy.stats import qmc
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from integration import integrate_point_analytic_z_t234_brutemc_t1 as integrate_point
+from integration import integrate_analytic_z_t234_brutemc_t1 as integrate_point
 from integration import SOFT_PIDS
 
 
