@@ -29,7 +29,7 @@ SOFT_PIDS = [1, -1, 2, -2, 3, -3, 21]  # Soft parton species for rho0 summation
 
 NITN_WARMUP = 3  # Iterations for the MC integrators during "warmup"
 NITN = 5  # Number of iterations for actual integration
-NEVAL = 10  # Number of evaluations for integration
+NEVAL = 10000  # Number of evaluations for integration
 
 DELTAZ = 0.1 / HBARC  # Fixed pathlength where applicable
 
@@ -462,15 +462,13 @@ def t4_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_max):
     """
     Implementation of numerical elliptic integrals for term 4. This is a valid analytic solution expression.
     """
-    u_perp = np.asarray(u_perp)
     uu = u_perp * u_perp
-    q_max = np.asarray(q_max)
-    mu = np.asarray(mu)
-    k = np.asarray(k_perp)
-    kk = k * k
-    _k4 = k**4
-    k_phi = np.asarray(k_phi)
-    ku = k * u_perp * np.cos(k_phi)
+    kk = k_perp * k_perp
+    ku = k_perp * u_perp * np.cos(k_phi)
+    kuku = ku * ku
+    deltaz = zf - z0
+    _k4 = kk * kk
+    ku = k_perp * u_perp * np.cos(k_phi)
     kuku = ku * ku
     deltaz = zf - z0
 
