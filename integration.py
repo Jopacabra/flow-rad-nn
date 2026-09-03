@@ -26,10 +26,12 @@ SOFT_PIDS = [1, -1, 2, -2, 3, -3, 21]  # Soft parton species for rho0 summation
 # NITN_WARMUP = 10  # Iterations for the MC integrators during "warmup"
 # NITN = 50  # Number of iterations for actual integration
 # NEVAL = 10000  # Number of evaluations for integration
+# MCADAPT = True  # Whether to do grid adaptation -- negligible overhead, helps accuracy
 
-NITN_WARMUP = 3  # Iterations for the MC integrators during "warmup"
+NITN_WARMUP = 0  # Iterations for the MC integrators during "warmup"
 NITN = 5  # Number of iterations for actual integration
 NEVAL = 10000  # Number of evaluations for integration
+MCADAPT = True  # Whether to do grid adaptation -- negligible overhead, helps accuracy
 
 DELTAZ = 0.1 / HBARC  # Fixed pathlength where applicable
 
@@ -59,9 +61,9 @@ def ellippi(n, m):
            (n / 3.) * sp.special.elliprj(0., 1. - m, 1., 1. - n)
 
 
-##############################
-# Brute Force MC Integrators #
-##############################
+#############################
+# Brute Force MC Integrands #
+#############################
 def make_batch_integrand_brutemc(x, k_perp, k_phi, E, mu, u_perp):
     """
     Constructs a vegas batch integrand for the medium-induced gluon radiation
@@ -373,6 +375,271 @@ def make_batch_t1_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, z
     return integrand
 
 
+##########################################################
+# Persistent, reusable integrands + singleton Integrators #
+##########################################################
+"""
+Rescaling every integration variable onto a FIXED [0,1]^d region means the
+vegas.Integrator itself never has to change between points, so we build
+each one exactly once (at import time) and reuse it for the whole batch.
+The mutable classes below replace "rebuild a closure per point" with
+"overwrite a few attributes per point", which is essentially free.
+"""
+class _IntegrandParams:
+    """Shared parameter-setting logic for all three integrand variants."""
+
+    __slots__ = (
+        "x", "E", "mu", "mu2", "u_perp", "z0", "zf", "deltaz",
+        "kx", "ky", "ux", "kk", "ku", "uu", "q_lim",
+    )
+
+    def set_params(self, x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+        self.x, self.E, self.mu = x, E, mu
+        self.mu2 = mu * mu
+        self.u_perp = u_perp
+        self.z0, self.zf = z0, zf
+        self.deltaz = zf - z0
+
+        kx = k_perp * np.cos(k_phi)
+        ky = k_perp * np.sin(k_phi)
+        ux = u_perp
+
+        kk = kx * kx + ky * ky
+        if kk < 1e-10:
+            kk = 1e-10
+
+        self.kx, self.ky, self.ux = kx, ky, ux
+        self.kk = kk
+        self.ku = kx * ux
+        self.uu = ux * ux
+        self.q_lim = np.sqrt(3.0 * E * mu)
+        return self
+
+
+class _BruteMCIntegrand(_IntegrandParams):
+    """
+    Full (q, q_phi, z) brute-force integrand, rescaled onto the unit cube:
+        pts[:,0] = u_q   -> q   = u_q   * q_lim     in (0, q_lim)
+        pts[:,1] = u_phi -> phi = u_phi * 2*pi      in (0, 2*pi)
+        pts[:,2] = u_z   -> z   = z0 + u_z * deltaz in (z0, zf)
+    The extra Jacobian (q_lim * 2*pi * deltaz) from this rescaling is folded
+    into the return value, on top of the original polar jacobian `q`.
+    """
+
+    def __call__(self, pts):
+        x, E, mu2, ux = self.x, self.E, self.mu2, self.ux
+        kx, ky, kk, ku, uu = self.kx, self.ky, self.kk, self.ku, self.uu
+        q_lim, deltaz, z0 = self.q_lim, self.deltaz, self.z0
+
+        q = pts[:, 0] * q_lim
+        q_phi = pts[:, 1] * (2.0 * np.pi)
+        z = z0 + pts[:, 2] * deltaz
+
+        qx = q * np.cos(q_phi)
+        qy = q * np.sin(q_phi)
+
+        j = q  # polar jacobian dqx dqy = q dq dphi
+
+        kmqx = kx - qx
+        kmqy = ky - qy
+
+        qq = qx * qx + qy * qy
+        kq = kx * qx + ky * qy
+        qu = qx * ux
+        kmqu = kmqx * ux
+        kmqq = kmqx * qx + kmqy * qy
+        kmqkmq = kmqx ** 2 + kmqy ** 2
+
+        q2_mu2 = qq + mu2
+        R_sq = qq + mu2 - qu ** 2
+
+        kmqkmq = np.maximum(kmqkmq, 1e-10)
+        R_sq = np.maximum(R_sq, 1e-10)
+        R = np.sqrt(R_sq)
+
+        v2 = 1.0 / (q2_mu2 ** 2)
+        vm2dv2 = -2.0 / q2_mu2
+
+        omega_kmq = kmqkmq / (2.0 * x * E)
+        omega_k = kk / (2.0 * x * E)
+
+        t1 = (
+            (
+                (4.0 * kq / (kk * kmqkmq))
+                - (2.0 / (x * E)) * (1.0 / (kk * kmqkmq)) * (
+                    2.0 * kmqu * kk
+                    + 2.0 * ku * kmqq
+                    + kq * qu * (2.0 * kk - kmqkmq) * vm2dv2
+                )
+            )
+            * (1 - np.cos(omega_kmq * z))
+        )
+
+        t2 = (
+            (1.0 / (x * E)) * (ku / kk)
+            * (4.0 + qq * vm2dv2)
+            * (1 - np.cos(omega_k * z))
+        )
+
+        t3 = (
+            (-1)
+            * (1.0 / (4 * (R ** 3) * x * E))
+            * ((mu2 * ((qu ** 4) + 6 * (qu ** 2) * (R ** 2) - 3 * R ** 4)
+               - 2 * (R ** 2) * ((qu ** 4) - (R ** 4))) / kk)
+            * vm2dv2
+            * np.sin(omega_k * z)
+        )
+
+        t4 = (
+            (1 / (x * E))
+            * ((kk * (1 - uu) + (ku ** 2)) / (kk ** 2))
+            * ((((R ** 2) + (qu ** 2)) ** 2) / (R ** 3))
+            * np.sin(omega_k * z)
+        )
+
+        jac = q_lim * 2.0 * np.pi * deltaz
+        return j * v2 * (t1 + t2 + t3 + t4) * jac
+
+
+class _AnalyticZFullIntegrand(_IntegrandParams):
+    """(q, q_phi) integrand with z integrated analytically. Same rescaling
+    idea as above, but no z-axis (jac = q_lim * 2*pi)."""
+
+    def __call__(self, pts):
+        x, E, mu2, ux = self.x, self.E, self.mu2, self.ux
+        kx, ky, kk, ku, uu = self.kx, self.ky, self.kk, self.ku, self.uu
+        q_lim, deltaz, z0 = self.q_lim, self.deltaz, self.z0
+
+        q = pts[:, 0] * q_lim
+        q_phi = pts[:, 1] * (2.0 * np.pi)
+
+        qx = q * np.cos(q_phi)
+        qy = q * np.sin(q_phi)
+        j = q
+
+        kmqx = kx - qx
+        kmqy = ky - qy
+
+        qq = qx * qx + qy * qy
+        kq = kx * qx + ky * qy
+        qu = qx * ux
+        kmqu = kmqx * ux
+        kmqq = kmqx * qx + kmqy * qy
+        kmqkmq = kmqx ** 2 + kmqy ** 2
+
+        q2_mu2 = qq + mu2
+        R_sq = qq + mu2 - qu ** 2
+
+        kmqkmq = np.maximum(kmqkmq, 1e-10)
+        R_sq = np.maximum(R_sq, 1e-10)
+        R = np.sqrt(R_sq)
+
+        v2 = 1.0 / (q2_mu2 ** 2)
+        vm2dv2 = -2.0 / q2_mu2
+
+        omega_kmq = kmqkmq / (2.0 * x * E)
+        omega_k = kk / (2.0 * x * E)
+
+        t1 = (
+            (
+                (4.0 * kq / (kk * kmqkmq))
+                - (2.0 / (x * E)) * (1.0 / (kk * kmqkmq)) * (
+                    2.0 * kmqu * kk
+                    + 2.0 * ku * kmqq
+                    + kq * qu * (2.0 * kk - kmqkmq) * vm2dv2
+                )
+            )
+            * (1 - np.sinc(omega_kmq * deltaz / (2 * np.pi)) * np.cos(omega_kmq * (z0 + deltaz / 2))) * deltaz
+        )
+
+        t2 = (
+            (1.0 / (x * E)) * (ku / kk)
+            * (4.0 + qq * vm2dv2)
+            * (1 - np.sinc(omega_k * deltaz / (2 * np.pi)) * np.cos(omega_k * (z0 + deltaz / 2))) * deltaz
+        )
+
+        t3 = (
+            (-1)
+            * (1.0 / (4 * (R ** 3) * x * E))
+            * ((mu2 * ((qu ** 4) + 6 * (qu ** 2) * (R ** 2) - 3 * R ** 4)
+               - 2 * (R ** 2) * ((qu ** 4) - (R ** 4))) / kk)
+            * vm2dv2
+            * np.sinc(omega_k * deltaz / (2 * np.pi)) * np.sin(omega_k * (z0 + deltaz / 2)) * deltaz
+        )
+
+        t4 = (
+            (1 / (x * E))
+            * ((kk * (1 - uu) + (ku ** 2)) / (kk ** 2))
+            * ((((R ** 2) + (qu ** 2)) ** 2) / (R ** 3))
+            * np.sinc(omega_k * deltaz / (2 * np.pi)) * np.sin(omega_k * (z0 + deltaz / 2)) * deltaz
+        )
+
+        jac = q_lim * 2.0 * np.pi
+        return j * v2 * (t1 + t2 + t3 + t4) * jac
+
+
+class _T1OnlyIntegrand(_IntegrandParams):
+    """t1-only version of the analytic-z integrand (same rescaling)."""
+
+    def __call__(self, pts):
+        x, E, mu2, ux = self.x, self.E, self.mu2, self.ux
+        kx, ky, kk, ku = self.kx, self.ky, self.kk, self.ku
+        q_lim, deltaz, z0 = self.q_lim, self.deltaz, self.z0
+
+        q = pts[:, 0] * q_lim
+        q_phi = pts[:, 1] * (2.0 * np.pi)
+
+        qx = q * np.cos(q_phi)
+        qy = q * np.sin(q_phi)
+        j = q
+
+        kmqx = kx - qx
+        kmqy = ky - qy
+
+        kq = kx * qx + ky * qy
+        qq = qx * qx + qy * qy
+        qu = qx * ux
+        kmqu = kmqx * ux
+        kmqq = kmqx * qx + kmqy * qy
+        kmqkmq = kmqx ** 2 + kmqy ** 2
+        kmqkmq = np.maximum(kmqkmq, 1e-10)
+
+        q2_mu2 = qq + mu2
+        v2 = 1.0 / (q2_mu2 ** 2)
+        vm2dv2 = -2.0 / q2_mu2
+
+        omega_kmq = kmqkmq / (2.0 * x * E)
+
+        t1 = (
+            (
+                (4.0 * kq / (kk * kmqkmq))
+                - (2.0 / (x * E)) * (1.0 / (kk * kmqkmq)) * (
+                    2.0 * kmqu * kk
+                    + 2.0 * ku * kmqq
+                    + kq * qu * (2.0 * kk - kmqkmq) * vm2dv2
+                )
+            )
+            * (1 - np.sinc(omega_kmq * deltaz / (2 * np.pi)) * np.cos(omega_kmq * (z0 + deltaz / 2))) * deltaz
+        )
+
+        jac = q_lim * 2.0 * np.pi
+        return j * v2 * t1 * jac
+
+
+# Build every Integrator + integrand ONCE, at import time.
+_INTEG_3D = vegas.Integrator([(0., 1.), (0., 1.), (0., 1.)])
+_INTEG_2D_FULL = vegas.Integrator([(0., 1.), (0., 1.)])
+_INTEG_2D_T1 = vegas.Integrator([(0., 1.), (0., 1.)])
+
+_brutemc_obj = _BruteMCIntegrand()
+_analytic_z_obj = _AnalyticZFullIntegrand()
+_t1_only_obj = _T1OnlyIntegrand()
+
+_brutemc_integrand = vegas.batchintegrand(_brutemc_obj)
+_analytic_z_integrand = vegas.batchintegrand(_analytic_z_obj)
+_t1_only_integrand = vegas.batchintegrand(_t1_only_obj)
+
+
 ###################################
 # Simplified Per-Term Integrators #
 ###################################
@@ -500,8 +767,8 @@ def integrate_point_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
     integ    = vegas.Integrator(region)
     integrand = make_batch_integrand_brutemc(x, k_perp, k_phi, E, mu, u_perp)
 
-    integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
-    result = integ(integrand, nitn=NITN, neval=NEVAL)
+    if NITN_WARMUP: integ(integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
+    result = integ(integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
 
     return result.mean, result.sdev
 
@@ -518,8 +785,8 @@ def integrate_point_analytic_z_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0
     integ    = vegas.Integrator(region)
     integrand = make_batch_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
 
-    integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
-    result = integ(integrand, nitn=NITN, neval=NEVAL)
+    if NITN_WARMUP: integ(integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
+    result = integ(integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
 
     return result.mean, result.sdev
 
@@ -538,8 +805,52 @@ def integrate_point_analytic_z_t234_brutemc_t1(x, k_perp, k_phi, E, mu, u_perp, 
     integ    = vegas.Integrator(region)
     integrand = make_batch_t1_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
 
-    integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
-    t1_result = integ(integrand, nitn=NITN, neval=NEVAL)
+    if NITN_WARMUP: integ(integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
+    t1_result = integ(integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
+
+    t2_result = t2_analytic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
+    t3_result = t3_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
+    t4_result = t4_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
+
+    return t1_result.mean + t2_result + t3_result + t4_result, t1_result.sdev
+
+
+##############################################
+# Reusable Integrand Integrators, Per Method #
+##############################################
+def integrate_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+    """Integrate a single parameter point using brute force MC method w/ VEGAS+."""
+    _brutemc_obj.set_params(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+
+    if NITN_WARMUP: _INTEG_3D(_brutemc_integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
+    result = _INTEG_3D(_brutemc_integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
+
+    return result.mean, result.sdev
+
+
+def integrate_analytic_z_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+    """
+    Integrate a single parameter point using brute force MC method w/ VEGAS+.
+    Apply analytic z integration.
+    """
+    _analytic_z_obj.set_params(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+
+    if NITN_WARMUP: _INTEG_2D_FULL(_analytic_z_integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
+    result = _INTEG_2D_FULL(_analytic_z_integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
+
+    return result.mean, result.sdev
+
+
+def integrate_analytic_z_t234_brutemc_t1(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+    """
+    Integrate a single parameter point using brute force MC method w/ VEGAS+ for t1,
+    with analytic/elliptic solutions for t2, t3, t4.
+    """
+    _t1_only_obj.set_params(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+    q_lim = _t1_only_obj.q_lim
+
+    if NITN_WARMUP: _INTEG_2D_T1(_t1_only_integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
+    t1_result = _INTEG_2D_T1(_t1_only_integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
 
     t2_result = t2_analytic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
     t3_result = t3_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
@@ -576,8 +887,11 @@ def run_benchmark(n_points=25, n_radial_panels=12, n_phi=16, seed=0, n_origin_su
 
     methods = {
         "vegas t1 + a/e t234 + analytic z (MC)" : lambda p: integrate_point_analytic_z_t234_brutemc_t1(*p)[0],
+        "vegas t1 + a/e t234 + analytic z (MC), ri": lambda p: integrate_analytic_z_t234_brutemc_t1(*p)[0],
         "vegas + analytic z (MC)": lambda p: integrate_point_analytic_z_brutemc_t1234(*p)[0],
+        "vegas + analytic z (MC), ri": lambda p: integrate_analytic_z_brutemc_t1234(*p)[0],
         "vegas (MC)": lambda p: integrate_point_brutemc_t1234(*p)[0],
+        "vegas (MC), ri": lambda p: integrate_brutemc_t1234(*p)[0],
         # "vegas polar (MC)": lambda p: integrate_point_polar(*p)[0],
         # "filon (fixed, multi-panel)": lambda p: integrate_filon(
         #     *p, n_radial_panels=n_radial_panels, n_phi=n_phi,
@@ -665,49 +979,3 @@ if __name__ == "__main__":
     print("=" * 70)
     results = run_benchmark(n_points=200, n_radial_panels=12, n_phi=16)
     print_benchmark_report(results)
-
-
-    ## Points are like (x, k_perp, k_phi, E, mu, u_perp, z0, zf)
-    # z0 = 1 / HBARC
-    # test_point = [0.01, 2.5, 0.3, 150, 0.3, 0.6, 0.5, z0 + 0.1 / HBARC]
-    #
-    # analytic = []
-    # mc = []
-    # batch = _random_batch(100)
-    # # batch = np.array([test_point])
-    # for test_point in batch:
-    #     q_lim = np.sqrt(3 * test_point[3] * test_point[4])
-    #     region = [(0, q_lim), (0, 2 * np.pi)]
-    #
-    #     integ = vegas.Integrator(region)
-    #     integrand = make_batch_integrand_t3_analytic_z_mc(*test_point)
-    #
-    #     integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
-    #     result = integ(integrand, nitn=NITN, neval=NEVAL)
-    #     mc.append(result.mean)
-    #     analytic.append(t3_elliptic(*test_point, q_lim).item())
-    #
-    #     print(f"Point: {test_point}")
-    #     print(f"Q_lim: {q_lim}")
-    #     print(f"MC: {mc[-1]}")
-    #     print(f"AN: {analytic[-1]}")
-    #
-    # analytic = np.array(analytic)
-    # mc = np.array(mc)
-    #
-    # print(f"Mean: {np.mean(analytic / mc)}")
-    # print(f"Std: {np.std(analytic / mc)}")
-    # plt.hist(analytic / mc, density=True)
-    # plt.show()
-    # print("\n" + "=" * 70)
-    # print("phi_k-separation validation against vegas (Cartesian) ground truth")
-    # print("=" * 70)
-    # validate_phi_separation(
-    #     x=0.01, k_mag=1.2, E=20.0, T=0.35, g=1.8, u_perp=0.4, z0=DELTAZ * 3,
-    #     phi_k_samples=np.linspace(0, 2 * np.pi, 8, endpoint=False),
-    # )
-    #
-    # print("\n" + "=" * 70)
-    # print("phi_k-grid speedup (2-call trick vs. naive per-angle loop)")
-    # print("=" * 70)
-    # run_phi_grid_benchmark(n_points=100, n_phi_k=16, n_radial_panels=12, n_phi=16)
