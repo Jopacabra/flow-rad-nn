@@ -31,7 +31,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 ape_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.append(ape_dir)
 
-from integration import integrate_point
+from integration import integrate_point_analytic_z_t234_brutemc_t1 as integrate_point
 from train_radiation_nn import RadiationEmulatorInference
 
 # ==============================================================================
@@ -58,13 +58,15 @@ DEFAULTS["zf"] = DEFAULTS["z0"] + DTAU  # dtau = 0.1 fm
 # ==============================================================================
 def _integrate_one(args):
     """Top-level wrapper required for ProcessPoolExecutor pickling."""
-    ix, iky, x, kx, ky, E, T, g, u_perp, z0, zf = args
-    mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf)
+    ix, iky, x, kx, ky, E, mu, u_perp, z0, zf = args
+    k_perp = np.hypot(kx, ky)
+    k_phi = np.arctan2(ky, kx)
+    mean, sdev = integrate_point(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
     return ix, iky, mean, sdev
 
 
 def compute_reference_grid(
-    x, E, z0, zf, u_perp, T, g,
+    x, E, z0, zf, u_perp, mu,
     kx_values: np.ndarray,
     ky_values: np.ndarray,
     n_workers: int = 4,
@@ -77,9 +79,6 @@ def compute_reference_grid(
     I_ref : ndarray, shape (n_kx, n_ky)
     I_err : ndarray, shape (n_kx, n_ky)
     """
-    print("!" * 70)
-    print("WARNING -- MISMATCHED MU DEFINITION")
-    print("!" * 70)
     n_kx = len(kx_values)
     n_ky = len(ky_values)
     n_total = n_kx * n_ky
@@ -89,7 +88,7 @@ def compute_reference_grid(
 
     # Build task list
     tasks = [
-        (ikx, iky, x, kx_values[ikx], ky_values[iky], E, T, g, u_perp, z0, zf)
+        (ikx, iky, x, kx_values[ikx], ky_values[iky], E, mu, u_perp, z0, zf)
         for ikx in range(n_kx)
         for iky in range(n_ky)
     ]
@@ -425,7 +424,7 @@ def main():
     print("Step 1: Computing reference (Vegas integrator)")
     I_ref, I_err = compute_reference_grid(
         x=args.x, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
-        u_perp=args.u_perp, T=(args.mu/np.sqrt(1 + 2/6))/2, g=2,
+        u_perp=args.u_perp, mu=args.mu,
         kx_values=kx_values,
         ky_values=ky_values,
         n_workers=args.workers,
@@ -468,7 +467,7 @@ def main():
             print("  Computing reference grid...")
             I_ref_x, I_err_x = compute_reference_grid(
                 x=x_val, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
-                u_perp=args.u_perp, T=(args.mu**2 - 2/6)/2, g=2,
+                u_perp=args.u_perp, mu=args.mu,
                 kx_values=kx_values,
                 ky_values=ky_values,
                 n_workers=args.workers,

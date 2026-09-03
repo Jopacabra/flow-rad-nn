@@ -1,6 +1,11 @@
 import sys
+import time
 from pathlib import Path
+
 import numpy as np
+import scipy as sp
+import matplotlib.pyplot as plt
+
 import vegas
 
 # Import medium property functions from plasma_interaction
@@ -9,22 +14,29 @@ sys.path.append(ape_dir)
 from plasma_interaction import rho, mu_DeBye
 
 
-# ==============================================================================
-# Integration settings
-# ==============================================================================
-NITN_WARMUP = 5
-NITN = 8
-NEVAL = 3000
+#############
+# Constants #
+#############
+_EPS_OMEGA = 1e-6  # threshold for small-argument Taylor fallback (avoids inf*0 / Ci(0) issues)
 
-# ==============================================================================
-# Physical constants
-# ==============================================================================
+HBARC = 0.1973269804  # GeV * fm
 NC = 3  # Number of colors
 SOFT_PIDS = [1, -1, 2, -2, 3, -3, 21]  # Soft parton species for rho0 summation
 
-# ==============================================================================
-# Medium property helpers
-# ==============================================================================
+# NITN_WARMUP = 10  # Iterations for the MC integrators during "warmup"
+# NITN = 50  # Number of iterations for actual integration
+# NEVAL = 10000  # Number of evaluations for integration
+
+NITN_WARMUP = 3  # Iterations for the MC integrators during "warmup"
+NITN = 5  # Number of iterations for actual integration
+NEVAL = 10  # Number of evaluations for integration
+
+DELTAZ = 0.1 / HBARC  # Fixed pathlength where applicable
+
+
+###########################
+# Medium property helpers #
+###########################
 def compute_rho0(T: float) -> float:
     rho0 = 0.0
     for pid in SOFT_PIDS:
@@ -35,72 +47,87 @@ def compute_rho0(T: float) -> float:
 def compute_mu(T: float, g: float) -> float:
     return mu_DeBye(T, g=g)
 
-# ==============================================================================
-# Integrand (adapted from radiation.py)
-# ==============================================================================
-def make_batch_integrand(x, kx, ky, E, T, g, u_perp):
+
+#####################
+# Special Functions #
+#####################
+def ellippi(n, m):
+    """
+    Complete elliptic integral of the third kind.
+    """
+    return sp.special.elliprf(0., 1. - m, 1.) + \
+           (n / 3.) * sp.special.elliprj(0., 1. - m, 1., 1. - n)
+
+
+##############################
+# Brute Force MC Integrators #
+##############################
+def make_batch_integrand_brutemc(x, k_perp, k_phi, E, mu, u_perp):
     """
     Constructs a vegas batch integrand for the medium-induced gluon radiation
-    intensity at fixed (x, kx, ky, E, T, g, u_perp), integrating over (qx, qy, z).
+    intensity at fixed (x, k_perp, k_phi, E, mu, u_perp), integrating over (qx, qy, z).
 
     Assumes u_y = 0 (flow along +x only).
-
-    Note: The Casimir factor (CF) is NOT included. Multiply by CF at runtime
-          depending on the hard particle flavor (4/3 for quarks, 3 for gluons).
     """
-    # Compute alpha_s from g
-    alpha_s = g**2 / (4 * np.pi)
 
-    # Medium properties derived from T and g
-    rho0 = compute_rho0(T)
-    mu = compute_mu(T, g)
+    # Derived properties
     _mu2 = mu ** 2
+
+    # Get cartesian kx and ky
+    kx = k_perp * np.cos(k_phi)
+    ky = k_perp * np.sin(k_phi)
 
     # Flow (u_y = 0 by assumption)
     ux = u_perp
-    uy = 0.0
+    # uy = 0, but we simply don't compute those values
 
-    # Constants WITHOUT CF factor (user will multiply by CF later)
-    _constants = alpha_s / (16 * (np.pi ** 2))
-
+    # Dot products constant for every integration point
     kk = kx * kx + ky * ky
-    ku = kx * ux + ky * uy
-    uu = ux * ux + uy * uy
+    ku = kx * ux  # ky * uy = 0 by construction
+    uu = ux * ux  # uy * uy = 0 by construction
 
     # Protect against kk = 0
     if kk < 1e-10:
         kk = 1e-10
 
-    # Precompute g^4 for scattering potential
-    g4 = g ** 4
-
     @vegas.batchintegrand
     def integrand(pts):
-        qx = pts[:, 0]
-        qy = pts[:, 1]
+        q = pts[:, 0]
+        q_phi = pts[:, 1]
+        qx = q * np.cos(q_phi)
+        qy = q * np.sin(q_phi)
         z = pts[:, 2]
 
+        # Polar jacobian, multiplied in return statement
+        j = q
+
+        # Compute per-point arithmetic
         kmqx = kx - qx
         kmqy = ky - qy
 
         qq = qx * qx + qy * qy
         kq = kx * qx + ky * qy
-        qu = qx * ux + qy * uy
-        kmqu = kmqx * ux + kmqy * uy
+        qu = qx * ux  # qy * uy = 0 by construction
+        kmqu = kmqx * ux  # kmqy * uy = 0 by construction
         kmqq = kmqx * qx + kmqy * qy
         kmqkmq = kmqx ** 2 + kmqy ** 2
 
-        # Protect against division by zero
-        kmqkmq = np.maximum(kmqkmq, 1e-10)
-
         q2_mu2 = qq + _mu2
         R_sq = qq + _mu2 - qu ** 2
-        R_sq = np.maximum(R_sq, 1e-10)  # Numerical protection
+
+        # Protect against division by zero
+        kmqkmq = np.maximum(kmqkmq, 1e-10)  # This is always positive, since it's squared. No sign error here.
+        R_sq = np.maximum(R_sq, 1e-10)  # Same as above.
+
         R = np.sqrt(R_sq)
 
-        # Scattering potential (uses g^4)
-        v2 = g4 / (q2_mu2 ** 2)
+        # Scattering potential -- Here we have extracted g^4
+        v2 = 1 / (q2_mu2 ** 2)
         vm2dv2 = -2.0 / q2_mu2
+
+        # Oscillation frequencies
+        omega_kmq = (kmqkmq / (2.0 * x * E))
+        omega_k = (kk / (2.0 * x * E))
 
         # Term 1
         t1 = (
@@ -112,24 +139,24 @@ def make_batch_integrand(x, kx, ky, E, T, g, u_perp):
                     + kq * qu * (2.0 * kk - kmqkmq) * vm2dv2
                 )
             )
-            * (1 - np.cos((kmqkmq / (2.0 * x * E)) * z))
+            * (1 - np.cos(omega_kmq * z))
         )
 
         # Term 2
         t2 = (
             (1.0 / (x * E)) * (ku / kk)
             * (4.0 + qq * vm2dv2)
-            * (1 - np.cos((kk / (2.0 * x * E)) * z))
+            * (1 - np.cos(omega_k * z))
         )
 
         # Term 3
         t3 = (
             (-1)
             * (1.0 / (4 * (R ** 3) * x * E))
-            * (_mu2 * ((qu ** 4) + 6 * (qu ** 2) * (R ** 2) - 3 * R ** 4)
-               - 2 * (R ** 2) * ((qu ** 4) - (R ** 4)))
+            * ((_mu2 * ((qu ** 4) + 6 * (qu ** 2) * (R ** 2) - 3 * R ** 4)
+               - 2 * (R ** 2) * ((qu ** 4) - (R ** 4))) / kk)
             * vm2dv2
-            * np.sin((kk / (2.0 * x * E)) * z)
+            * np.sin(omega_k * z)
         )
 
         # Term 4
@@ -137,92 +164,83 @@ def make_batch_integrand(x, kx, ky, E, T, g, u_perp):
             (1 / (x * E))
             * ((kk * (1 - uu) + (ku ** 2)) / (kk ** 2))
             * ((((R ** 2) + (qu ** 2)) ** 2) / (R ** 3))
-            * np.sin((kk / (2.0 * x * E)) * z)
+            * np.sin(omega_k * z)
         )
 
-        return _constants * rho0 * v2 * (t1 + t2 + t3 + t4)
+        return j * v2 * (t1 + t2 + t3 + t4)
 
     return integrand
 
-def integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf):
-    """Integrate the radiation intensity for a single parameter point."""
-    q_lim = np.sqrt(6 * E * T)
-    region = [(-q_lim, q_lim), (-q_lim, q_lim), (z0, zf)]
 
-    integ    = vegas.Integrator(region)
-    integrand = make_batch_integrand(x, kx, ky, E, T, g, u_perp)
-
-    integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
-    result = integ(integrand, nitn=NITN, neval=NEVAL)
-
-    return result.mean, result.sdev
-
-
-def _integrate_one(task):
-    """Top-level worker function for parallel integration. Must be module-level for pickling."""
-    idx, x, kx, ky, E, z0, zf, u_perp, T, g = task
-    try:
-        mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf)
-        return idx, mean, sdev
-    except Exception as e:
-        print(f"  Warning: Integration failed at index {idx}: {e}")
-        return idx, np.nan, np.nan
-
-
-def make_batch_integrand_fixed_z(x, kx, ky, E, T, g, u_perp, z):
+def make_batch_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
     """
     Constructs a vegas batch integrand for the medium-induced gluon radiation
-    intensity at fixed (x, kx, ky, E, T, g, u_perp, z), integrating over (qx, qy) only.
+    intensity at fixed (x, k_perp, k_phi, E, mu, u_perp), integrating over (qx, qy, z). Analytic solution for z integral.
 
     Assumes u_y = 0 (flow along +x only).
 
-    Note: The Casimir factor (CF) is NOT included. Multiply by CF at runtime
-          depending on the hard particle flavor (4/3 for quarks, 3 for gluons).
+    Note: This uses numpy's sinc function, which differs by a norm. from a pure math definition, e.g. in Mathematica
+          Mathematica Sinc[x] -> Numpy np.sin( x / np.pi )
     """
-    alpha_s = g**2 / (4 * np.pi)
 
-    rho0 = compute_rho0(T)
-    mu = compute_mu(T, g)
-    _mu2 = mu**2
+    # Derived properties
+    _mu2 = mu ** 2
+    deltaz = zf - z0
 
+    # Get cartesian kx and ky
+    kx = k_perp * np.cos(k_phi)
+    ky = k_perp * np.sin(k_phi)
+
+    # Flow (u_y = 0 by assumption)
     ux = u_perp
-    uy = 0.0
+    # uy = 0, but we simply don't compute those values
 
-    _constants = alpha_s / (16 * (np.pi**2))
-
+    # Dot products constant for every integration point
     kk = kx * kx + ky * ky
-    ku = kx * ux + ky * uy
-    uu = ux * ux + uy * uy
+    ku = kx * ux  # ky * uy = 0 by construction
+    uu = ux * ux  # uy * uy = 0 by construction
 
+    # Protect against kk = 0
     if kk < 1e-10:
         kk = 1e-10
 
-    g4 = g**4
-
     @vegas.batchintegrand
     def integrand(pts):
-        qx = pts[:, 0]
-        qy = pts[:, 1]
+        q = pts[:, 0]
+        q_phi = pts[:, 1]
+        qx = q * np.cos(q_phi)
+        qy = q * np.sin(q_phi)
 
+        # Polar jacobian, multiplied in return statement
+        j = q
+
+        # Compute per-point arithmetic
         kmqx = kx - qx
         kmqy = ky - qy
 
         qq = qx * qx + qy * qy
         kq = kx * qx + ky * qy
-        qu = qx * ux + qy * uy
-        kmqu = kmqx * ux + kmqy * uy
+        qu = qx * ux  # qy * uy = 0 by construction
+        kmqu = kmqx * ux  # kmqy * uy = 0 by construction
         kmqq = kmqx * qx + kmqy * qy
-        kmqkmq = kmqx**2 + kmqy**2
-
-        kmqkmq = np.maximum(kmqkmq, 1e-10)
+        kmqkmq = kmqx ** 2 + kmqy ** 2
 
         q2_mu2 = qq + _mu2
-        R_sq = qq + _mu2 - qu**2
-        R_sq = np.maximum(R_sq, 1e-10)
+        R_sq = qq + _mu2 - qu ** 2
+
+        # Protect against division by zero
+        kmqkmq = np.maximum(kmqkmq, 1e-10)  # This is always positive, since it's squared. No sign error here.
+        R_sq = np.maximum(R_sq, 1e-10)  # Same as above.
+
         R = np.sqrt(R_sq)
 
-        v2 = g4 / (q2_mu2**2)
+        # Scattering potential -- Here we have extracted g^4
+        v2 = 1 / (q2_mu2 ** 2)
         vm2dv2 = -2.0 / q2_mu2
+
+        # Oscillation frequencies
+        omega_kmq = (kmqkmq / (2.0 * x * E))
+        omega_k = (kk / (2.0 * x * E))
 
         # Term 1
         t1 = (
@@ -234,50 +252,464 @@ def make_batch_integrand_fixed_z(x, kx, ky, E, T, g, u_perp, z):
                     + kq * qu * (2.0 * kk - kmqkmq) * vm2dv2
                 )
             )
-            * (1 - np.cos((kmqkmq / (2.0 * x * E)) * z))
+            * (1 - np.sinc(omega_kmq * deltaz / (2 * np.pi))*np.cos(omega_kmq*(z0 + (deltaz/2)))) * deltaz
         )
 
         # Term 2
         t2 = (
             (1.0 / (x * E)) * (ku / kk)
             * (4.0 + qq * vm2dv2)
-            * (1 - np.cos((kk / (2.0 * x * E)) * z))
+            * (1 - np.sinc(omega_k * deltaz / (2 * np.pi))*np.cos(omega_k*(z0 + (deltaz/2)))) * deltaz
         )
 
         # Term 3
         t3 = (
             (-1)
-            * (1.0 / (4 * (R**3) * x * E))
-            * (
-                _mu2 * ((qu**4) + 6 * (qu**2) * (R**2) - 3 * R**4)
-                - 2 * (R**2) * ((qu**4) - (R**4))
-            )
+            * (1.0 / (4 * (R ** 3) * x * E))
+            * ((_mu2 * ((qu ** 4) + 6 * (qu ** 2) * (R ** 2) - 3 * R ** 4)
+               - 2 * (R ** 2) * ((qu ** 4) - (R ** 4))) / kk)
             * vm2dv2
-            * np.sin((kk / (2.0 * x * E)) * z)
+            * np.sinc(omega_k * deltaz / (2 * np.pi) ) * np.sin(omega_k * (z0 + (deltaz/2))) * deltaz
         )
 
         # Term 4
         t4 = (
             (1 / (x * E))
-            * ((kk * (1 - uu) + (ku**2)) / (kk**2))
-            * ((((R**2) + (qu**2)) ** 2) / (R**3))
-            * np.sin((kk / (2.0 * x * E)) * z)
+            * ((kk * (1 - uu) + (ku ** 2)) / (kk ** 2))
+            * ((((R ** 2) + (qu ** 2)) ** 2) / (R ** 3))
+            * np.sinc(omega_k * deltaz / (2 * np.pi) ) * np.sin(omega_k * (z0 + (deltaz/2))) * deltaz
         )
 
-        return _constants * rho0 * v2 * (t1 + t2 + t3 + t4)
+        return j * v2 * (t1 + t2 + t3 + t4)
 
     return integrand
 
 
-def integrate_point_fixed_z(x, kx, ky, E, T, g, u_perp, z):
-    """Integrate the radiation intensity over (qx, qy) only at a fixed z value."""
-    q_lim = np.sqrt(6 * E * T)
-    region = [(-q_lim, q_lim), (-q_lim, q_lim)]
+def make_batch_t1_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+    """
+    Constructs a vegas batch integrand for the medium-induced gluon radiation
+    intensity at fixed (x, k_perp, k_phi, E, mu, u_perp), integrating over (qx, qy, z). Analytic solution for z integral.
 
-    integ = vegas.Integrator(region)
-    integrand = make_batch_integrand_fixed_z(x, kx, ky, E, T, g, u_perp, z)
+    Assumes u_y = 0 (flow along +x only).
+
+    Note: This uses numpy's sinc function, which differs by a norm. from a pure math definition, e.g. in Mathematica
+          Mathematica Sinc[x] -> Numpy np.sin( x / np.pi )
+    """
+
+    # Derived properties
+    _mu2 = mu ** 2
+    deltaz = zf - z0
+
+    # Get cartesian kx and ky
+    kx = k_perp * np.cos(k_phi)
+    ky = k_perp * np.sin(k_phi)
+
+    # Flow (u_y = 0 by assumption)
+    ux = u_perp
+    # uy = 0, but we simply don't compute those values
+
+    # Dot products constant for every integration point
+    kk = kx * kx + ky * ky
+    ku = kx * ux  # ky * uy = 0 by construction
+    uu = ux * ux  # uy * uy = 0 by construction
+
+    # Protect against kk = 0
+    if kk < 1e-10:
+        kk = 1e-10
+
+    @vegas.batchintegrand
+    def integrand(pts):
+        q = pts[:, 0]
+        q_phi = pts[:, 1]
+        qx = q * np.cos(q_phi)
+        qy = q * np.sin(q_phi)
+
+        # Polar jacobian, multiplied in return statement
+        j = q
+
+        # Compute per-point arithmetic
+        kmqx = kx - qx
+        kmqy = ky - qy
+
+        qq = qx * qx + qy * qy
+        kq = kx * qx + ky * qy
+        qu = qx * ux  # qy * uy = 0 by construction
+        kmqu = kmqx * ux  # kmqy * uy = 0 by construction
+        kmqq = kmqx * qx + kmqy * qy
+        kmqkmq = kmqx ** 2 + kmqy ** 2
+
+        q2_mu2 = qq + _mu2
+        R_sq = qq + _mu2 - qu ** 2
+
+        # Protect against division by zero
+        kmqkmq = np.maximum(kmqkmq, 1e-10)  # This is always positive, since it's squared. No sign error here.
+        R_sq = np.maximum(R_sq, 1e-10)  # Same as above.
+
+        R = np.sqrt(R_sq)
+
+        # Scattering potential -- Here we have extracted g^4
+        v2 = 1 / (q2_mu2 ** 2)
+        vm2dv2 = -2.0 / q2_mu2
+
+        # Oscillation frequencies
+        omega_kmq = (kmqkmq / (2.0 * x * E))
+        omega_k = (kk / (2.0 * x * E))
+
+        # Term 1
+        t1 = (
+            (
+                (4.0 * kq / (kk * kmqkmq))
+                - (2.0 / (x * E)) * (1.0 / (kk * kmqkmq)) * (
+                    2.0 * kmqu * kk
+                    + 2.0 * ku * kmqq
+                    + kq * qu * (2.0 * kk - kmqkmq) * vm2dv2
+                )
+            )
+            * (1 - np.sinc(omega_kmq * deltaz / (2 * np.pi))*np.cos(omega_kmq*(z0 + (deltaz/2)))) * deltaz
+        )
+
+        return j * v2 * t1
+
+    return integrand
+
+
+###################################
+# Simplified Per-Term Integrators #
+###################################
+def t2_analytic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_max):
+    """
+    Implementation of analytic solution for term 2.
+    """
+
+    # Derived properties
+    _mu2 = mu ** 2
+    _mu4 = mu ** 4
+    _qmax2 = q_max ** 2
+    _qmax4 = q_max ** 4
+    _qmax6 = q_max ** 6
+    _qmax2_mu2 = (_qmax2 + _mu2)
+    deltaz = zf - z0
+
+    # Get cartesian kx
+    kx = k_perp * np.cos(k_phi)
+
+    # Flow (u_y = 0 by assumption)
+    ux = u_perp
+
+    # Dot products constant for every integration point
+    kk = k_perp * k_perp
+    ku = kx * ux  # ky * uy = 0 by construction
+
+    # Oscillation frequency
+    omega_k = (kk / (2.0 * x * E))
+
+    # Protect against kk = 0
+    if kk < 1e-10:
+        kk = 1e-10
+
+    analytic = (1 / (x * E)) * (ku / kk)
+    q_integral = np.pi * ( 3 * _qmax4 + 4 * _qmax2 * _mu2) / ( _mu2 * (_qmax2_mu2 ** 2) )
+    #((2*_qmax2 / (_mu2 * _qmax2_mu2)) + ((_qmax6 + 3 * _qmax4 * _mu2) / (12 * _mu4 * (_qmax2_mu2**3))))
+    z_integral = (1 - np.sinc(omega_k * deltaz / (2 * np.pi))*np.cos(omega_k*(z0 + (deltaz/2)))) * deltaz
+
+    return analytic * q_integral * z_integral
+
+
+def t3_integrand_radial(q, mu, u):
+    """
+    Radial integrand for term 3 in terms of elliptic integrals
+    """
+    Q, M, U = q**2, mu**2, u**2
+    B     = Q + M
+    Delta = Q*(1 - U) + M
+    m     = Q*U / B
+    P_E   = 4*(4*Q**2*(1-U) + Q*M*(1+4*U) - 3*M**2)
+
+    E = sp.special.ellipe(m)
+    K = sp.special.ellipk(m)
+
+    J = np.sqrt(B) * (P_E * E / Delta - 8*(Q - M)*K)
+    val = J / B**3
+    return val * q
+
+
+def t3_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_max):
+    """
+    Implementation of numerical elliptic integrals for term 3.
+    """
+    kk = k_perp * k_perp
+    deltaz = zf - z0
+    omega_k = kk / (2.0 * x * E)
+
+    n = 32
+    x_lg, w = np.polynomial.legendre.leggauss(n)
+
+    q = 0.5 * q_max * (x_lg + 1.0)      # shape (n,) -- true 1D, no stray dim
+    jac = 0.5 * q_max
+
+    vals = t3_integrand_radial(q, mu, u_perp)   # shape (n,)
+    q_integral = jac * np.dot(vals, w)          # true scalar
+
+    z_integral = (np.sinc(omega_k * deltaz / (2 * np.pi))
+                  * np.sin(omega_k * (z0 + deltaz / 2)) * deltaz)
+
+    analytic = 1.0 / (2.0 * kk * x * E)
+
+    return analytic * q_integral * z_integral   # plain scalar, no .item() needed
+
+
+def t4_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_max):
+    """
+    Implementation of numerical elliptic integrals for term 4. This is a valid analytic solution expression.
+    """
+    u_perp = np.asarray(u_perp)
+    uu = u_perp * u_perp
+    q_max = np.asarray(q_max)
+    mu = np.asarray(mu)
+    k = np.asarray(k_perp)
+    kk = k * k
+    _k4 = k**4
+    k_phi = np.asarray(k_phi)
+    ku = k * u_perp * np.cos(k_phi)
+    kuku = ku * ku
+    deltaz = zf - z0
+
+    # Oscillation frequency
+    omega_k = (kk / (2.0 * x * E))
+
+    b2 = 1.0 - uu
+    term1 = 2.0 * np.pi / (mu * np.sqrt(b2))
+
+    m = u_perp ** 2 * q_max ** 2 / (q_max ** 2 + mu ** 2)
+    n = u_perp ** 2
+    term2 = 4.0 * ellippi(n, m) / np.sqrt(q_max ** 2 + mu ** 2)
+
+    analytic = (1/(x * E)) * ((kk * (1 - uu) + kuku) / _k4)
+    q_integral = term1 - term2
+    z_integral = np.sinc(omega_k * deltaz / (2 * np.pi) ) * np.sin(omega_k * (z0 + (deltaz/2))) * deltaz
+
+    return analytic * q_integral * z_integral
+
+
+##################################################
+# Single Point Integration Functions, Per Method #
+##################################################
+def integrate_point_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+    """Integrate a single parameter point using brute force MC method w/ VEGAS+."""
+    q_lim = np.sqrt(3 * E * mu)
+    region = [(0, q_lim), (0, 2*np.pi), (z0, zf)]
+
+    integ    = vegas.Integrator(region)
+    integrand = make_batch_integrand_brutemc(x, k_perp, k_phi, E, mu, u_perp)
 
     integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
     result = integ(integrand, nitn=NITN, neval=NEVAL)
 
     return result.mean, result.sdev
+
+
+def integrate_point_analytic_z_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+    """
+    Integrate a single parameter point using brute force MC method w/ VEGAS+.
+    Apply analytic z integration.
+    Perform brute force VEGAS+ integration of t1, t2, t3, & t4
+    """
+    q_lim = np.sqrt(3 * E * mu)
+    region = [(0, q_lim), (0, 2*np.pi)]
+
+    integ    = vegas.Integrator(region)
+    integrand = make_batch_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+
+    integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
+    result = integ(integrand, nitn=NITN, neval=NEVAL)
+
+    return result.mean, result.sdev
+
+
+def integrate_point_analytic_z_t234_brutemc_t1(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
+    """
+    Integrate a single parameter point using brute force MC method w/ VEGAS+.
+    Apply analytic z integration.
+    Perform brute force VEGAS+ integration of t1
+    Perform analytic t2 q integration
+    Perform numerical q integration of t3 & t4 using elliptic integral expressions
+    """
+    q_lim = np.sqrt(3 * E * mu)
+    region = [(0, q_lim), (0, 2*np.pi)]
+
+    integ    = vegas.Integrator(region)
+    integrand = make_batch_t1_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+
+    integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
+    t1_result = integ(integrand, nitn=NITN, neval=NEVAL)
+
+    t2_result = t2_analytic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
+    t3_result = t3_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
+    t4_result = t4_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
+
+    return t1_result.mean + t2_result + t3_result + t4_result, t1_result.sdev
+
+
+############################
+# Method Benchmarking Code #
+############################
+def _random_batch(n_points, seed=0):
+    """
+    Generates a random batch of points for every integrator.
+    """
+    rng = np.random.default_rng(seed)
+    deltaz = 0.1 / HBARC
+    batch = []
+    for _ in range(n_points):
+        x = rng.uniform(0.01, 0.99)
+        k_perp = rng.uniform(0, 5.0)
+        k_phi = rng.uniform(0, 2*np.pi)
+        E = rng.uniform(5.0, 50.0)
+        mu = rng.uniform(0.3, 1.2)
+        u_perp = rng.uniform(0.0, 0.6)
+        z0 = rng.uniform(0.0, 10 / HBARC)  # 0 to 10 fm
+        zf = z0 + deltaz
+        batch.append((x, k_perp, k_phi, E, mu, u_perp, z0, zf))
+    return batch
+
+
+def run_benchmark(n_points=25, n_radial_panels=12, n_phi=16, seed=0, n_origin_subdiv_max=400):
+    batch = _random_batch(n_points, seed=seed)
+
+    methods = {
+        "vegas t1 + a/e t234 + analytic z (MC)" : lambda p: integrate_point_analytic_z_t234_brutemc_t1(*p)[0],
+        "vegas + analytic z (MC)": lambda p: integrate_point_analytic_z_brutemc_t1234(*p)[0],
+        "vegas (MC)": lambda p: integrate_point_brutemc_t1234(*p)[0],
+        # "vegas polar (MC)": lambda p: integrate_point_polar(*p)[0],
+        # "filon (fixed, multi-panel)": lambda p: integrate_filon(
+        #     *p, n_radial_panels=n_radial_panels, n_phi=n_phi,
+        #     n_origin_subdiv_max=n_origin_subdiv_max),
+    }
+
+    results = {}
+    for name, fn in methods.items():
+        t0 = time.perf_counter()
+        values = [float(fn(p)) for p in batch]  # Coerce all integrators to give a float. No shape errors possible!
+        t1 = time.perf_counter()
+        total = t1 - t0
+        results[name] = {
+            "total_s": total,
+            "per_point_ms": 1000.0 * total / n_points,
+            "values": values,
+        }
+    return results
+
+
+def _error_stats(vals, ref_vals):
+    vals = np.asarray(vals, dtype=float)
+    ref_vals = np.asarray(ref_vals, dtype=float)
+    diff = vals - ref_vals
+    with np.errstate(divide="ignore", invalid="ignore"):
+        reldiff = np.abs(diff) / np.abs(ref_vals)
+        signed_reldiff = diff / ref_vals
+    median_ref = np.median(np.abs(ref_vals))
+    norm_diff = np.abs(diff) / (median_ref + 1e-300)
+
+    finite = np.isfinite(reldiff)
+    reldiff_f = reldiff[finite]
+    signed_f = signed_reldiff[finite]
+
+    return {
+        "bias_mean": np.mean(signed_f),                 # signed -> systematic over/under
+        "abs_mean": np.mean(reldiff_f),
+        "abs_median": np.median(reldiff_f),
+        "abs_p90": np.percentile(reldiff_f, 90),
+        "abs_p99": np.percentile(reldiff_f, 99),
+        "abs_max": np.max(reldiff_f),
+        "argmax": np.argmax(reldiff),
+        "norm_mean": np.mean(norm_diff),                 # robust to near-zero ref values
+        "frac_1pct": np.mean(reldiff_f < 0.01),
+        "frac_5pct": np.mean(reldiff_f < 0.05),
+        "frac_20pct": np.mean(reldiff_f < 0.20),
+    }
+
+
+def print_benchmark_report(results, reference="vegas t1 + a/e t234 + analytic z (MC)"):
+    ref_vals = np.array(results[reference]["values"])
+    ref_time = results[reference]["per_point_ms"]
+
+    print(f"Reference: {reference}  ({ref_time:.4f} ms/point, n={len(ref_vals)} points)")
+    print("=" * 100)
+    col = "{:32s}{:>12s}{:>10s}{:>12s}{:>12s}{:>10s}{:>10s}{:>10s}"
+    print(col.format("method", "ms/point", "speedup", "bias", "mean|rd|",
+                      "med|rd|", "p90|rd|", "max|rd|"))
+    print("-" * 100)
+
+    for name, r in results.items():
+        vals = r["values"]
+        s = _error_stats(vals, ref_vals)
+        speedup = ref_time / r["per_point_ms"]
+        row = "{:32s}{:12.4f}{:10.2f}x{:12.2%}{:12.2%}{:10.2%}{:10.2%}{:10.2%}"
+        print(row.format(name, r["per_point_ms"], speedup, s["bias_mean"],
+                          s["abs_mean"], s["abs_median"], s["abs_p90"], s["abs_max"]))
+        print(f"    within 1%: {s['frac_1pct']:.1%}   within 5%: {s['frac_5pct']:.1%}   "
+              f"within 20%: {s['frac_20pct']:.1%}   "
+              f"<|diff|/median(|ref|)>: {s['norm_mean']:.3e}   "
+              f"worst point idx: {s['argmax']}")
+
+    print("=" * 100)
+    print("bias        = mean signed relative error (systematic over/under-estimate)")
+    print("mean/med/p90/max |rd| = distribution of |value - ref|/|ref| across points")
+    print("norm mean   = |diff| normalized by median(|ref|), robust to near-zero ref values")
+
+
+
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("Integration Method Comparison")
+    print("=" * 70)
+    results = run_benchmark(n_points=200, n_radial_panels=12, n_phi=16)
+    print_benchmark_report(results)
+
+
+    ## Points are like (x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+    # z0 = 1 / HBARC
+    # test_point = [0.01, 2.5, 0.3, 150, 0.3, 0.6, 0.5, z0 + 0.1 / HBARC]
+    #
+    # analytic = []
+    # mc = []
+    # batch = _random_batch(100)
+    # # batch = np.array([test_point])
+    # for test_point in batch:
+    #     q_lim = np.sqrt(3 * test_point[3] * test_point[4])
+    #     region = [(0, q_lim), (0, 2 * np.pi)]
+    #
+    #     integ = vegas.Integrator(region)
+    #     integrand = make_batch_integrand_t3_analytic_z_mc(*test_point)
+    #
+    #     integ(integrand, nitn=NITN_WARMUP, neval=NEVAL)
+    #     result = integ(integrand, nitn=NITN, neval=NEVAL)
+    #     mc.append(result.mean)
+    #     analytic.append(t3_elliptic(*test_point, q_lim).item())
+    #
+    #     print(f"Point: {test_point}")
+    #     print(f"Q_lim: {q_lim}")
+    #     print(f"MC: {mc[-1]}")
+    #     print(f"AN: {analytic[-1]}")
+    #
+    # analytic = np.array(analytic)
+    # mc = np.array(mc)
+    #
+    # print(f"Mean: {np.mean(analytic / mc)}")
+    # print(f"Std: {np.std(analytic / mc)}")
+    # plt.hist(analytic / mc, density=True)
+    # plt.show()
+    # print("\n" + "=" * 70)
+    # print("phi_k-separation validation against vegas (Cartesian) ground truth")
+    # print("=" * 70)
+    # validate_phi_separation(
+    #     x=0.01, k_mag=1.2, E=20.0, T=0.35, g=1.8, u_perp=0.4, z0=DELTAZ * 3,
+    #     phi_k_samples=np.linspace(0, 2 * np.pi, 8, endpoint=False),
+    # )
+    #
+    # print("\n" + "=" * 70)
+    # print("phi_k-grid speedup (2-call trick vs. naive per-angle loop)")
+    # print("=" * 70)
+    # run_phi_grid_benchmark(n_points=100, n_phi_k=16, n_radial_panels=12, n_phi=16)

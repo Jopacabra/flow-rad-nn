@@ -5,8 +5,6 @@ Generates a single batch of Sobol-sampled training data for the radiation PINN
 emulator. Designed to be run as a Slurm job array, where each array task writes
 an independent HDF5 file. Merge outputs afterwards with merge.py.
 
-Integration and physical model are identical to generate_training_data.py.
-
 Usage (standalone):
     python generate_sobol_batch.py --batch-id 0 --n-points 4096 --n-workers 8
 
@@ -21,7 +19,8 @@ import h5py
 from pathlib import Path
 from scipy.stats import qmc
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from integration import integrate_point, SOFT_PIDS
+from integration import integrate_point_analytic_z_t234_brutemc_t1 as integrate_point
+from integration import SOFT_PIDS
 
 
 # ==============================================================================
@@ -37,13 +36,12 @@ HBARC = 0.197327  # GeV·fm
 # zf is hardcoded as z0 + 0.1/HBARC
 PARAM_RANGES = [
     (0.01, 0.99),   # x
-    (-5.0, 5.0),    # kx  (GeV)
-    (0.0,  5.0),    # ky  (GeV)
+    (0, 5.0),    # k_perp  (GeV)
+    (0.0,  2*np.pi),    # k_phi  (rad)
     (1.0,  100.0),  # E   (GeV)
     (0.0,  50.0),   # z0  (invGeV)  # Up to 10 fmish
     (0.0,  0.99),   # u_perp
-    (0.150, 0.650), # T   (GeV)
-    (1.5,  2.5),    # g
+    (0.3, 1.2), # mu   (GeV)
 ]
 N_DIMS = len(PARAM_RANGES)
 
@@ -56,10 +54,10 @@ DTAU_GEV = 0.1 / HBARC
 # ==============================================================================
 def _worker(task):
     """Integrate one point. Returns (idx, mean, sdev)."""
-    idx, x, kx, ky, E, z0, u_perp, T, g = task
+    idx, x, k_perp, k_phi, E, z0, u_perp, mu = task
     zf = z0 + DTAU_GEV
     try:
-        mean, sdev = integrate_point(x, kx, ky, E, T, g, u_perp, z0, zf)
+        mean, sdev = integrate_point(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
         return idx, mean, sdev
     except Exception as exc:
         print(f"  Warning: integration failed at index {idx}: {exc}", flush=True)
@@ -151,14 +149,13 @@ def run_batch(n_points: int, batch_id: int, n_workers: int, output_file: str):
     Path(output_file).parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(output_file, "w") as f:
         f.create_dataset("x",      data=pts_full[:, 0])
-        f.create_dataset("kx",     data=pts_full[:, 1])
-        f.create_dataset("ky",     data=pts_full[:, 2])
+        f.create_dataset("k_perp",     data=pts_full[:, 1])
+        f.create_dataset("k_phi",     data=pts_full[:, 2])
         f.create_dataset("E",      data=pts_full[:, 3])
         f.create_dataset("z0",     data=pts_full[:, 4])
         f.create_dataset("zf", data=zf_full)  # derived, stored for reference
         f.create_dataset("u_perp", data=pts_full[:, 5])
-        f.create_dataset("T",      data=pts_full[:, 6])
-        f.create_dataset("g",      data=pts_full[:, 7])
+        f.create_dataset("mu",      data=pts_full[:, 6])
         f.create_dataset("I",      data=vals_full)
         f.create_dataset("I_err",  data=errs_full)
         f.create_dataset("weight", data=weights)
