@@ -20,7 +20,6 @@ from pathlib import Path
 from scipy.stats import qmc
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from integration import integrate_analytic_z_t234_brutemc_t1 as integrate_point
-from integration import SOFT_PIDS
 
 
 # ==============================================================================
@@ -163,7 +162,6 @@ def run_batch(n_points: int, batch_id: int, n_workers: int, output_file: str):
         f.attrs["batch_id"]   = batch_id
         f.attrs["n_original"] = n_valid
         f.attrs["n_samples"]  = len(vals_full)
-        f.attrs["soft_pids"]  = SOFT_PIDS
         f.attrs["HBARC"]      = HBARC
         f.attrs["dtau_fm"]    = 0.1
         f.attrs["description"] = (

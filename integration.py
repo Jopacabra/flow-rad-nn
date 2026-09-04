@@ -4,14 +4,8 @@ from pathlib import Path
 
 import numpy as np
 import scipy as sp
-import matplotlib.pyplot as plt
 
 import vegas
-
-# Import medium property functions from plasma_interaction
-ape_dir = str(Path(__file__).resolve().parent.parent)
-sys.path.append(ape_dir)
-from plasma_interaction import rho, mu_DeBye
 
 
 #############
@@ -20,10 +14,8 @@ from plasma_interaction import rho, mu_DeBye
 _EPS_OMEGA = 1e-6  # threshold for small-argument Taylor fallback (avoids inf*0 / Ci(0) issues)
 
 HBARC = 0.1973269804  # GeV * fm
-NC = 3  # Number of colors
-SOFT_PIDS = [1, -1, 2, -2, 3, -3, 21]  # Soft parton species for rho0 summation
 
-# High accuracy, moderately slow
+# High accuracy, slow
 NITN_WARMUP = 10  # Iterations for the MC integrators during "warmup"
 NITN = 50  # Number of iterations for actual integration
 NEVAL = 10000  # Number of evaluations for integration
@@ -36,22 +28,6 @@ MCADAPT = True  # Whether to do grid adaptation -- negligible overhead, helps ac
 # MCADAPT = False  # Whether to do grid adaptation -- negligible overhead, helps accuracy
 
 MCADAPT_GRIDS = False  # Whether to do grid adaptation evaluating on a grid -- Outliers ruin the grid!
-
-DELTAZ = 0.1 / HBARC  # Fixed pathlength where applicable
-
-
-###########################
-# Medium property helpers #
-###########################
-def compute_rho0(T: float) -> float:
-    rho0 = 0.0
-    for pid in SOFT_PIDS:
-        rho0 += rho(T, soft_pid=pid)
-    return rho0
-
-
-def compute_mu(T: float, g: float) -> float:
-    return mu_DeBye(T, g=g)
 
 
 #####################
@@ -870,7 +846,7 @@ def print_benchmark_report(results, reference="vegas t1 + a/e t234 + analytic z 
 
 
 def run_grid_benchmark(N_x=10, N_k_perp=10, N_k_phi=16, seed=0,
-                        E=20.0, mu=0.7, u_perp=0.3, deltaz=DELTAZ):
+                        E=20.0, mu=0.7, u_perp=0.3, deltaz=0.5):
     """
     Build the same (x, k_perp, k_phi) grid multiple ways and time each:
       - `get_grid_harmonics`: analytic k_phi decomposition/reconstruction.
