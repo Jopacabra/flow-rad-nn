@@ -440,65 +440,6 @@ def t4_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_max):
     return analytic * q_integral * z_integral
 
 
-##################################################
-# Single Point Integration Functions, Per Method #
-##################################################
-def integrate_point_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
-    """Integrate a single parameter point using brute force MC method w/ VEGAS+."""
-    q_lim = np.sqrt(3 * E * mu)
-    region = [(0, q_lim), (0, 2*np.pi), (z0, zf)]
-
-    integ    = vegas.Integrator(region)
-    integrand = make_batch_integrand_brutemc(x, k_perp, k_phi, E, mu, u_perp)
-
-    if NITN_WARMUP: integ(integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
-    result = integ(integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
-
-    return result.mean, result.sdev
-
-
-def integrate_point_analytic_z_brutemc_t1234(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
-    """
-    Integrate a single parameter point using brute force MC method w/ VEGAS+.
-    Apply analytic z integration.
-    Perform brute force VEGAS+ integration of t1, t2, t3, & t4
-    """
-    q_lim = np.sqrt(3 * E * mu)
-    region = [(0, q_lim), (0, 2*np.pi)]
-
-    integ    = vegas.Integrator(region)
-    integrand = make_batch_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
-
-    if NITN_WARMUP: integ(integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
-    result = integ(integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
-
-    return result.mean, result.sdev
-
-
-def integrate_point_analytic_z_t234_brutemc_t1(x, k_perp, k_phi, E, mu, u_perp, z0, zf):
-    """
-    Integrate a single parameter point using brute force MC method w/ VEGAS+.
-    Apply analytic z integration.
-    Perform brute force VEGAS+ integration of t1
-    Perform analytic t2 q integration
-    Perform numerical q integration of t3 & t4 using elliptic integral expressions
-    """
-    q_lim = np.sqrt(3 * E * mu)
-    region = [(0, q_lim), (0, 2*np.pi)]
-
-    integ    = vegas.Integrator(region)
-    integrand = make_batch_t1_integrand_analytic_z_mc(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
-
-    if NITN_WARMUP: integ(integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=MCADAPT)
-    t1_result = integ(integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT)
-
-    t2_result = t2_analytic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
-    t3_result = t3_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
-    t4_result = t4_elliptic(x, k_perp, k_phi, E, mu, u_perp, z0, zf, q_lim)
-
-    return t1_result.mean + t2_result + t3_result + t4_result, t1_result.sdev
-
-
 ##############################################
 # Reusable Integrand Integrators, Per Method #
 ##############################################
