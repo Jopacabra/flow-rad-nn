@@ -31,9 +31,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 ape_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.append(ape_dir)
 
-from integration import integrate_point_analytic_z_t234_brutemc_t1 as integrate_point
-from train_radiation_nn import RadiationEmulatorInference
 from integration import integrate_analytic_z_t234_brutemc_t1 as integrate_point
+from radiation_nn import RadiationEmulatorInference
 
 # ==============================================================================
 # Defaults

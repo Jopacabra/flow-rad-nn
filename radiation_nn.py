@@ -1,5 +1,5 @@
 """
-train_radiation_nn.py
+radiation_nn.py
 
 Trains a neural network emulator for the medium-induced radiation intensity
 distribution using precomputed training data.
@@ -12,7 +12,7 @@ Features:
 - Saves trained model for deployment
 
 Usage:
-    python train_radiation_nn.py                    # Train the model
+    python radiation_nn.py                    # Train the model
 """
 
 import argparse
