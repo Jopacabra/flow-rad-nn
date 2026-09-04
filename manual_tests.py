@@ -7,7 +7,7 @@ Diagnostic plots to understand model performance.
 import numpy as np
 import h5py
 import matplotlib.pyplot as plt
-from train_radiation_nn import RadiationEmulatorInference
+from radiation_nn import RadiationEmulatorInference
 
 
 def check_training_data(data_file="radiation_training_data.h5"):
