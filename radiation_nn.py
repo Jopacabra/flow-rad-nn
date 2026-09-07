@@ -153,7 +153,7 @@ class RadiationDataset(Dataset):
     """
 
     # Get feature names as we should find in the data files
-    RAW_FEATURE_NAMES = ['x', 'kx', 'ky', 'E', 'z0', 'u_perp', 'T', 'g', 'mu', 'k_perp', 'k_phi']
+    RAW_FEATURE_NAMES = ['x', 'E', 'z0', 'u_perp', 'T', 'g', 'mu', 'k_perp', 'k_phi']
 
     # Get the input feature names and number of features
     FEATURE_NAMES = list(compute_input_features(x=np.array([]), k_perp=np.array([]), E=np.array([]), z0=np.array([]),
