@@ -1218,9 +1218,9 @@ class RadiationEmulatorInference:
 
     def predict_harmonics_raw(self, inputs: np.ndarray) -> np.ndarray:
         """
-        Fast entry-point for pre-stacked (N, 7) float32 arrays in feature
-        order [x, k_perp, E, z0, u_perp, T, g]. Returns physical (N, 3)
-        array of (A0, A1, A2) harmonic amplitudes (phi not yet applied).
+        Fast entry-point for pre-stacked (N, 6) float32 arrays in feature
+        order [x, k_perp, E, z0, u_perp, mu]. Returns physical (N, 3)
+        array of (A0, A1, A2) harmonic amplitudes.
         """
         # Find the indices of the names features we want
         IDX_X = RadiationDataset.FEATURE_NAMES.index('x')
@@ -1275,12 +1275,10 @@ class RadiationEmulatorInference:
                              E: float,
                              z0: float,
                              u_perp: float,
-                             T: float,
-                             g: float,
+                             mu: float,
                              x_values: np.ndarray,
                              k_perp_values: np.ndarray,
                              phi_values: np.ndarray,
-                             mu: float,
                              ) -> (np.ndarray):
         """
         Computes a complete grid of (1/CR) dN/(dx d^2k_perp) shaped as (k_perp, phi, x).
