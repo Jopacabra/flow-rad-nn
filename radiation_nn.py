@@ -151,6 +151,13 @@ class RadiationDataset(Dataset):
     self.w_data : np.ndarray, shape (N_valid,),   float32   -- importance weights
     self.phi_data : np.ndarray, shape (N_valid,), float32   -- phi values for loss computation
     """
+    # Get the NN input feature names and number of features
+    FEATURE_NAMES = list(
+        compute_input_features(x=np.array([]), k_perp=np.array([]), E=np.array([]), z0=np.array([]),
+                               u_perp=np.array([]), mu=np.array([])).keys())
+    N_FEATURES = len(FEATURE_NAMES)
+    print(f"  Using {N_FEATURES} features for NN input:")
+    print(f"    {FEATURE_NAMES}")
 
     def __init__(
             self,
@@ -175,14 +182,6 @@ class RadiationDataset(Dataset):
             self.RAW_FEATURE_NAMES = sorted(key for key in f.keys() if isinstance(f[key], h5py.Dataset))
             print(f"  Found {len(self.RAW_FEATURE_NAMES)} features in dataset:")
             print(f"    {self.RAW_FEATURE_NAMES}")
-
-            # Get the NN input feature names and number of features
-            self.FEATURE_NAMES = list(
-                compute_input_features(x=np.array([]), k_perp=np.array([]), E=np.array([]), z0=np.array([]),
-                                       u_perp=np.array([]), mu=np.array([])).keys())
-            self.N_FEATURES = len(self.FEATURE_NAMES)
-            print(f"  Using {self.N_FEATURES} features for NN input:")
-            print(f"    {self.FEATURE_NAMES}")
 
             n_raw = int(f['I'].shape[0])
             print(f"  Reading {n_raw:,} rows from HDF5 ...")
@@ -496,9 +495,6 @@ def compute_loss(
         X_std: torch.Tensor,
         y_mean: float,
         y_std: float,
-        IDX_X: int,
-        IDX_K_PERP: int,
-        IDX_E: int
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute weighted MSE loss with physics constraints.
@@ -509,6 +505,12 @@ def compute_loss(
 
     Returns total loss and dictionary of individual loss components.
     """
+    # Find indices of physical features
+    names = RadiationDataset.FEATURE_NAMES
+    IDX_X = names.index('x')
+    IDX_K_PERP = names.index('k_perp')
+    IDX_E = names.index('E')
+
     # Get head outputs and compute predicted values at phi points
     A_heads = model(inputs)  # (B, 3)
     x_phys = inputs[:, IDX_X] * X_std[IDX_X] + X_mean[IDX_X]
@@ -655,14 +657,7 @@ def train_epoch(
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        names = dataloader.dataset.ds.FEATURE_NAMES
-        # Find the indices of the names features we want
-        IDX_X = names.index('x')
-        IDX_K_PERP = names.index('k_perp')
-        IDX_E = names.index('E')
-
-        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
-                                        IDX_X, IDX_K_PERP, IDX_E)
+        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
         loss.backward()
         optimizer.step()
 
@@ -702,13 +697,7 @@ def validate(
             weights = weights.to(config.device)
 
             # Compute loss
-            names = dataloader.dataset.ds.FEATURE_NAMES
-            IDX_X = names.index('x')
-            IDX_K_PERP = names.index('k_perp')
-            IDX_E = names.index('E')
-
-            _, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
-                                         IDX_X, IDX_K_PERP, IDX_E)
+            _, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
 
             # Add to running sum of loss and MSE
             total_loss += components['total']
@@ -1417,12 +1406,7 @@ def find_learning_rate(
         weights = weights.to(config.device)
 
         optimizer.zero_grad()
-        names = dataloader.dataset.ds.FEATURE_NAMES
-        IDX_X = names.index('x')
-        IDX_K_PERP = names.index('k_perp')
-        IDX_E = names.index('E')
-        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
-                                        IDX_X, IDX_K_PERP, IDX_E)
+        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
         loss.backward()
         optimizer.step()
 
