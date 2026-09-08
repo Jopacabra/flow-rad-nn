@@ -477,6 +477,24 @@ def integrate_analytic_z_t234_brutemc_t1(x, k_perp, k_phi, E, mu, u_perp, z0, zf
     return t1_result.mean + t2_result + t3_result + t4_result, t1_result.sdev
 
 
+def integrate_analytic_z_brutemc_t1(x, k_perp, k_phi, E, mu, u_perp, z0, zf, adapt=MCADAPT):
+    """
+    Integrate a single parameter point using brute force MC method w/ VEGAS+ for t1,
+    with analytic/elliptic solutions for t2, t3, t4.
+    """
+    _t1_only_obj.set_params(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+    q_lim = _t1_only_obj.q_lim
+
+    if NITN_WARMUP: _INTEG_2D_T1(_t1_only_integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=adapt)
+    t1_result = _INTEG_2D_T1(_t1_only_integrand, nitn=NITN, neval=NEVAL, adapt=adapt)
+
+    return t1_result.mean, t1_result.sdev
+
+
+#############################################
+# Helper Functions for Fast Grid Evaluation #
+#############################################
+
 def _direct_compute_harmonics(
         x,
         k_perp,
