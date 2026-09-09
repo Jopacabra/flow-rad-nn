@@ -51,7 +51,7 @@ class TrainingConfig:
     """
 
     # Data
-    data_file: str = "data/radiation_training_data.h5"
+    data_file: str = "data/sobol_batch_0002.h5"
     train_fraction: float = 0.8
     transform: str = "arcsinh"
     transform_f0: float | None = None  # Scale for transformation, if applicable. None uses std of y_data.
@@ -205,7 +205,7 @@ class RadiationDataset(Dataset):
 
         phi_raw = raw_cols['k_phi']
 
-        # Compute the input paramter dictionary
+        # Compute the input parameter dictionary
         X_raw_dict = compute_input_features(raw_cols['x'], raw_cols['k_perp'], raw_cols['E'], raw_cols['z0'],
             raw_cols['u_perp'], raw_cols['mu'])
 
@@ -271,7 +271,7 @@ class RadiationDataset(Dataset):
         if self.transform == "arcsinh":
             return np.arcsinh(y / self.f0).astype(np.float32)
         elif self.transform == "log":
-            return (np.sign(y) * np.log(np.abs(y) + self.epsilon)).astype(np.float32)
+            return (np.sign(y / self.f0) * np.log(np.abs(y / self.f0) + self.epsilon)).astype(np.float32)
         return y.astype(np.float32)
 
     # ------------------------------------------------------------------
@@ -424,6 +424,14 @@ class RadiationEmulator(nn.Module):
         # convention as the arcsinh transform used on the training targets).
         self.output_layer = nn.Linear(hidden_dim, 3)
 
+        # Learnable per-head output scale, in the same units as f0 (i.e. the
+        # physical amplitude is head_scale * f0 * sinh(raw)). Initialized to 1.0
+        # so that at initialization -- with raw ~ O(1) from Xavier init -- the
+        # head's behavior matches a plain linear layer (sinh(z) ~ z for small z).
+        # Training is then free to learn a different per-head scale if A0, A1, A2
+        # have substantially different typical magnitudes.
+        self.head_scale = nn.Parameter(torch.ones(3))
+
         # Initialize weights
         self._init_weights()
 
@@ -450,6 +458,8 @@ class RadiationEmulator(nn.Module):
         torch.Tensor
             Output tensor of shape (batch_size, 3): (A0, A1, A2) harmonic
             amplitudes, in units of 1/f0 (physical amplitude = output * f0).
+            Internally computed as head_scale * sinh(raw_output) per head, so
+            large-magnitude harmonics don't require large upstream weights.
         """
         # Input layer
         h = self.input_act(self.input_layer(x))
@@ -463,13 +473,30 @@ class RadiationEmulator(nn.Module):
             if i % 2 == 1:  # End of block: add saved block input
                 h = h + h_block_in
 
-        # Output layer
-        return self.output_layer(h)
+        # Output layer: raw pre-activation, then per-head sinh reparametrization.
+        # This lets each head reach large physical magnitudes (sinh grows without
+        # bound) while keeping the preceding linear layer's weights/pre-activations
+        # in a comfortable O(1) range -- avoiding the poor conditioning that would
+        # result from a plain linear layer needing very large weights directly.
+        raw = self.output_layer(h)  # (B, 3), expected O(1) at init
+        return self.head_scale * torch.sinh(raw)  # (B, 3), physical units of 1/f0
 
 
 # ==============================================================================
 # Training utilities
 # ==============================================================================
+def apply_output_transform(y_over_f0: torch.Tensor, transform: str, epsilon: float = 1e-10):
+    """
+    Shared forward transform, usable both on raw numpy target data (with f0-scaling
+    baked in via y/f0) and on the network's combined harmonic prediction.
+    """
+    if transform == "arcsinh":
+        return torch.arcsinh(y_over_f0)
+    elif transform == "log":
+        return torch.sign(y_over_f0) * torch.log(torch.abs(y_over_f0) + epsilon)
+    return y_over_f0
+
+
 def combine_harmonics(A_heads: torch.Tensor, phi: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
     Reconstruct I/f0 = A0 + A1*cos(phi) + A2*cos(2*phi) from the 3 network heads.
@@ -495,6 +522,7 @@ def compute_loss(
         X_std: torch.Tensor,
         y_mean: float,
         y_std: float,
+        transform: str,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute weighted MSE loss with physics constraints.
@@ -512,10 +540,14 @@ def compute_loss(
     IDX_E = names.index('E')
 
     # Get head outputs and compute predicted values at phi points
+    """
+    Because we perform the same forward transform on the training data and NN outputs, the NN is training to directly
+    output the pre-transformed values, normalized by f0.
+    """
     A_heads = model(inputs)  # (B, 3)
     x_phys = inputs[:, IDX_X] * X_std[IDX_X] + X_mean[IDX_X]
     I_over_f0_pred = combine_harmonics(A_heads, phi, x_phys)
-    pred_transformed = torch.arcsinh(I_over_f0_pred)
+    pred_transformed = apply_output_transform(I_over_f0_pred, config.transform)
     predictions = (pred_transformed - y_mean) / y_std
 
     """
@@ -657,7 +689,8 @@ def train_epoch(
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
+        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
+                                        config.transform)
         loss.backward()
         optimizer.step()
 
@@ -697,7 +730,8 @@ def validate(
             weights = weights.to(config.device)
 
             # Compute loss
-            _, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
+            _, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
+                                        config.transform)
 
             # Add to running sum of loss and MSE
             total_loss += components['total']
@@ -1404,7 +1438,8 @@ def find_learning_rate(
         weights = weights.to(config.device)
 
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std)
+        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
+                                        config.transform)
         loss.backward()
         optimizer.step()
 
