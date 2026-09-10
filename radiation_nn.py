@@ -59,7 +59,7 @@ class TrainingConfig:
     data_file: str = "data/sobol_batch_0002.h5"
     train_fraction: float = 0.8
     transform: str = "arcsinh"
-    transform_f0: float | None = None  # Scale for transformation, if applicable. None uses std of y_data.
+    transform_f0: float | None = None  # Scale for transformation, if applicable. None uses small % of data
 
     # Architecture
     hidden_dim: int = 256
@@ -123,14 +123,14 @@ def compute_input_features(x: np.ndarray, k_perp: np.ndarray, E: np.ndarray, z0:
     # Create dictionary
     input_dict = {
         'x': x,
-        'k_perp': k_perp,
-        'E': E,
+        'ln(k_perp)': np.log(k_perp),
+        'ln(E)': np.log(E),
         'z0': z0,
         'u_perp': u_perp,
         'mu': mu,
-        'omega_k_dz': omega_k_dz,
-        'omega_k_midz': omega_k_midz,
-        'omega_width': omega_width,
+        'arcsinh(omega_k_dz)': np.arcsinh(omega_k_dz),
+        'arcsinh(omega_k_midz)': np.arcsinh(omega_k_midz),
+        'arcsinh(omega_width)': np.arcsinh(omega_width),
     }
 
     return input_dict
@@ -259,7 +259,7 @@ class RadiationDataset(Dataset):
 
         # Transform input data
         if config.transform_f0 is None:
-            self.f0 = float(np.std(self.A0_data))
+            self.f0 = np.percentile(np.abs(self.A0_data[self.A0_data != 0]), 1)
         else:
             self.f0 = float(config.transform_f0)
         A0_t = self._transform_y(self.A0_data)
@@ -373,12 +373,11 @@ class Normalization:
 # Neural Network Model
 # ==============================================================================
 class RadiationEmulator(nn.Module):
-    # Clamp value for raw outputs to avoid overflow in sinh transform
-    RAW_CLAMP = 25.0  # float32 overflow @ sinh(~88.7)
-
-    # Fixed feature indices needed for the envelope (static, not dataset-dependent)
-    IDX_K_PERP = RadiationDataset.FEATURE_NAMES.index('k_perp')
+    # Fixed feature indices needed for the envelope
+    IDX_K_PERP = RadiationDataset.FEATURE_NAMES.index('ln(k_perp)')
     IDX_MU     = RadiationDataset.FEATURE_NAMES.index('mu')
+    IDX_X = RadiationDataset.FEATURE_NAMES.index('x')
+    IDX_E = RadiationDataset.FEATURE_NAMES.index('ln(E)')
 
     def __init__(
             self,
@@ -423,8 +422,7 @@ class RadiationEmulator(nn.Module):
         # convention as the arcsinh transform used on the training targets).
         self.output_layer = nn.Linear(hidden_dim, 2)
 
-        # Learnable per-head output scale, in the same units as f0 (i.e. the
-        # physical amplitude is head_scale * f0 * sinh(raw)). Initialized to 1.0
+        # Learnable per-head output scale, in the same units as f0 Initialized to 1.0
         # so that at initialization -- with raw ~ O(1) from Xavier init -- the
         # head's behavior matches a plain linear layer (sinh(z) ~ z for small z).
         # Training is then free to learn a different per-head scale if A0, A1, A2
@@ -432,17 +430,14 @@ class RadiationEmulator(nn.Module):
         self.head_scale = nn.Parameter(torch.ones(2))
 
         # Learnable UV shape parameters
-        self.raw_p = nn.Parameter(torch.zeros(2))  # one exponent per head (A0, A1)
-        self.raw_k0_scale = nn.Parameter(torch.zeros(2))  # transition scale, in units of mu
+        self.raw_p = nn.Parameter(torch.full((2,), -3.0))  # one exponent per head (A0, A1)
+        target_k0_over_mu = math.sqrt(10) / 0.4
+        init_val = math.log(math.exp(target_k0_over_mu) - 1.0)  # invert softplus
+        self.raw_k0_scale = nn.Parameter(torch.full((2,), init_val))
 
         self.P_MIN, self.P_MAX = 1.0, 8.0  # decay rate is *guaranteed* to be at least k_perp^{P_MIN}
 
-        # --- Normalization buffers -------------------------------------
-        # Registered with placeholder values so the model is constructible
-        # (and forward()-able as an identity-ish map) before set_normalization()
-        # is called. Real values are filled in via set_normalization() right
-        # after the dataset is scanned, and are then saved/restored automatically
-        # as part of state_dict() -- no separate JSON needed.
+        # Normalization buffers -- initialized with something close to an identity normalization
         self.register_buffer('X_mean', torch.zeros(input_dim))
         self.register_buffer('X_std',  torch.ones(input_dim))
         self.register_buffer('y_mean', torch.zeros(2))   # (A0, A1, A2)
@@ -485,36 +480,41 @@ class RadiationEmulator(nn.Module):
             if i % 2 == 1:
                 h = h + h_block_in
 
-        # Raw logits
-        raw = self.output_layer(h)                          # (B, 2)
-        # clamped = self.RAW_CLAMP * torch.tanh(raw / self.RAW_CLAMP)
-        # clamped_head_scale = torch.clamp(self.head_scale, min=-100.0, max=100.0)
-        # residual_over_f0 = clamped_head_scale * torch.sinh(clamped) # unconstrained, units of 1/f0
+        raw = self.output_layer(h)  # (B, 2)
 
-        k_perp = x_norm[:, self.IDX_K_PERP] * self.X_std[self.IDX_K_PERP] + self.X_mean[self.IDX_K_PERP]
+        E = torch.exp(x_norm[:, self.IDX_E] * self.X_std[self.IDX_E] + self.X_mean[self.IDX_E])
+        x = x_norm[:, self.IDX_X] * self.X_std[self.IDX_X] + self.X_mean[self.IDX_X]
+        k_perp = torch.exp(x_norm[:, self.IDX_K_PERP] * self.X_std[self.IDX_K_PERP] + self.X_mean[self.IDX_K_PERP])
         mu = x_norm[:, self.IDX_MU] * self.X_std[self.IDX_MU] + self.X_mean[self.IDX_MU]
 
-        # Bounded residual -- this is the key change vs. before
-        residual_over_f0 = self.head_scale * torch.tanh(raw)
+        # Soft-clamp on the "z-space" raw output -- normalized+transformed
+        Z_CLAMP = 25.0  # Tuning this parameter is extremely important for not clipping huge vals at small x !!!
+        raw_z = Z_CLAMP * torch.tanh(raw / Z_CLAMP)  # (B, 2), safely bounded, good gradients
 
-        # Learnable exponent, bounded away from 0 and from blowing up
+        # Learnable exponent, bounded by P_MIN and P_MAX
         p = self.P_MIN + (self.P_MAX - self.P_MIN) * torch.sigmoid(self.raw_p)  # (2,)
 
-        # Learnable transition scale, anchored near mu but allowed to drift
-        k0 = mu.unsqueeze(-1) * torch.nn.functional.softplus(self.raw_k0_scale)  # (B, 2)
+        # Learnable transition scale -- anchored comfortably above ((Min[x^2, (1-x)^2]  * E^2) - mu^2),
+        # near the physical UV threshold -- at which the envelope really starts to squeeze.
+        k0 = (((torch.minimum(x.unsqueeze(-1)**2, (1-x.unsqueeze(-1))**2) * E.unsqueeze(-1)**2) - mu.unsqueeze(-1)**2)
+              * torch.nn.functional.softplus(self.raw_k0_scale))  # (B, 2)
 
-        log_ratio_sq = torch.log1p((k_perp.unsqueeze(-1) / k0) ** 2)  # numerically stable
-        log_envelope = -0.5 * p * log_ratio_sq
-        envelope = torch.exp(log_envelope)  # (B, 2), monotone decay in k_perp
+        # Envelope enforcing power law decay
+        log_ratio_sq = torch.log1p((k_perp.unsqueeze(-1) / k0) ** 2)
+        log_envelope = -0.5 * p * log_ratio_sq  # <= 0, monotone decay in k_perp, in NATS
 
-        phys_over_f0 = envelope * residual_over_f0
-        z = apply_output_transform(phys_over_f0, transform=self.transform)
+        # Additive combination in z-space
+        z = raw_z + log_envelope  # No head scale effect -- quick comparison preferred no head scaling
+        # z = raw_z + self.head_scale.unsqueeze(0) + log_envelope  # Include head scale effect
 
-        # Debug prints
-        # print(f"raw: {raw}")
-        # print(f"envelope: {envelope}")
-        # print(f"residual_over_f0: {residual_over_f0}")
-        # print(f"z: {z}")
+        # Some debug prints
+        # with torch.no_grad():
+        #     frac_saturated = (raw_z.abs() > 0.95 * Z_CLAMP).float().mean()
+        #     print(f"  clamp saturation frac: {frac_saturated:.3f}  "
+        #           f"k0: {(k0).mean():.3f}  "
+        #           f"k0 param: {(self.raw_k0_scale):.3f}  "
+        #           f"p: {p.tolist()}")
+
         return (z - self.y_mean) / self.y_std
 
 # ==============================================================================
@@ -575,22 +575,28 @@ def compute_loss(
     """
     # Find indices of physical features
     names = RadiationDataset.FEATURE_NAMES
-    IDX_X = names.index('x')
-    IDX_K_PERP = names.index('k_perp')
-    IDX_E = names.index('E')
+    IDX_K_PERP = names.index('ln(k_perp)')
+    IDX_E = names.index('ln(E)')
 
     """
     Weighted MSE loss
     """
     # Get head outputs and compute MSE per each
     NN_heads = model(inputs)  # (B, 2)
-    x_phys = inputs[:, IDX_X] * model.X_std[IDX_X] + model.X_mean[IDX_X]
     NN_A0 = NN_heads[:, 0]
     NN_A1 = NN_heads[:, 1]
 
     # Notice no transformation of model output -- training for raw model output in transformed and normalized space
     A0_mse = (weights * (NN_A0 - A0_targets) ** 2).mean()
     A1_mse = (weights * (NN_A1 - A1_targets) ** 2).mean()
+
+    # accumulate residuals and x per point
+    # A0_res2 = (NN_A0 - A0_targets) ** 2
+    # A1_res2 = (NN_A1 - A1_targets) ** 2
+    # for lo, hi in zip([0], [1]):
+    #     mask = (x_phys >= lo) & (x_phys < hi)
+    #     print(f"x∈[{lo:.1e},{hi:.1e}): A0 frac of loss = {A0_res2[mask].sum() / A0_res2.sum():.3f}")
+    #     print(f"x∈[{lo:.1e},{hi:.1e}): A1 frac of loss = {A1_res2[mask].sum() / A1_res2.sum():.3f}")
 
     # Debug prints
     # print(f"x: {x_phys}")
@@ -623,7 +629,7 @@ def compute_loss(
 
         E_mean = model.X_mean[IDX_E].to(device)
         E_std = model.X_std[IDX_E].to(device)
-        energy_params = (uv_params[:, IDX_E] * E_std + E_mean).cpu().numpy()
+        energy_params = np.pow(10, (uv_params[:, IDX_E] * E_std + E_mean).cpu().numpy())
 
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
         log_k = []
@@ -643,11 +649,12 @@ def compute_loss(
         phys[:, IDX_K_PERP] = k_perp_uv
 
         # Recompute the k_perp-dependent derived features consistently
-        IDX_X, IDX_E, IDX_Z0 = names.index('x'), names.index('E'), names.index('z0')
-        x_p, E_p, z0_p = phys[:, IDX_X], phys[:, IDX_E], phys[:, IDX_Z0]
+        IDX_X, IDX_E, IDX_Z0 = names.index('x'), names.index('ln(E)'), names.index('ln(z0)')
+        x_p, E_p, z0_p = phys[:, IDX_X], torch.exp(phys[:, IDX_E]), torch.exp(phys[:, IDX_Z0])
         mu_p = phys[:, names.index('mu')]
+        k_perp_p = torch.exp(phys[:, IDX_K_PERP])
         DELTA_Z = 0.1 / 0.197327
-        omega_k = phys[:, IDX_K_PERP] ** 2 / (2 * x_p * E_p)
+        omega_k = k_perp_p ** 2 / (2 * x_p * E_p)
         phys[:, names.index('omega_k_dz')] = omega_k * DELTA_Z / 2
         phys[:, names.index('omega_k_midz')] = omega_k * (z0_p + DELTA_Z / 2)
         phys[:, names.index('omega_width')] = mu_p ** 2 * DELTA_Z / (2 * x_p * E_p)
