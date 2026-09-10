@@ -431,6 +431,12 @@ class RadiationEmulator(nn.Module):
         # have substantially different typical magnitudes.
         self.head_scale = nn.Parameter(torch.ones(2))
 
+        # Learnable UV shape parameters
+        self.raw_p = nn.Parameter(torch.zeros(2))  # one exponent per head (A0, A1)
+        self.raw_k0_scale = nn.Parameter(torch.zeros(2))  # transition scale, in units of mu
+
+        self.P_MIN, self.P_MAX = 1.0, 8.0  # decay rate is *guaranteed* to be at least k_perp^{P_MIN}
+
         # --- Normalization buffers -------------------------------------
         # Registered with placeholder values so the model is constructible
         # (and forward()-able as an identity-ish map) before set_normalization()
@@ -479,17 +485,29 @@ class RadiationEmulator(nn.Module):
             if i % 2 == 1:
                 h = h + h_block_in
 
+        # Raw logits
         raw = self.output_layer(h)                          # (B, 2)
-        clamped = self.RAW_CLAMP * torch.tanh(raw / self.RAW_CLAMP)
-        clamped_head_scale = torch.clamp(self.head_scale, min=-100.0, max=100.0)
-        residual_over_f0 = clamped_head_scale * torch.sinh(clamped) # unconstrained, units of 1/f0
+        # clamped = self.RAW_CLAMP * torch.tanh(raw / self.RAW_CLAMP)
+        # clamped_head_scale = torch.clamp(self.head_scale, min=-100.0, max=100.0)
+        # residual_over_f0 = clamped_head_scale * torch.sinh(clamped) # unconstrained, units of 1/f0
 
         k_perp = x_norm[:, self.IDX_K_PERP] * self.X_std[self.IDX_K_PERP] + self.X_mean[self.IDX_K_PERP]
-        mu     = x_norm[:, self.IDX_MU]     * self.X_std[self.IDX_MU]     + self.X_mean[self.IDX_MU]
+        mu = x_norm[:, self.IDX_MU] * self.X_std[self.IDX_MU] + self.X_mean[self.IDX_MU]
 
-        envelope = (1.0 + (k_perp / mu) ** 2).pow(-2)        # (B,)
-        phys_over_f0 = envelope.unsqueeze(-1) * residual_over_f0
+        # Bounded residual -- this is the key change vs. before
+        residual_over_f0 = self.head_scale * torch.tanh(raw)
 
+        # Learnable exponent, bounded away from 0 and from blowing up
+        p = self.P_MIN + (self.P_MAX - self.P_MIN) * torch.sigmoid(self.raw_p)  # (2,)
+
+        # Learnable transition scale, anchored near mu but allowed to drift
+        k0 = mu.unsqueeze(-1) * torch.nn.functional.softplus(self.raw_k0_scale)  # (B, 2)
+
+        log_ratio_sq = torch.log1p((k_perp.unsqueeze(-1) / k0) ** 2)  # numerically stable
+        log_envelope = -0.5 * p * log_ratio_sq
+        envelope = torch.exp(log_envelope)  # (B, 2), monotone decay in k_perp
+
+        phys_over_f0 = envelope * residual_over_f0
         z = apply_output_transform(phys_over_f0, transform=self.transform)
 
         # Debug prints
