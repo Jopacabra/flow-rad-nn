@@ -287,15 +287,25 @@ def make_combined_plot(
         squeeze=False,
     )
 
-    extent = [ky_values[0], ky_values[-1], kx_values[0], kx_values[-1]]
+    mirror = True
+    if mirror:
+        extent = [(-1)*ky_values[-1], ky_values[-1], kx_values[0], kx_values[-1]]
+    else:
+        extent = [ky_values[0], ky_values[-1], kx_values[0], kx_values[-1]]
     imshow_kwargs = dict(
         origin='lower',
-        aspect='auto',
+        aspect='equal',
         extent=extent,
         interpolation='nearest',
     )
 
     for row_idx, (params, I_ref, I_err, I_nn) in enumerate(rows):
+        if mirror:
+            flip_ax = 1
+            I_ref = np.concat((np.flip(I_ref, axis=flip_ax), I_ref), axis=flip_ax)
+            I_err = np.concat((np.flip(I_err, axis=flip_ax), I_err), axis=flip_ax)
+            I_nn = np.concat((np.flip(I_nn, axis=flip_ax), I_nn), axis=flip_ax)
+
         ax_ref, ax_nn, ax_res = axes[row_idx]
 
         # Per-row colour scale
@@ -312,8 +322,17 @@ def make_combined_plot(
         )
         with np.errstate(invalid='ignore', divide='ignore'):
             rel_err = I_err / (np.abs(I_ref) + 1e-30)
+
+        if mirror:
+            flip_ax = 0
+            rel_err = np.concat((np.flip(rel_err, axis=flip_ax), rel_err))
+            plot_kx = np.concat((np.flip(kx_values, axis=flip_ax), kx_values))
+            plot_ky = np.concat((np.flip(ky_values, axis=flip_ax), ky_values))
+        else:
+            plot_kx = kx_values
+            plot_ky = ky_values
         ax_ref.contour(
-            ky_values, kx_values, rel_err,
+            plot_ky, plot_ky, rel_err,
             levels=[0.5], colors='yellow', linewidths=1.0, linestyles='--',
         )
         ax_ref.set_title('Reference (Vegas integrator)\n'
