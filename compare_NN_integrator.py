@@ -416,8 +416,6 @@ def main():
                              '(e.g. --x-values 0.01 0.3 0.7)')
     parser.add_argument('--model-file',
                         type=str, default='data/radiation_emulator.pt')
-    parser.add_argument('--normalization-file',
-                        type=str, default='data/radiation_normalization.json')
     parser.add_argument('--output',  type=str,   default='kxky_comparison.png')
     args = parser.parse_args()
 
@@ -454,7 +452,6 @@ def main():
     print("\nStep 2: Loading NN emulator and predicting")
     emulator = RadiationEmulatorInference(
         model_file=args.model_file,
-        normalization_file=args.normalization_file,
         device='cpu',
     )
     t0 = time.time()

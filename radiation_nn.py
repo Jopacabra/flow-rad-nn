@@ -1,15 +1,20 @@
 """
 radiation_nn.py
 
-Trains a neural network emulator for the medium-induced radiation intensity
-distribution using precomputed training data.
+Trains a neural network emulator to replicate the leading term of the medium-induced radiation intensity distribution
+from a fast probe in a transversely flowing quark gluon plasma using precomputed training data.
+
+The transformations and normalization are specialized to reproduce a huge dynamic range of intensity values while
+keeping weights small. The model architecture incorporates a physics-informed UV power law envelope that sets in
+at large $k_\perp$.
 
 Features:
 - Loads training data from HDF5 file
-- Normalizes inputs and log-transforms outputs
-- Uses importance sampling weights for unbiased training
-- Enforces soft physics constraints
+- Normalizes input parameters to zero mean and unit variance
+- Normalizes input targets to zero mean and unit variance, then transforms input targets
+- Trains NN, enforcing some physics constraints via architecture and loss terms
 - Saves trained model for deployment
+- Provides inference methods to predict radiation intensity distribution from model file
 
 Usage:
     python radiation_nn.py                    # Train the model
@@ -72,8 +77,7 @@ class TrainingConfig:
     # Physics constraints
     lambda_A0: float = 1.0  # Weight for MSE of A0 head
     lambda_A1: float = 1.0  # Weight for MSE of A1 head
-    lambda_uv: float = 1.0  # Weight for UV decay loss term
-    lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
+    lambda_uv: float = 0.0  # Weight for UV decay loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
     # A safe default is 10.0 GeV^2 (kperp > ~3.16 GeV).
@@ -81,7 +85,6 @@ class TrainingConfig:
 
     # Output
     model_file: str = "data/radiation_emulator.pt"
-    normalization_file: str = "data/radiation_normalization.json"
     checkpoint_file: str = "data/radiation_training_checkpoint.pt"  # Resume checkpoint
     checkpoint_interval: int = 1  # Save resume checkpoint every N epochs
 
@@ -370,11 +373,12 @@ class Normalization:
 # Neural Network Model
 # ==============================================================================
 class RadiationEmulator(nn.Module):
-    """
-    Neural network emulator for medium-induced radiation intensity.
+    # Clamp value for raw outputs to avoid overflow in sinh transform
+    RAW_CLAMP = 25.0  # float32 overflow @ sinh(~88.7)
 
-    Architecture: MLP with skip connections every 2 layers.
-    """
+    # Fixed feature indices needed for the envelope (static, not dataset-dependent)
+    IDX_K_PERP = RadiationDataset.FEATURE_NAMES.index('k_perp')
+    IDX_MU     = RadiationDataset.FEATURE_NAMES.index('mu')
 
     def __init__(
             self,
@@ -383,12 +387,14 @@ class RadiationEmulator(nn.Module):
             n_layers: int = 5,
             activation: str = "silu",
             dropout_p: float = 0.1,
+            transform: str = "arcsinh"
     ):
         super().__init__()
 
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
+        self.transform = transform
 
         # Select activation function
         activations = {
@@ -415,7 +421,7 @@ class RadiationEmulator(nn.Module):
         # Output layer -- 3 features: A0, A1, & A2 fourier harmonic factors.
         # Each head predicts the harmonic amplitude scaled by 1/f0 (same scale
         # convention as the arcsinh transform used on the training targets).
-        self.output_layer = nn.Linear(hidden_dim, 3)
+        self.output_layer = nn.Linear(hidden_dim, 2)
 
         # Learnable per-head output scale, in the same units as f0 (i.e. the
         # physical amplitude is head_scale * f0 * sinh(raw)). Initialized to 1.0
@@ -423,9 +429,21 @@ class RadiationEmulator(nn.Module):
         # head's behavior matches a plain linear layer (sinh(z) ~ z for small z).
         # Training is then free to learn a different per-head scale if A0, A1, A2
         # have substantially different typical magnitudes.
-        self.head_scale = nn.Parameter(torch.ones(3))
+        self.head_scale = nn.Parameter(torch.ones(2))
 
-        # Initialize weights
+        # --- Normalization buffers -------------------------------------
+        # Registered with placeholder values so the model is constructible
+        # (and forward()-able as an identity-ish map) before set_normalization()
+        # is called. Real values are filled in via set_normalization() right
+        # after the dataset is scanned, and are then saved/restored automatically
+        # as part of state_dict() -- no separate JSON needed.
+        self.register_buffer('X_mean', torch.zeros(input_dim))
+        self.register_buffer('X_std',  torch.ones(input_dim))
+        self.register_buffer('y_mean', torch.zeros(2))   # (A0, A1, A2)
+        self.register_buffer('y_std',  torch.ones(2))
+        self.register_buffer('f0',      torch.tensor(1.0))
+        self.register_buffer('epsilon', torch.tensor(1e-10))
+
         self._init_weights()
 
     def _init_weights(self):
@@ -436,44 +454,50 @@ class RadiationEmulator(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def set_normalization(self, X_mean, X_std, y_mean, y_std, f0, epsilon=1e-10):
         """
-        Forward pass.
+        Populate normalization buffers from dataset statistics. Call once,
+        right after model construction, before training starts.
 
-        Parameters
-        ----------
-        x : torch.Tensor
-            Input tensor of shape (batch_size, N_FEATURES) with normalized features as defined in
-            `compute_input_features`.
-
-        Returns
-        -------
-        torch.Tensor
-            Output tensor of shape (batch_size, 3): (A0, A1, A2) harmonic
-            amplitudes, in units of 1/f0 (physical amplitude = output * f0).
-            Internally computed as head_scale * sinh(raw_output) per head, so
-            large-magnitude harmonics don't require large upstream weights.
+        y_mean / y_std should be length-3 (A0, A1, A2); pad the unused A2
+        slot with (0.0, 1.0) if you're not training a third head.
         """
-        # Input layer
-        h = self.input_act(self.input_layer(x))
+        self.X_mean.copy_(torch.as_tensor(X_mean, dtype=torch.float32))
+        self.X_std.copy_(torch.as_tensor(X_std,  dtype=torch.float32))
+        self.y_mean.copy_(torch.as_tensor(y_mean, dtype=torch.float32))
+        self.y_std.copy_(torch.as_tensor(y_std,  dtype=torch.float32))
+        self.f0.copy_(torch.as_tensor(f0, dtype=torch.float32))
+        self.epsilon.copy_(torch.as_tensor(epsilon, dtype=torch.float32))
 
-        # Hidden layers with skip connections every 2 layers
+    def forward(self, x_norm: torch.Tensor) -> torch.Tensor:
+        h = self.input_act(self.input_layer(x_norm))
         h_block_in = h
         for i, (layer, act, drop) in enumerate(zip(self.hidden_layers, self.hidden_acts, self.dropouts)):
             if i % 2 == 0:
-                h_block_in = h  # Save block input at the start of each 2-layer block
+                h_block_in = h
             h = drop(act(layer(h)))
-            if i % 2 == 1:  # End of block: add saved block input
+            if i % 2 == 1:
                 h = h + h_block_in
 
-        # Output layer: raw pre-activation, then per-head sinh reparametrization.
-        # This lets each head reach large physical magnitudes (sinh grows without
-        # bound) while keeping the preceding linear layer's weights/pre-activations
-        # in a comfortable O(1) range -- avoiding the poor conditioning that would
-        # result from a plain linear layer needing very large weights directly.
-        raw = self.output_layer(h)  # (B, 3), expected O(1) at init
-        # return self.head_scale * torch.sinh(raw)  # (B, 3), physical units of 1/f0
-        return raw
+        raw = self.output_layer(h)                          # (B, 2)
+        clamped = self.RAW_CLAMP * torch.tanh(raw / self.RAW_CLAMP)
+        clamped_head_scale = torch.clamp(self.head_scale, min=-100.0, max=100.0)
+        residual_over_f0 = clamped_head_scale * torch.sinh(clamped) # unconstrained, units of 1/f0
+
+        k_perp = x_norm[:, self.IDX_K_PERP] * self.X_std[self.IDX_K_PERP] + self.X_mean[self.IDX_K_PERP]
+        mu     = x_norm[:, self.IDX_MU]     * self.X_std[self.IDX_MU]     + self.X_mean[self.IDX_MU]
+
+        envelope = (1.0 + (k_perp / mu) ** 2).pow(-2)        # (B,)
+        phys_over_f0 = envelope.unsqueeze(-1) * residual_over_f0
+
+        z = apply_output_transform(phys_over_f0, transform=self.transform)
+
+        # Debug prints
+        # print(f"raw: {raw}")
+        # print(f"envelope: {envelope}")
+        # print(f"residual_over_f0: {residual_over_f0}")
+        # print(f"z: {z}")
+        return (z - self.y_mean) / self.y_std
 
 # ==============================================================================
 # Training utilities
@@ -491,7 +515,7 @@ def apply_output_transform(y_over_f0: torch.Tensor, transform: str, epsilon: flo
 
 def reverse_output_transform(y_over_f0: torch.Tensor, transform: str, epsilon: float = 1e-10):
     """
-    Shared forward transform
+    Shared reverse transform
     """
     if transform == "arcsinh":
         return torch.sinh(y_over_f0)
@@ -521,7 +545,6 @@ def compute_loss(
         A1_targets: torch.Tensor,
         weights: torch.Tensor,
         config: TrainingConfig,
-        normalization: Normalization,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute weighted MSE loss with physics constraints.
@@ -543,7 +566,7 @@ def compute_loss(
     """
     # Get head outputs and compute MSE per each
     NN_heads = model(inputs)  # (B, 2)
-    x_phys = inputs[:, IDX_X] * normalization.X_std[IDX_X] + normalization.X_mean[IDX_X]
+    x_phys = inputs[:, IDX_X] * model.X_std[IDX_X] + model.X_mean[IDX_X]
     NN_A0 = NN_heads[:, 0]
     NN_A1 = NN_heads[:, 1]
 
@@ -576,12 +599,12 @@ def compute_loss(
         uv_params = inputs[idx].clone()  # (n_uv_samples, 7)
 
         # Unnormalize the whole row back to physical space
-        X_mean = normalization.X_mean.to(device)
-        X_std = normalization.X_std.to(device)
+        X_mean = model.X_mean.to(device)
+        X_std = model.X_std.to(device)
         phys = uv_params * X_std + X_mean  # (n_uv_samples, n_features), physical units
 
-        E_mean = normalization.X_mean[IDX_E].to(device)
-        E_std = normalization.X_std[IDX_E].to(device)
+        E_mean = model.X_mean[IDX_E].to(device)
+        E_std = model.X_std[IDX_E].to(device)
         energy_params = (uv_params[:, IDX_E] * E_std + E_mean).cpu().numpy()
 
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
@@ -624,57 +647,17 @@ def compute_loss(
     else:
         uv_decay = torch.tensor(0.0, device=inputs.device)
 
-    """
-    UV power law behavior enforcement loss
-
-    Enforces A_n(alpha * k_perp) / A_n(k_perp) ~ alpha^{-power} for each head.
-    """
-    if config.lambda_uv_power > 0.0:
-        B = inputs.shape[0]
-        device = inputs.device
-        alpha = 4.0  # scale_factor between compared points -- compare f(k) vs f(scale_factor * k)
-        n_uv_power_law_samples = 64
-        k_perp_base = 2.0  # base UV scale
-        power = 4.0  # expected UV power law exponent
-
-        idx = torch.randint(0, B, (n_uv_power_law_samples,), device=device)
-        base_params = inputs[idx].clone()
-
-        # Randomise k_perp_base point in a moderate UV range
-        k_perp_sample = k_perp_base * torch.exp(
-            torch.empty(n_uv_power_law_samples, device=device).uniform_(0, 3)
-        )
-
-        # Low-k point
-        base_params[:, IDX_K_PERP] = k_perp_sample
-        heads_low = model(base_params)  # (n, 3)
-
-        # High-k point (same direction, same other params)
-        high_params = base_params.clone()
-        high_params[:, IDX_K_PERP] = alpha * k_perp_sample
-        heads_high = model(high_params)  # (n, 3)
-
-        expected_ratio = alpha ** (-power)
-        log_ratio = torch.log(torch.abs(heads_high) + 1e-30) - torch.log(torch.abs(heads_low) + 1e-30)
-        target_log_ratio = torch.full_like(log_ratio, math.log(expected_ratio))
-
-        uv_power_law = nn.functional.mse_loss(log_ratio, target_log_ratio)
-    else:
-        uv_power_law = torch.tensor(0.0, device=inputs.device)
-
     # Total loss
     total_loss = (
             config.lambda_A0 * A0_mse
             + config.lambda_A1 * A1_mse
             + config.lambda_uv * uv_decay
-            + config.lambda_uv_power * uv_power_law
     )
 
     components = {
         'A0_mse': A0_mse.item(),
-        'A1_mse': A0_mse.item(),
+        'A1_mse': A1_mse.item(),
         'uv_decay': uv_decay.item(),
-        'uv_power_law': uv_power_law.item(),
         'total': total_loss.item(),
     }
 
@@ -686,7 +669,6 @@ def train_epoch(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
-        normalization: Normalization,
 ) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
@@ -707,8 +689,12 @@ def train_epoch(
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config, normalization)
+        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config)
+        if not torch.isfinite(loss):
+            print("Non-finite loss detected:", components)
+            raise FloatingPointError("Non-finite loss")
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # clip gradients to avoid feedback from exploding gradients
         optimizer.step()
 
         # Add to running sum of loss and MSE
@@ -727,7 +713,6 @@ def validate(
         model: nn.Module,
         dataloader: DataLoader,
         config: TrainingConfig,
-        normalization: Normalization,
 ) -> Dict[str, float]:
     """Validate the model."""
     model.eval()
@@ -744,7 +729,7 @@ def validate(
             weights = weights.to(config.device)
 
             # Compute loss
-            _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config, normalization)
+            _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config)
 
             # Add to running sum of loss and MSE
             total_loss += components['total']
@@ -896,13 +881,6 @@ def train_model(config: TrainingConfig):
     # Create normalization metadata container
     norm = Normalization.from_dataset(dataset, device=config.device)
 
-    # Save normalization parameters
-    norm_params = dataset.get_normalization_params()
-    if is_main:
-        print("Saving normalization...")
-        with open(config.normalization_file, 'w') as f:
-            json.dump(norm_params, f, indent=2)
-
     # Split on *physical* indices, so each subset gets a
     # contiguous, cache-friendly slice of the underlying arrays.
     n_phys_train = int(dataset.n_valid * config.train_fraction)
@@ -960,7 +938,18 @@ def train_model(config: TrainingConfig):
         n_layers=config.n_layers,
         activation=config.activation,
         dropout_p=config.dropout_p,
+        transform=config.transform,
     ).to(config.device)
+
+    # Set normalization values of model
+    model.set_normalization(
+        X_mean=dataset.X_mean,
+        X_std=dataset.X_std,
+        y_mean=[dataset.A0_mean, dataset.A1_mean],  # 0.0 placeholder for unused A2 head
+        y_std=[dataset.A0_std, dataset.A1_std],
+        f0=dataset.f0,
+        epsilon=dataset.epsilon,
+    )
 
     # Optimizer -- applies various strategies that change the way we use our neurons
     # Controls usage of dropout and L2 regularization to encourage generalization instead of memorization
@@ -1008,7 +997,7 @@ def train_model(config: TrainingConfig):
     if config.run_lr_finder:
         print("\nRunning LR range test...")
         print("-" * 70)
-        lrs, losses, raw_losses = find_learning_rate(model, train_loader, optimizer, config, norm)
+        lrs, losses, raw_losses = find_learning_rate(model, train_loader, optimizer, config)
         suggested_lr = plot_lr_finder(lrs, losses, raw_losses)
         print(f"\nRe-run with --learning-rate {suggested_lr / 3:.2e} (1/3 of suggested)")
         return model, dataset.get_normalization_params()
@@ -1047,10 +1036,10 @@ def train_model(config: TrainingConfig):
                 break
 
             # Train
-            train_metrics = train_epoch(model, train_loader, optimizer, config, norm)
+            train_metrics = train_epoch(model, train_loader, optimizer, config)
 
             # Validate
-            val_metrics = validate(model, val_loader, config, norm)
+            val_metrics = validate(model, val_loader, config)
 
             # Update scheduler
             scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
@@ -1089,7 +1078,9 @@ def train_model(config: TrainingConfig):
                             'activation': config.activation,
                             'input_dim': len(dataset.FEATURE_NAMES),
                             'dropout_p': config.dropout_p,
+                            'transform': config.transform,
                         },
+                        'feature_names': dataset.FEATURE_NAMES,
                         'epoch': epoch,
                         'val_loss': best_val_loss,
                     }, config.model_file)
@@ -1118,7 +1109,6 @@ def train_model(config: TrainingConfig):
     print(f"Training complete!")
     print(f"Best validation loss: {best_val_loss:.4e}")
     print(f"Model saved to: {config.model_file}")
-    print(f"Normalization params saved to: {config.normalization_file}")
 
     # Shutdown our dataset object
     dataset.shutdown()
@@ -1130,54 +1120,7 @@ def train_model(config: TrainingConfig):
 # Inference utilities
 # ==============================================================================
 class RadiationEmulatorInference:
-    """
-    Wrapper for inference with the trained radiation emulator.
-
-    Handles normalization and inverse transforms automatically.
-    """
-
-    FEATURE_NAMES = list(compute_input_features(x=np.array([]), k_perp=np.array([]), E=np.array([]), z0=np.array([]),
-                                                u_perp=np.array([]), mu=np.array([])).keys())
-
-    def __init__(
-            self,
-            model_file: str = "data/radiation_emulator.pt",
-            normalization_file: str = "data/radiation_normalization.json",
-            device: str = "cpu",
-            compile: bool = False,
-            quiet: bool = False,
-    ):
-        """
-        Load trained model and normalization parameters.
-
-        Parameters
-        ----------
-        model_file : str
-            Path to saved model checkpoint
-        normalization_file : str
-            Path to JSON file with normalization parameters
-        device : str
-            Device to run inference on ('cpu' or 'cuda')
-        """
-        self.device = device
-
-        # Load normalization parameters
-        with open(normalization_file, 'r') as f:
-            self.norm_params = json.load(f)
-
-        self.X_mean = torch.tensor(self.norm_params['X_mean'], dtype=torch.float32)
-        self.X_std = torch.tensor(self.norm_params['X_std'], dtype=torch.float32)
-        # self.X_max = torch.tensor(self.norm_params['X_max'], dtype=torch.float32)
-        # self.X_min = torch.tensor(self.norm_params['X_min'], dtype=torch.float32)
-        self.A0_mean = self.norm_params['A0_mean']
-        self.A0_std = self.norm_params['A0_std']
-        self.A1_mean = self.norm_params['A1_mean']
-        self.A1_std = self.norm_params['A1_std']
-        self.transform = self.norm_params['transform']
-        self.f0 = self.norm_params['f0']
-        self.epsilon = self.norm_params['epsilon']
-
-        # Load model
+    def __init__(self, model_file: str = "data/radiation_emulator.pt", device="cpu", compile=False, quiet=False):
         checkpoint = torch.load(model_file, map_location=device, weights_only=True)
         model_config = checkpoint['config']
 
@@ -1186,31 +1129,31 @@ class RadiationEmulatorInference:
             hidden_dim=model_config['hidden_dim'],
             n_layers=model_config['n_layers'],
             activation=model_config['activation'],
-            dropout_p=model_config.get('dropout_p', 0.0),  # backward compatible
+            dropout_p=model_config.get('dropout_p', 0.0),
+            transform = model_config.get('transform', 'arcsinh'),
         ).to(device)
+        self.device = device
+
+        saved_names = checkpoint.get('feature_names')
+        # if saved_names is not None and saved_names != RadiationDataset.FEATURE_NAMES:
+        #     raise ValueError(f"Feature mismatch: model trained with {saved_names}")
 
         if torch.cuda.device_count() > 1:
             print(f"Using {torch.cuda.device_count()} GPUs")
             self.model = nn.DataParallel(self.model)
 
+        state_dict = checkpoint['model_state_dict']
         try:
-            self.model.load_state_dict(checkpoint['model_state_dict'])
-        except RuntimeError:
-            # Strip torch.compile's '_orig_mod.' prefix if present (backward compatible)
-            state_dict = {
-                k.removeprefix('_orig_mod.').removeprefix('module.'): v
-                for k, v in checkpoint['model_state_dict'].items()
-            }
             self.model.load_state_dict(state_dict)
+        except RuntimeError:
+            state_dict = {k.removeprefix('_orig_mod.').removeprefix('module.'): v
+                          for k, v in state_dict.items()}
+            self.model.load_state_dict(state_dict)   # buffers restored here too
+
         self.model.eval()
 
-        # Pre-move normalization tensors to the target device once,
-        # so repeated predict() calls don't trigger device copies.
-        self.X_mean = self.X_mean.to(device)
-        self.X_std = self.X_std.to(device)
-
         # Optionally compile the model for faster repeated inference
-        # (requires PyTorch >= 2.0; falls back silently on older versions)
+        # (requires PyTorch >= 2.0; falls back on older versions)
         if hasattr(torch, 'compile') and compile:
             self.model = torch.compile(self.model)
 
@@ -1259,36 +1202,16 @@ class RadiationEmulatorInference:
         return A_heads[:, 0], A_heads[:, 1]
 
     def predict_harmonics_raw(self, inputs: np.ndarray) -> np.ndarray:
-        """
-        Fast entry-point for pre-stacked (N, 6) float32 arrays in feature
-        order [x, k_perp, E, z0, u_perp, mu]. Returns physical (N, 3)
-        array of (A0, A1, A2) harmonic amplitudes.
-        """
-        # Find the indices of the names features we want
-        IDX_X = RadiationDataset.FEATURE_NAMES.index('x')
+        inputs_tensor = torch.from_numpy(np.asarray(inputs, dtype=np.float32)).to(self.device)
 
-        # Collect the inputs as a torch tensor
-        inputs_arr = np.asarray(inputs, dtype=np.float32, order='C')
-        inputs_tensor = torch.from_numpy(inputs_arr).to(self.device, non_blocking=True)
+        # Normalize using the model's own buffers -- guaranteed in sync with training
+        inputs_norm = (inputs_tensor - self.model.X_mean) / self.model.X_std
 
-        # Normalize
-        inputs_norm = (inputs_tensor - self.X_mean) / self.X_std
-
-        # Get the model prediction
         with torch.no_grad():
-            A_heads = self.model(inputs_norm)  # (N, 3), units of 1/f0; head 1 is x*A1
+            z = self.model(inputs_norm)                        # (N, 3), normalized+transformed
 
-        # Cast predictions of harmonics to CPU
-        A_heads = A_heads if self.device == "cpu" else A_heads.cpu()
-        A_heads = A_heads.numpy()
-
-        # Undo normalization
-        A_heads[:, 0] = (A_heads[:, 0] * self.A0_std) + self.A0_mean
-        A_heads[:, 1] = (A_heads[:, 1] * self.A1_std) + self.A1_mean
-
-        # Undo transformation
-        A_heads = self.f0 * np.sinh(A_heads)
-
+        phys_over_f0 = torch.sinh(z * self.model.y_std + self.model.y_mean)
+        A_heads = (self.model.f0 * phys_over_f0).cpu().numpy()
         return A_heads
 
     def predict_dict(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
@@ -1447,6 +1370,9 @@ def find_learning_rate(
 
         optimizer.zero_grad()
         loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config, normalization)
+        if not torch.isfinite(loss):
+            print("Non-finite loss detected:", components)
+            raise FloatingPointError("Non-finite loss")
         loss.backward()
         optimizer.step()
 
@@ -1554,7 +1480,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train or run inference with radiation emulator")
     parser.add_argument("--data-file", type=str, default=default_config.data_file, help="Training data file")
     parser.add_argument("--model-file", type=str, default=default_config.model_file, help="Model output file")
-    parser.add_argument("--normalization-file", type=str, default=default_config.normalization_file, help="Model normalization output file")
     parser.add_argument("--transform", type=str, default=default_config.transform, help="Type of transform on data")
     parser.add_argument("--epochs", type=int, default=default_config.n_epochs, help="Number of training epochs")
     parser.add_argument("--hidden-dim", type=int, default=default_config.hidden_dim, help="Hidden layer dimension")
@@ -1575,7 +1500,6 @@ if __name__ == "__main__":
     config = TrainingConfig(
         data_file=args.data_file,
         model_file=args.model_file,
-        normalization_file=args.normalization_file,
         n_epochs=args.epochs,
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
