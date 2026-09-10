@@ -21,7 +21,7 @@ import numpy as np
 import h5py
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, Subset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
@@ -70,7 +70,9 @@ class TrainingConfig:
     patience: int = 20  # Early stopping patience
 
     # Physics constraints
-    lambda_uv: float = 0.0  # Weight for UV decay loss term
+    lambda_A0: float = 1.0  # Weight for MSE of A0 head
+    lambda_A1: float = 1.0  # Weight for MSE of A1 head
+    lambda_uv: float = 1.0  # Weight for UV decay loss term
     lambda_uv_power: float = 0.0  # Weight for UV power-law loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
@@ -149,7 +151,6 @@ class RadiationDataset(Dataset):
     self.X_data : np.ndarray, shape (N_valid, 9), float32   -- input features
     self.y_data : np.ndarray, shape (N_valid,),   float32   -- raw intensity
     self.w_data : np.ndarray, shape (N_valid,),   float32   -- importance weights
-    self.phi_data : np.ndarray, shape (N_valid,), float32   -- phi values for loss computation
     """
     # Get the NN input feature names and number of features
     FEATURE_NAMES = list(
@@ -173,9 +174,9 @@ class RadiationDataset(Dataset):
 
         print(f"Dataset ready  |  valid={self.n_valid:,}  transform={self.transform}")
 
-    # ------------------------------------------------------------------
-    # Full load into RAM — no copies, no HDF5 handles kept open
-    # ------------------------------------------------------------------
+    ######################
+    # Load Data into RAM #
+    ######################
     def _scan_file(self):
         with h5py.File(self.data_file, 'r') as f:
             # Get dataset feature names from the file
@@ -183,10 +184,10 @@ class RadiationDataset(Dataset):
             print(f"  Found {len(self.RAW_FEATURE_NAMES)} features in dataset:")
             print(f"    {self.RAW_FEATURE_NAMES}")
 
-            n_raw = int(f['I'].shape[0])
+            n_raw = int(f['A0'].shape[0])
             print(f"  Reading {n_raw:,} rows from HDF5 ...")
 
-            # Read raw (unmodified) columns straight from disk
+            # Read raw (unmodified) columns straight from disk into pre-allocated arrays
             # Allocate arrays, then use h5py to read into them
             raw_cols = {}
             for name in self.RAW_FEATURE_NAMES:
@@ -194,16 +195,18 @@ class RadiationDataset(Dataset):
                 f[name].read_direct(buf)
                 raw_cols[name] = buf
 
-            y_raw = np.empty(n_raw, dtype=np.float32)
-            f['I'].read_direct(y_raw)
+            A0_raw = np.empty(n_raw, dtype=np.float32)
+            A1_raw = np.empty(n_raw, dtype=np.float32)
+            f['A0'].read_direct(A0_raw)
+            f['A1'].read_direct(A1_raw)
 
             w_raw = np.empty(n_raw, dtype=np.float32)
             f['weight'].read_direct(w_raw)
 
-            i_err = np.empty(n_raw, dtype=np.float32)
-            f['I_err'].read_direct(i_err)
-
-        phi_raw = raw_cols['k_phi']
+            A0_err = np.empty(n_raw, dtype=np.float32)
+            A1_err = np.empty(n_raw, dtype=np.float32)
+            f['A0_err'].read_direct(A0_err)
+            f['A1_err'].read_direct(A1_err)
 
         # Compute the input parameter dictionary
         X_raw_dict = compute_input_features(raw_cols['x'], raw_cols['k_perp'], raw_cols['E'], raw_cols['z0'],
@@ -215,23 +218,26 @@ class RadiationDataset(Dataset):
         # Mask off any points where the integration when awry
         print("  Filtering invalid rows ...")
         ok = (
-                np.isfinite(y_raw)
-                & np.isfinite(i_err)
-                & np.isfinite(phi_raw)
+                np.isfinite(A0_raw)
+                & np.isfinite(A1_raw)
+                & np.isfinite(A0_err)
+                & np.isfinite(A1_err)
                 & np.all(np.isfinite(X_raw), axis=1)
         )
-        del i_err  # Trash the integration error to save memory
+        del A0_err, A1_err  # Trash the integration error to save memory
 
         n_valid = int(ok.sum())
         print(f"  {n_raw:,} raw  →  {n_valid:,} valid")
 
         # Apply mask to cut arrays
         self.X_data = X_raw[ok]
-        self.phi_data = phi_raw[ok]
-        del X_raw, raw_cols, phi_raw
+        del X_raw, raw_cols
 
-        self.y_data = y_raw[ok]
-        del y_raw
+        self.A0_data = A0_raw[ok]
+        del A0_raw
+
+        self.A1_data = A1_raw[ok]
+        del A1_raw
 
         self.w_data = w_raw[ok]
         del w_raw
@@ -248,25 +254,31 @@ class RadiationDataset(Dataset):
 
         self.weight_mean = float(self.w_data.mean())
 
+        # Transform input data
         if config.transform_f0 is None:
-            self.f0 = float(np.std(self.y_data))
+            self.f0 = float(np.std(self.A0_data))
         else:
             self.f0 = float(config.transform_f0)
-        y_t = self._transform_y(self.y_data)
-        self.y_mean = float(y_t.mean())
-        self.y_std = float(y_t.std() + 1e-8)
+        A0_t = self._transform_y(self.A0_data)
+        self.A0_mean = float(A0_t.mean())
+        self.A0_std = float(A0_t.std() + 1e-8)
+        A1_t = self._transform_y(self.A1_data)
+        self.A1_mean = float(A1_t.mean())
+        self.A1_std = float(A1_t.std() + 1e-8)
 
-        self.y_norm_data = ((y_t - self.y_mean) / self.y_std).astype(np.float32)
-        del y_t
-
+        # Normalize transformed input data to zero mean and unit variance
+        self.A0_norm_data = ((A0_t - self.A0_mean) / self.A0_std).astype(np.float32)
+        del A0_t
+        self.A1_norm_data = ((A1_t - self.A1_mean) / self.A1_std).astype(np.float32)
+        del A1_t
         self.X_norm_data = ((self.X_data - self.X_mean) / self.X_std).astype(np.float32)
         self.w_norm_data = (self.w_data / self.weight_mean).astype(np.float32)
 
         print(f"  weight_mean={self.weight_mean:.3e}  f0={self.f0:.3e}")
 
-    # ------------------------------------------------------------------
-    # Output transform
-    # ------------------------------------------------------------------
+    ####################
+    # Output transform #
+    ####################
     def _transform_y(self, y: np.ndarray) -> np.ndarray:
         if self.transform == "arcsinh":
             return np.arcsinh(y / self.f0).astype(np.float32)
@@ -274,9 +286,9 @@ class RadiationDataset(Dataset):
             return (np.sign(y / self.f0) * np.log(np.abs(y / self.f0) + self.epsilon)).astype(np.float32)
         return y.astype(np.float32)
 
-    # ------------------------------------------------------------------
-    # Dataset protocol
-    # ------------------------------------------------------------------
+    #####################
+    # Dataset protocols #
+    #####################
     # Check the number of points in the dataset
     def __len__(self) -> int:
         return self.n_valid
@@ -284,14 +296,14 @@ class RadiationDataset(Dataset):
     # Get a single data point by index
     def __getitem__(self, idx: int):
         x_norm = self.X_norm_data[idx]
-        phi = self.phi_data[idx]
-        y_norm = self.y_norm_data[idx]
+        A0_norm = self.A0_norm_data[idx]
+        A1_norm = self.A1_norm_data[idx]
         w_norm = self.w_norm_data[idx]
 
         return (
             torch.from_numpy(x_norm),
-            torch.tensor(phi, dtype=torch.float32),
-            torch.tensor(y_norm, dtype=torch.float32),
+            torch.tensor(A0_norm, dtype=torch.float32),
+            torch.tensor(A1_norm, dtype=torch.float32),
             torch.tensor(w_norm, dtype=torch.float32),
         )
 
@@ -300,16 +312,16 @@ class RadiationDataset(Dataset):
         indices = np.asarray(indices, dtype=np.intp)
 
         X_batch = self.X_norm_data[indices]
-        phi_batch = self.phi_data[indices]
-        y_batch = self.y_norm_data[indices]
+        A0_batch = self.A0_norm_data[indices]
+        A1_batch = self.A1_norm_data[indices]
         w_batch = self.w_norm_data[indices]
 
         # Return four tensors — collate_fn receives one "sample" and passes
         # it straight through without any further stacking.
         return [
             torch.from_numpy(X_batch),
-            torch.from_numpy(phi_batch.copy()),
-            torch.from_numpy(y_batch.copy()),
+            torch.from_numpy(A0_batch.copy()),
+            torch.from_numpy(A1_batch.copy()),
             torch.from_numpy(w_batch.copy()),
         ]
 
@@ -320,8 +332,10 @@ class RadiationDataset(Dataset):
         return {
             'X_mean':        self.X_mean.tolist(),
             'X_std':         self.X_std.tolist(),
-            'y_mean':        self.y_mean,
-            'y_std':         self.y_std,
+            'A0_mean':       self.A0_mean,
+            'A0_std':        self.A0_std,
+            'A1_mean':       self.A1_mean,
+            'A1_std':        self.A1_std,
             'transform':     str(self.transform),
             'f0':            self.f0,
             'epsilon':       self.epsilon,
@@ -332,46 +346,25 @@ class RadiationDataset(Dataset):
     def shutdown(self):
         pass
 
-class RadiationSubset(Dataset):
-    """
-    A view into a RadiationDataset restricted to a subset of *physical* indices.
 
-    Parameters
-    ----------
-    dataset : RadiationDataset
-        The parent dataset (already loaded into RAM).
-    physical_indices : np.ndarray, dtype=np.intp
-        Indices into dataset.X_norm_data / y_norm_data / w_norm_data.
-        Must be in [0, dataset.n_valid).
-    """
+@dataclass
+class Normalization:
+    X_mean: torch.Tensor
+    X_std: torch.Tensor
+    y_mean: Dict[str, float]   # {'A0': ..., 'A1': ...} -- keyed by target name
+    y_std: Dict[str, float]
+    feature_index: Dict[str, int]  # e.g. {'x': 0, 'k_perp': 1, 'E': 2, ...}
 
-    def __init__(
-            self,
-            dataset: RadiationDataset,
-            physical_indices: np.ndarray,
-    ):
-        self.ds = dataset
-        self.idx = np.asarray(physical_indices, dtype=np.intp)
-        self.n_phys = len(self.idx)
+    @classmethod
+    def from_dataset(cls, dataset: RadiationDataset, device) -> "Normalization":
+        return cls(
+            X_mean=torch.tensor(dataset.X_mean, device=device),
+            X_std=torch.tensor(dataset.X_std, device=device),
+            y_mean={'A0': dataset.A0_mean, 'A1': dataset.A1_mean},
+            y_std={'A0': dataset.A0_std, 'A1': dataset.A1_std},
+            feature_index={name: i for i, name in enumerate(dataset.FEATURE_NAMES)},
+        )
 
-    def __len__(self) -> int:
-        return self.n_phys
-
-    def __getitems__(self, positions: list[int]) -> list:
-        positions = np.asarray(positions, dtype=np.intp)
-        phys_idx = self.idx[positions]
-
-        X_batch = self.ds.X_norm_data[phys_idx]
-        phi_batch = self.ds.phi_data[phys_idx]
-        y_batch = self.ds.y_norm_data[phys_idx]
-        w_batch = self.ds.w_norm_data[phys_idx]
-
-        return [
-            torch.from_numpy(X_batch.copy()),
-            torch.from_numpy(phi_batch.copy()),
-            torch.from_numpy(y_batch.copy()),
-            torch.from_numpy(w_batch.copy()),
-        ]
 
 # ==============================================================================
 # Neural Network Model
@@ -479,16 +472,15 @@ class RadiationEmulator(nn.Module):
         # in a comfortable O(1) range -- avoiding the poor conditioning that would
         # result from a plain linear layer needing very large weights directly.
         raw = self.output_layer(h)  # (B, 3), expected O(1) at init
-        return self.head_scale * torch.sinh(raw)  # (B, 3), physical units of 1/f0
-
+        # return self.head_scale * torch.sinh(raw)  # (B, 3), physical units of 1/f0
+        return raw
 
 # ==============================================================================
 # Training utilities
 # ==============================================================================
 def apply_output_transform(y_over_f0: torch.Tensor, transform: str, epsilon: float = 1e-10):
     """
-    Shared forward transform, usable both on raw numpy target data (with f0-scaling
-    baked in via y/f0) and on the network's combined harmonic prediction.
+    Shared forward transform
     """
     if transform == "arcsinh":
         return torch.arcsinh(y_over_f0)
@@ -497,38 +489,45 @@ def apply_output_transform(y_over_f0: torch.Tensor, transform: str, epsilon: flo
     return y_over_f0
 
 
+def reverse_output_transform(y_over_f0: torch.Tensor, transform: str, epsilon: float = 1e-10):
+    """
+    Shared forward transform
+    """
+    if transform == "arcsinh":
+        return torch.sinh(y_over_f0)
+    elif transform == "log":
+        return np.nan
+    return y_over_f0
+
+
 def combine_harmonics(A_heads: torch.Tensor, phi: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
     """
-    Reconstruct I/f0 = A0 + A1*cos(phi) + A2*cos(2*phi) from the 3 network heads.
+    Reconstruct I/f0 = A0 + A1*cos(phi) + ... + An*cos(n*phi) from the n network heads.
 
-    A_heads : (B, 3) tensor of (A0, x*A1, A2), each already in units of 1/f0.
+    A_heads : (B, 2) tensor of (A0, x*A1), each already in units of 1/f0.
               Note: head 1 is x*A1, not A1 -- it is divided by x below.
     phi     : (B,)   tensor of azimuthal angle.
     x       : (B,)   tensor of physical x values (undoes the x*A1 normalization).
     """
     eps = 1e-6
     A1 = A_heads[:, 1] / (x + eps)
-    return A_heads[:, 0] + A1 * torch.cos(phi) + A_heads[:, 2] * torch.cos(2 * phi)
+    return A_heads[:, 0] + A1 * torch.cos(phi)
 
 
 def compute_loss(
         model: nn.Module,
         inputs: torch.Tensor,
-        phi: torch.Tensor,
-        targets: torch.Tensor,
+        A0_targets: torch.Tensor,
+        A1_targets: torch.Tensor,
         weights: torch.Tensor,
         config: TrainingConfig,
-        X_mean: torch.Tensor,
-        X_std: torch.Tensor,
-        y_mean: float,
-        y_std: float,
-        transform: str,
+        normalization: Normalization,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute weighted MSE loss with physics constraints.
 
-    The model outputs 3 harmonic heads (A0, A1, A2). These are combined via
-    A0 + A1*cos(phi) + A2*cos(2*phi) to reconstruct I/f0, then arcsinh-transformed
+    The model outputs 2 harmonic heads (A0, A1). These are combined via
+    A0 + A1*cos(phi) to reconstruct I/f0, then arcsinh-transformed
     and standardized to match the (pre-transformed) targets.
 
     Returns total loss and dictionary of individual loss components.
@@ -539,21 +538,23 @@ def compute_loss(
     IDX_K_PERP = names.index('k_perp')
     IDX_E = names.index('E')
 
-    # Get head outputs and compute predicted values at phi points
-    """
-    Because we perform the same forward transform on the training data and NN outputs, the NN is training to directly
-    output the pre-transformed values, normalized by f0.
-    """
-    A_heads = model(inputs)  # (B, 3)
-    x_phys = inputs[:, IDX_X] * X_std[IDX_X] + X_mean[IDX_X]
-    I_over_f0_pred = combine_harmonics(A_heads, phi, x_phys)
-    pred_transformed = apply_output_transform(I_over_f0_pred, config.transform)
-    predictions = (pred_transformed - y_mean) / y_std
-
     """
     Weighted MSE loss
     """
-    mse = (weights * (predictions - targets) ** 2).mean()
+    # Get head outputs and compute MSE per each
+    NN_heads = model(inputs)  # (B, 2)
+    x_phys = inputs[:, IDX_X] * normalization.X_std[IDX_X] + normalization.X_mean[IDX_X]
+    NN_A0 = NN_heads[:, 0]
+    NN_A1 = NN_heads[:, 1]
+
+    # Notice no transformation of model output -- training for raw model output in transformed and normalized space
+    A0_mse = (weights * (NN_A0 - A0_targets) ** 2).mean()
+    A1_mse = (weights * (NN_A1 - A1_targets) ** 2).mean()
+
+    # Debug prints
+    # print(f"x: {x_phys}")
+    # print(f"A0: {NN_A0}")
+    # print(f"A1: {NN_A1}")
 
     """
     UV decay enforcement loss
@@ -574,8 +575,13 @@ def compute_loss(
         idx = torch.randint(0, B, (n_uv_samples,), device=device)
         uv_params = inputs[idx].clone()  # (n_uv_samples, 7)
 
-        E_mean = X_mean[IDX_E].to(device)
-        E_std = X_std[IDX_E].to(device)
+        # Unnormalize the whole row back to physical space
+        X_mean = normalization.X_mean.to(device)
+        X_std = normalization.X_std.to(device)
+        phys = uv_params * X_std + X_mean  # (n_uv_samples, n_features), physical units
+
+        E_mean = normalization.X_mean[IDX_E].to(device)
+        E_std = normalization.X_std[IDX_E].to(device)
         energy_params = (uv_params[:, IDX_E] * E_std + E_mean).cpu().numpy()
 
         # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
@@ -592,9 +598,22 @@ def compute_loss(
         log_k = torch.tensor(log_k, device=device)
         k_perp_uv = torch.exp(log_k)
 
-        uv_params[:, IDX_K_PERP] = k_perp_uv  # Overwrite k_perp vals
+        # Overwrite k_perp in physical space
+        phys[:, IDX_K_PERP] = k_perp_uv
 
-        uv_heads = model(uv_params)  # shape (n_uv_samples, 3)
+        # Recompute the k_perp-dependent derived features consistently
+        IDX_X, IDX_E, IDX_Z0 = names.index('x'), names.index('E'), names.index('z0')
+        x_p, E_p, z0_p = phys[:, IDX_X], phys[:, IDX_E], phys[:, IDX_Z0]
+        mu_p = phys[:, names.index('mu')]
+        DELTA_Z = 0.1 / 0.197327
+        omega_k = phys[:, IDX_K_PERP] ** 2 / (2 * x_p * E_p)
+        phys[:, names.index('omega_k_dz')] = omega_k * DELTA_Z / 2
+        phys[:, names.index('omega_k_midz')] = omega_k * (z0_p + DELTA_Z / 2)
+        phys[:, names.index('omega_width')] = mu_p ** 2 * DELTA_Z / (2 * x_p * E_p)
+
+        # Re-normalize before feeding to the model
+        uv_params = (phys - X_mean) / X_std
+        uv_heads = model(uv_params) # shape (n_uv_samples, 3)
 
         # Use log weight to penalize nonzero result at larger k_perp values more
         log_esqr = torch.tensor(math.log(max_frac) + 2 * np.log(energy_params), device=device)
@@ -645,13 +664,15 @@ def compute_loss(
 
     # Total loss
     total_loss = (
-            mse
+            config.lambda_A0 * A0_mse
+            + config.lambda_A1 * A1_mse
             + config.lambda_uv * uv_decay
             + config.lambda_uv_power * uv_power_law
     )
 
     components = {
-        'mse': mse.item(),
+        'A0_mse': A0_mse.item(),
+        'A1_mse': A0_mse.item(),
         'uv_decay': uv_decay.item(),
         'uv_power_law': uv_power_law.item(),
         'total': total_loss.item(),
@@ -665,10 +686,7 @@ def train_epoch(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
-        X_mean: torch.Tensor,
-        X_std: torch.Tensor,
-        y_mean: float,
-        y_std: float,
+        normalization: Normalization,
 ) -> Dict[str, float]:
     """Train for one epoch."""
     model.train()
@@ -677,26 +695,25 @@ def train_epoch(
     n_batches = 0
 
     t0 = time.time()
-    for i, (inputs, phi, targets, weights) in enumerate(dataloader):
+    for i, (inputs, A0_targets, A1_targets, weights) in enumerate(dataloader):
         # if i % 10000 == 0 and i != 0:
         #     print(f"  Batch {i}/{len(dataloader)}  [avg {(time.time() - t0)/i:.3f}s/batch]")
 
         # Send tensors to device
         inputs = inputs.to(config.device)
-        phi = phi.to(config.device)
-        targets = targets.to(config.device)
+        A0_targets = A0_targets.to(config.device)
+        A1_targets = A1_targets.to(config.device)
         weights = weights.to(config.device)
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
-                                        config.transform)
+        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config, normalization)
         loss.backward()
         optimizer.step()
 
         # Add to running sum of loss and MSE
         total_loss += components['total']
-        total_mse += components['mse']
+        total_mse += components['A0_mse'] + components['A1_mse']
         n_batches += 1
 
     # Return loss and MSE
@@ -710,10 +727,7 @@ def validate(
         model: nn.Module,
         dataloader: DataLoader,
         config: TrainingConfig,
-        X_mean: torch.Tensor,
-        X_std: torch.Tensor,
-        y_mean: float,
-        y_std: float,
+        normalization: Normalization,
 ) -> Dict[str, float]:
     """Validate the model."""
     model.eval()
@@ -722,20 +736,19 @@ def validate(
     n_batches = 0
 
     with torch.no_grad():
-        for inputs, phi, targets, weights in dataloader:
+        for inputs, A0_targets, A1_targets, weights in dataloader:
             # Send tensors to device
             inputs = inputs.to(config.device)
-            phi = phi.to(config.device)
-            targets = targets.to(config.device)
+            A0_targets = A0_targets.to(config.device)
+            A1_targets = A1_targets.to(config.device)
             weights = weights.to(config.device)
 
             # Compute loss
-            _, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
-                                        config.transform)
+            _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config, normalization)
 
             # Add to running sum of loss and MSE
             total_loss += components['total']
-            total_mse += components['mse']
+            total_mse += components['A0_mse'] + components['A1_mse']
             n_batches += 1
 
     # Return loss and MSE
@@ -880,6 +893,9 @@ def train_model(config: TrainingConfig):
     # Load dataset
     dataset = RadiationDataset(config.data_file, transform_output=config.transform)
 
+    # Create normalization metadata container
+    norm = Normalization.from_dataset(dataset, device=config.device)
+
     # Save normalization parameters
     norm_params = dataset.get_normalization_params()
     if is_main:
@@ -897,12 +913,9 @@ def train_model(config: TrainingConfig):
     train_idx = perm[:n_phys_train]
     val_idx = perm[n_phys_train:]
 
-    # Split training and validation datasets
-    train_dataset = RadiationSubset(dataset, train_idx)
-    val_dataset = RadiationSubset(dataset, val_idx)
-
-    # print(f"Training samples: {n_train}")
-    # print(f"Validation samples: {n_val}")
+    # Split dataset into training and validation subsets using Pytorch's built in Subset class
+    train_dataset = Subset(dataset, train_idx)
+    val_dataset = Subset(dataset, val_idx)
 
     # Create dataloaders
     if is_distributed:
@@ -990,19 +1003,12 @@ def train_model(config: TrainingConfig):
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Model parameters: {n_params:,}")
 
-    # Pre-move normalization tensors to device once, for use in loss computation
-    X_mean_t = torch.tensor(dataset.X_mean, dtype=torch.float32).to(config.device)
-    X_std_t = torch.tensor(dataset.X_std, dtype=torch.float32).to(config.device)
-    y_mean_t = dataset.y_mean
-    y_std_t = dataset.y_std
-
     # LR finder -- to be run before the main training loop, finds optimal learning rate
     # Looks for minima in the loss as function of learning rate, returns rate just before minima in loss function
     if config.run_lr_finder:
         print("\nRunning LR range test...")
         print("-" * 70)
-        lrs, losses, raw_losses = find_learning_rate(model, train_loader, optimizer, config, X_mean_t, X_std_t,
-                                                     y_mean_t, y_std_t)
+        lrs, losses, raw_losses = find_learning_rate(model, train_loader, optimizer, config, norm)
         suggested_lr = plot_lr_finder(lrs, losses, raw_losses)
         print(f"\nRe-run with --learning-rate {suggested_lr / 3:.2e} (1/3 of suggested)")
         return model, dataset.get_normalization_params()
@@ -1041,10 +1047,10 @@ def train_model(config: TrainingConfig):
                 break
 
             # Train
-            train_metrics = train_epoch(model, train_loader, optimizer, config, X_mean_t, X_std_t, y_mean_t, y_std_t)
+            train_metrics = train_epoch(model, train_loader, optimizer, config, norm)
 
             # Validate
-            val_metrics = validate(model, val_loader, config, X_mean_t, X_std_t, y_mean_t, y_std_t)
+            val_metrics = validate(model, val_loader, config, norm)
 
             # Update scheduler
             scheduler.step(val_metrics['mse'])  # Scheduler tracks mse, not the overall loss.
@@ -1163,8 +1169,10 @@ class RadiationEmulatorInference:
         self.X_std = torch.tensor(self.norm_params['X_std'], dtype=torch.float32)
         # self.X_max = torch.tensor(self.norm_params['X_max'], dtype=torch.float32)
         # self.X_min = torch.tensor(self.norm_params['X_min'], dtype=torch.float32)
-        self.y_mean = self.norm_params['y_mean']
-        self.y_std = self.norm_params['y_std']
+        self.A0_mean = self.norm_params['A0_mean']
+        self.A0_std = self.norm_params['A0_std']
+        self.A1_mean = self.norm_params['A1_mean']
+        self.A1_std = self.norm_params['A1_std']
         self.transform = self.norm_params['transform']
         self.f0 = self.norm_params['f0']
         self.epsilon = self.norm_params['epsilon']
@@ -1224,8 +1232,8 @@ class RadiationEmulatorInference:
         """
         Physical-facing entry point -- returns the combined scalar intensity
         """
-        A0, A1, A2 = self.predict_harmonics(x, k_perp, E, z0, u_perp, mu)
-        predictions = A0 + A1 * np.cos(phi) + A2 * np.cos(2 * phi)
+        A0, A1 = self.predict_harmonics(x, k_perp, E, z0, u_perp, mu)
+        predictions = A0 + A1 * np.cos(phi)
         return predictions
 
     def predict_harmonics(
@@ -1248,7 +1256,7 @@ class RadiationEmulatorInference:
                                  )).astype(np.float32, order='C', copy=False
         )
         A_heads = self.predict_harmonics_raw(inputs)
-        return A_heads[:, 0], A_heads[:, 1], A_heads[:, 2]
+        return A_heads[:, 0], A_heads[:, 1]
 
     def predict_harmonics_raw(self, inputs: np.ndarray) -> np.ndarray:
         """
@@ -1274,12 +1282,14 @@ class RadiationEmulatorInference:
         A_heads = A_heads if self.device == "cpu" else A_heads.cpu()
         A_heads = A_heads.numpy()
 
-        # Undo the x*A1 normalization to recover physical A1
-        eps = 1e-6
-        x_phys = inputs_arr[:, IDX_X]
-        A_heads[:, 1] = A_heads[:, 1] / (x_phys + eps)
+        # Undo normalization
+        A_heads[:, 0] = (A_heads[:, 0] * self.A0_std) + self.A0_mean
+        A_heads[:, 1] = (A_heads[:, 1] * self.A1_std) + self.A1_mean
 
-        return self.f0 * A_heads
+        # Undo transformation
+        A_heads = self.f0 * np.sinh(A_heads)
+
+        return A_heads
 
     def predict_dict(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
         """
@@ -1379,10 +1389,7 @@ def find_learning_rate(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
-        X_mean,
-        X_std,
-        y_mean,
-        y_std,
+        normalization: Normalization,
         start_lr: float = 1e-4,    # narrower range start
         end_lr: float = 1e-1,      # narrower range end
         n_steps: int = 150,        # far more steps for resolution
@@ -1428,18 +1435,18 @@ def find_learning_rate(
 
     for step in range(n_steps):
         try:
-            inputs, targets, weights = next(data_iter)
+            inputs, A0_targets, A1_targets, weights = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
-            inputs, targets, weights = next(data_iter)
+            inputs, A0_targets, A1_targets, weights = next(data_iter)
 
         inputs  = inputs.to(config.device)
-        targets = targets.to(config.device)
+        A0_targets = A0_targets.to(config.device)
+        A1_targets = A1_targets.to(config.device)
         weights = weights.to(config.device)
 
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, phi, targets, weights, config, X_mean, X_std, y_mean, y_std,
-                                        config.transform)
+        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config, normalization)
         loss.backward()
         optimizer.step()
 
