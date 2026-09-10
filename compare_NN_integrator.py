@@ -222,8 +222,9 @@ def make_comparison_plot(
     # im2 = axes[2].imshow(
     #     rel_residual, cmap='coolwarm', vmin=-res_abs, vmax=res_abs, **imshow_kwargs
     # )
+    vmax = np.amax([1, np.amax(np.abs(rel_residual))])
     im2 = axes[2].imshow(
-        rel_residual, cmap='coolwarm', vmin=-2, vmax=2, **imshow_kwargs
+        rel_residual, cmap='coolwarm', vmin=-vmax, vmax=vmax, **imshow_kwargs
     )
     axes[2].set_title(r'Relative residual $(I_\mathrm{NN} - I_\mathrm{ref})/|I_\mathrm{ref}|$')
     axes[2].set_xlabel(r'$k_y$ (GeV)')
