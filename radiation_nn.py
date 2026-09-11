@@ -508,24 +508,30 @@ class RadiationEmulator(nn.Module):
 
         # Learnable transition scale -- anchored comfortably above ((Min[x^2, (1-x)^2]  * E^2) - mu^2),
         # near the physical UV threshold -- at which the envelope really starts to squeeze.
-        k0 = (((torch.minimum(x.unsqueeze(-1)**2, (1-x.unsqueeze(-1))**2) * E.unsqueeze(-1)**2) - mu.unsqueeze(-1)**2)
-              * torch.nn.functional.softplus(self.raw_k0_scale))  # (B, 2)
+        # K = kperp_max^2 in GeV^2. Clamp for safety.
+        K = (torch.minimum(x.unsqueeze(-1) ** 2, (1 - x.unsqueeze(-1)) ** 2) * E.unsqueeze(-1) ** 2) - mu.unsqueeze(
+            -1) ** 2
+        K = K.clamp(min=1e-6)
 
-        # Envelope enforcing power law decay
-        log_ratio_sq = torch.log1p((k_perp.unsqueeze(-1) / k0) ** 2)
-        log_envelope = -0.5 * p * log_ratio_sq  # <= 0, monotone decay in k_perp, in NATS
+        # k0_sq is k0^2 in GeV^2 -- anchored comfortably above kperp_max^2 by the learnable (>=1) factor
+        k0_sq = K * torch.nn.functional.softplus(self.raw_k0_scale)  # (B, 2), units GeV^2
+
+        # Should be dimensionless: k_perp^2 [GeV^2] / k0_sq [GeV^2]
+        log_ratio_sq = torch.log1p(k_perp.unsqueeze(-1) ** 2 / k0_sq)
+        log_envelope = -0.5 * p * log_ratio_sq
 
         # Additive combination in z-space
         z = raw_z + log_envelope  # No head scale effect -- quick comparison preferred no head scaling
         # z = raw_z + self.head_scale.unsqueeze(0) + log_envelope  # Include head scale effect
 
         # Some debug prints
-        # with torch.no_grad():
-        #     frac_saturated = (raw_z.abs() > 0.95 * Z_CLAMP).float().mean()
-        #     print(f"  clamp saturation frac: {frac_saturated:.3f}  "
-        #           f"k0: {(k0).mean():.3f}  "
-        #           f"k0 param: {(self.raw_k0_scale):.3f}  "
-        #           f"p: {p.tolist()}")
+        with torch.no_grad():
+            frac_saturated = (raw_z.abs() > 0.95 * Z_CLAMP).float().mean()
+            print(f"  clamp saturation frac: {frac_saturated:.3f}  "
+                  f"K: {(torch.sqrt(K)).mean():.3f}  "
+                  f"k0: {(torch.sqrt(k0_sq)).mean():.3f}  "
+                  f"k0 param: {self.raw_k0_scale}  "
+                  f"p: {p.tolist()}")
 
         return (z - self.y_mean) / self.y_std
 
@@ -552,20 +558,6 @@ def reverse_output_transform(y_over_f0: torch.Tensor, transform: str, epsilon: f
     elif transform == "log":
         return np.nan
     return y_over_f0
-
-
-def combine_harmonics(A_heads: torch.Tensor, phi: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-    """
-    Reconstruct I/f0 = A0 + A1*cos(phi) + ... + An*cos(n*phi) from the n network heads.
-
-    A_heads : (B, 2) tensor of (A0, x*A1), each already in units of 1/f0.
-              Note: head 1 is x*A1, not A1 -- it is divided by x below.
-    phi     : (B,)   tensor of azimuthal angle.
-    x       : (B,)   tensor of physical x values (undoes the x*A1 normalization).
-    """
-    eps = 1e-6
-    A1 = A_heads[:, 1] / (x + eps)
-    return A_heads[:, 0] + A1 * torch.cos(phi)
 
 
 def compute_loss(
