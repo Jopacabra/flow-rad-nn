@@ -6,7 +6,9 @@ from a fast probe in a transversely flowing quark gluon plasma using precomputed
 
 The transformations and normalization are specialized to reproduce a huge dynamic range of intensity values while
 keeping weights small. The model architecture incorporates a physics-informed UV power law envelope that sets in
-at large $k_\perp$.
+at large k_perp.
+
+Values at small x are many orders of magnitude larger than those at large x.
 
 Features:
 - Loads training data from HDF5 file
@@ -128,8 +130,8 @@ def compute_input_features(x: np.ndarray, k_perp: np.ndarray, E: np.ndarray, z0:
         'z0': z0,
         'u_perp': u_perp,
         'mu': mu,
-        'arcsinh(omega_k_dz)': np.arcsinh(omega_k_dz),
-        'arcsinh(omega_k_midz)': np.arcsinh(omega_k_midz),
+        'sinc(omega_k_dz)': np.sinc(omega_k_dz / np.pi) * np.pi,  # Numpy sinc is signal-processing normalized sinc
+        'cos(omega_k_midz)': np.cos(omega_k_midz),
         'arcsinh(omega_width)': np.arcsinh(omega_width),
     }
 
