@@ -488,7 +488,17 @@ class RadiationEmulator(nn.Module):
         mu = x_norm[:, self.IDX_MU] * self.X_std[self.IDX_MU] + self.X_mean[self.IDX_MU]
 
         # Soft-clamp on the "z-space" raw output -- normalized+transformed
-        Z_CLAMP = 25.0  # Tuning this parameter is extremely important for not clipping huge vals at small x !!!
+        """
+        Tuning this parameter is extremely important for not clipping huge vals at small x !!!
+        
+        If you end up with any amount of clipping in the z-space output, 
+        you may need to adjust this parameter. This can manifest in many different signals, including apparent high-
+        frequency oscillations in the very large value regions of the output. Use the debug print below when plotting
+        the output to check for clipping. You should see zero here.
+        
+        float32 overflow occurs at sinh(~88.7), so keep this relatively well below 88.7.
+        """
+        Z_CLAMP = 50.0
         raw_z = Z_CLAMP * torch.tanh(raw / Z_CLAMP)  # (B, 2), safely bounded, good gradients
 
         # Learnable exponent, bounded by P_MIN and P_MAX
