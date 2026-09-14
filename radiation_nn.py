@@ -51,6 +51,9 @@ def _collate_passthrough(x):
 # ==============================================================================
 # Configuration
 # ==============================================================================
+# Module level constants -- ensure that this matches the dataset you're training on
+HBARC = 0.197327
+DELTA_Z = 0.1 / HBARC  # hardcoded 0.1 fm to GeV^{-1}
 @dataclass
 class TrainingConfig:
     """
@@ -67,6 +70,8 @@ class TrainingConfig:
     hidden_dim: int = 256
     n_layers: int = 5
     activation: str = "silu"  # silu, relu, tanh, gelu
+    n_harmonics: int = 0  # number of cos/sin harmonics of the cosine phase per head (0 = no harmonic architecture)
+    n_harmonics_dz: int = 0  # same for sinc phase -- this phase typically varies much more slowly when z0 >> Delta_z
 
     # Training
     batch_size: int = 4096
@@ -108,23 +113,27 @@ def compute_input_features(x: np.ndarray, k_perp: np.ndarray, E: np.ndarray, z0:
     Single source for computing NN-input features.
     Returns a dict of {name: array}, in the order they should be fed to the network.
 
-    Everywhere should call this function to collate inputs for a NN pass.
+    Everywhere should call this function to collate inputs for a NN pass or otherwise deal with input feature arrays.
+
+    E: hard parton energy (GeV)
+    x: momentum fraction of the emitted gluon
+    k_perp: transverse momentum of the emitted gluon (GeV)
+    z0: slab entry point (GeV)
+    u_perp: transverse collective flow velocity (unitless fraction of c)
+    mu: DeBye screening mass -- the medium scale
+
+    Constructed features are frequencies and widths of the phase factors in the spectrum.
+
     """
-    HBARC = 0.197327
-    DELTA_Z = 0.1 / HBARC  # hardcoded 0.1 fm to GeV^{-1}
-
-    # Cast to arrays
-
-
     # Oscillatory phases
     omega_k = (k_perp**2) / (2 * x * E)
     omega_k_dz = omega_k * DELTA_Z / 2
     omega_k_midz = omega_k * (z0 + DELTA_Z / 2)
     omega_width = (mu**2) * DELTA_Z / (2 * x * E)
 
-    # Create dictionary
+    # Create dictionary of computed input features
     input_dict = {
-        'x': x,
+        'ln(x)': np.log(x),
         'ln(k_perp)': np.log(k_perp),
         'ln(E)': np.log(E),
         'z0': z0,
@@ -143,7 +152,7 @@ def compute_input_features(x: np.ndarray, k_perp: np.ndarray, E: np.ndarray, z0:
 # ==============================================================================
 class RadiationDataset(Dataset):
     """
-    RAM-backed dataset. All valid data is loaded into memory once at construction.
+    All valid data is loaded into memory once at construction.
 
     Design
     ------
@@ -375,11 +384,72 @@ class Normalization:
 # Neural Network Model
 # ==============================================================================
 class RadiationEmulator(nn.Module):
-    # Fixed feature indices needed for the envelope
+    """
+    RadiationEmulator architecture
+    ------------------------------
+    Two-head MLP (A0, A1) predicting the radiation intensity harmonics in a
+    transformed, normalized "z-space". Each head is decomposed as:
+
+        z_head = clamp( background + S_end - S_start ) + log_envelope(k_perp)
+
+    1. Background: raw MLP scalar output per head (slowly-varying part).
+
+    2. Oscillatory part -- physics-injected carrier, MLP-learned envelope:
+       The medium-induced phase for a single q_perp is exactly
+           Phi(q_perp) = 1 - sinc(omega*dz/2)*cos(omega*(z0+dz/2))
+                       = 1 - [sin(theta_end) - sin(theta_start)] / (omega*dz)
+       where omega = (k_perp-q_perp)^2/(2xE), and
+           theta_end   = omega_midz + omega_dz  = omega*(z0+dz)   (phase at slab exit)
+           theta_start = omega_midz - omega_dz  = omega*z0        (phase at slab entry)
+
+       ---
+       This difference of sines form turned out to have obvious catastrophic cancellation issues, so the smeared cosine
+       and sinc form is preferable in principle. Difference of sines version kept in comment for now.
+       ---
+
+       i.e. the true structure is additive in two single-frequency terms sharing
+       one instantaneous omega but accumulated over two different path lengths --
+       NOT a product of independent cos/sinc series. The q_perp integral that
+       produces the observed A0/A1 keeps this frequency (stationary phase at
+       q_perp=0) but decoheres theta_end and theta_start at different rates
+       (longer path -> more decoherence, LPM-like), so each needs its own
+       independently-learned amplitude/phase envelope.
+
+       theta_end, theta_start are recomputed EXACTLY in float64 each forward
+       pass from the physical inputs (not inverted from the stored arcsinh
+       features, to avoid amplifying float32 rounding by ~omega at small x).
+       Two independent truncated Fourier series (n_harmonics, n_harmonics_dz
+       terms) are evaluated at theta_end and theta_start respectively, with
+       MLP-predicted coefficients (functions of all inputs) acting as the
+       slowly-varying envelope amplitude/phase on top of the exact carrier.
+       Combined additively (S_end - S_start), matching the exact single-q_perp
+       identity (which is recovered exactly at n=1 with the right coefficient).
+
+       Harmonic count must grow as x -> 0 since omega ~ k_perp^2/x oscillates
+       arbitrarily fast; coefficients must stay smooth in k_perp for a
+       truncated series to track the true envelope.
+
+    3. Z-space soft clamp (tanh, scale Z_CLAMP): prevents float32 sinh overflow
+       at huge dynamic range (small-x intensities are many decades above
+       large-x). CAUTION: if raw pre-clamp values approach Z_CLAMP, tanh
+       saturation clips the oscillatory carrier and injects spurious
+       high-frequency distortion harmonics -- check `frac_saturated` (binned by
+       x) if oscillation artifacts appear, especially at small x.
+
+    4. UV power-law envelope: learnable exponent p in [P_MIN,P_MAX] and
+       learnable transition scale k0^2 (anchored above the kinematic max
+       k_perp^2), applied multiplicatively in z-space (additively in log) so
+       every head decays smoothly to the UV threshold set by uv_kt_threshold.
+
+    Output is de-normalized (y_mean/y_std) and, at inference, inverse-transformed
+    via sinh(z)*f0 to recover the physical A0/A1 amplitudes.
+    """
+
     IDX_K_PERP = RadiationDataset.FEATURE_NAMES.index('ln(k_perp)')
     IDX_MU     = RadiationDataset.FEATURE_NAMES.index('mu')
-    IDX_X = RadiationDataset.FEATURE_NAMES.index('x')
-    IDX_E = RadiationDataset.FEATURE_NAMES.index('ln(E)')
+    IDX_X      = RadiationDataset.FEATURE_NAMES.index('ln(x)')
+    IDX_E      = RadiationDataset.FEATURE_NAMES.index('ln(E)')
+    IDX_Z0     = RadiationDataset.FEATURE_NAMES.index('z0')
 
     def __init__(
             self,
@@ -388,29 +458,25 @@ class RadiationEmulator(nn.Module):
             n_layers: int = 5,
             activation: str = "silu",
             dropout_p: float = 0.1,
-            transform: str = "arcsinh"
+            transform: str = "arcsinh",
+            n_harmonics: int = 1,
+            n_harmonics_dz: int = 1,
     ):
         super().__init__()
-
+        self.debug = False  # Whether to compute and print debug info during forward pass
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.n_layers = n_layers
         self.transform = transform
+        self.n_harmonics = n_harmonics
+        self.n_harmonics_dz = n_harmonics_dz
 
-        # Select activation function
-        activations = {
-            'silu': nn.SiLU,
-            'relu': nn.ReLU,
-            'tanh': nn.Tanh,
-            'gelu': nn.GELU,
-        }
+        activations = {'silu': nn.SiLU, 'relu': nn.ReLU, 'tanh': nn.Tanh, 'gelu': nn.GELU}
         act_fn = activations.get(activation, nn.SiLU)
 
-        # Build layers
         self.input_layer = nn.Linear(input_dim, hidden_dim)
         self.input_act = act_fn()
 
-        # Hidden layers with skip connections
         self.hidden_layers = nn.ModuleList()
         self.hidden_acts = nn.ModuleList()
         self.dropouts = nn.ModuleList()
@@ -419,16 +485,18 @@ class RadiationEmulator(nn.Module):
             self.hidden_acts.append(act_fn())
             self.dropouts.append(nn.Dropout(p=dropout_p))
 
-        # Output layer -- 3 features: A0, A1, & A2 fourier harmonic factors.
-        # Each head predicts the harmonic amplitude scaled by 1/f0 (same scale
-        # convention as the arcsinh transform used on the training targets).
-        self.output_layer = nn.Linear(hidden_dim, 2)
+        # Output layer -- target 2 features: A0, A1 fourier harmonic factors.
+        # Each head predicts the harmonic amplitude scaled by 1/f0
+        # Per head: 1 background + (A_n,B_n) per cos(omega_midz) harmonic + (C_m,D_m) per sinc(omega_dz) harmonic
+        self._n_out_per_head = 1 + 2 * self.n_harmonics + 2 * self.n_harmonics_dz
+        self.output_layer = nn.Linear(hidden_dim, 2 * self._n_out_per_head)
 
         # Learnable per-head output scale, in the same units as f0 Initialized to 1.0
         # so that at initialization -- with raw ~ O(1) from Xavier init -- the
         # head's behavior matches a plain linear layer (sinh(z) ~ z for small z).
         # Training is then free to learn a different per-head scale if A0, A1, A2
         # have substantially different typical magnitudes.
+        # Currently does nothing.
         self.head_scale = nn.Parameter(torch.ones(2))
 
         # Learnable UV shape parameters
@@ -436,18 +504,58 @@ class RadiationEmulator(nn.Module):
         target_k0_over_mu = math.sqrt(10) / 0.4
         init_val = math.log(math.exp(target_k0_over_mu) - 1.0)  # invert softplus
         self.raw_k0_scale = nn.Parameter(torch.full((2,), init_val))
-
-        self.P_MIN, self.P_MAX = 1.0, 8.0  # decay rate is *guaranteed* to be at least k_perp^{P_MIN}
+        self.P_MIN, self.P_MAX = 1.0, 8.0
 
         # Normalization buffers -- initialized with something close to an identity normalization
         self.register_buffer('X_mean', torch.zeros(input_dim))
         self.register_buffer('X_std',  torch.ones(input_dim))
-        self.register_buffer('y_mean', torch.zeros(2))   # (A0, A1, A2)
+        self.register_buffer('y_mean', torch.zeros(2))
         self.register_buffer('y_std',  torch.ones(2))
         self.register_buffer('f0',      torch.tensor(1.0))
         self.register_buffer('epsilon', torch.tensor(1e-10))
 
         self._init_weights()
+        self._init_harmonic_scale()
+
+    def _init_harmonic_scale(self):
+        """Shrink initial weights feeding the harmonic slots so training starts close to the
+        old background-only behavior and phases in oscillatory content gradually."""
+        if self.n_harmonics == 0 and self.n_harmonics_dz == 0:
+            return
+        with torch.no_grad():
+            W = self.output_layer.weight.view(2, self._n_out_per_head, -1)
+            b = self.output_layer.bias.view(2, self._n_out_per_head)
+
+            idx = 1
+            if self.n_harmonics > 0:
+                s = 1.0 / math.sqrt(self.n_harmonics)
+                W[:, idx: idx + 2 * self.n_harmonics, :] *= s
+                b[:, idx: idx + 2 * self.n_harmonics] *= s
+                idx += 2 * self.n_harmonics
+            if self.n_harmonics_dz > 0:
+                s = 1.0 / math.sqrt(self.n_harmonics_dz)
+                W[:, idx: idx + 2 * self.n_harmonics_dz, :] *= s
+                b[:, idx: idx + 2 * self.n_harmonics_dz] *= s
+
+    @staticmethod
+    def _eval_harmonics(phase64: torch.Tensor, coeffs: torch.Tensor, n_max: int) -> torch.Tensor:
+        """
+        phase64 : (B,) float64          -- exact bare phase, one value per sample
+        coeffs  : (B, heads, n_max, 2)  -- (A_n, B_n) pairs per head per harmonic
+        n_max   : number of harmonics (0 => returns zeros)
+
+        Returns (B, heads) = sum_n [ A_n*cos(n*phase) + B_n*sin(n*phase) ]
+        """
+        if n_max == 0:
+            return torch.zeros(coeffs.shape[0], coeffs.shape[1], device=coeffs.device, dtype=coeffs.dtype)
+
+        n_range = torch.arange(1, n_max + 1, device=phase64.device, dtype=torch.float64)  # (n_max,)
+        phase_n = phase64.unsqueeze(-1) * n_range.unsqueeze(0)  # (B, n_max), float64
+        cos_n = torch.cos(phase_n).to(coeffs.dtype)  # (B, n_max)
+        sin_n = torch.sin(phase_n).to(coeffs.dtype)  # (B, n_max)
+
+        return (coeffs[..., 0] * cos_n.unsqueeze(1)
+                + coeffs[..., 1] * sin_n.unsqueeze(1)).sum(dim=-1)  # (B, heads)
 
     def _init_weights(self):
         """Initialize weights using Xavier initialization."""
@@ -482,26 +590,77 @@ class RadiationEmulator(nn.Module):
             if i % 2 == 1:
                 h = h + h_block_in
 
-        raw = self.output_layer(h)  # (B, 2)
+        raw_out = self.output_layer(h).view(-1, 2, self._n_out_per_head)  # (B, heads=2, 1+2N+2M)
 
-        E = torch.exp(x_norm[:, self.IDX_E] * self.X_std[self.IDX_E] + self.X_mean[self.IDX_E])
-        x = x_norm[:, self.IDX_X] * self.X_std[self.IDX_X] + self.X_mean[self.IDX_X]
-        k_perp = torch.exp(x_norm[:, self.IDX_K_PERP] * self.X_std[self.IDX_K_PERP] + self.X_mean[self.IDX_K_PERP])
-        mu = x_norm[:, self.IDX_MU] * self.X_std[self.IDX_MU] + self.X_mean[self.IDX_MU]
+        # Get physical parameters
+        lnx64 = (x_norm[:, self.IDX_X].double() * self.X_std[self.IDX_X].double() + self.X_mean[
+            self.IDX_X].double())
+        x64 = torch.exp(lnx64)
+        E64 = torch.exp(
+            x_norm[:, self.IDX_E].double() * self.X_std[self.IDX_E].double() + self.X_mean[self.IDX_E].double())
+        kp64 = torch.exp(x_norm[:, self.IDX_K_PERP].double() * self.X_std[self.IDX_K_PERP].double() + self.X_mean[
+            self.IDX_K_PERP].double())
+        z064 = (x_norm[:, self.IDX_Z0].double() * self.X_std[self.IDX_Z0].double() + self.X_mean[
+            self.IDX_Z0].double())
 
-        # Soft-clamp on the "z-space" raw output -- normalized+transformed
+        x64_safe = x64.clamp(min=1e-12)  # guard only; x is physically bounded away from 0 by kinematic cuts
+
+        background = raw_out[:, :, 0]  # (B, 2)
+        if self.n_harmonics > 0:
+            idx = 1
+            harm_midz_coeffs = raw_out[:, :, idx: idx + 2 * self.n_harmonics].reshape(
+                -1, 2, self.n_harmonics, 2)  # (B, heads, N, [A,B])
+            idx += 2 * self.n_harmonics
+            harm_dz_coeffs = raw_out[:, :, idx: idx + 2 * self.n_harmonics_dz].reshape(
+                -1, 2, self.n_harmonics_dz, 2)  # (B, heads, M, [C,D])
+
+            # --- Recompute EXACT bare phases from physical inputs, in float64 ---
+            # Deliberately does NOT invert the stored arcsinh(omega_*) features.
+            # That inversion amplifies float32 rounding error by a factor of ~omega itself, which
+            # is precisely the divergent regime (x -> 0) we need to be most accurate in.
+            omega_k64 = kp64 ** 2 / (2.0 * x64_safe * E64)  # (B,)
+            omega_dz64 = omega_k64 * DELTA_Z / 2.0  # phase for the sinc(...) factor
+            omega_midz64 = omega_k64 * (z064 + DELTA_Z / 2.0)  # phase for the cos(...) factor
+
+            # # Exact slab-endpoint phases -- sinc(omega dz / 2)cos(omega(z0 + dz/2)) -> difference of sines
+            # theta_end64 = omega_midz64 + omega_dz64  # omega_k * (z0 + Delta_z)
+            # theta_start64 = omega_midz64 - omega_dz64  # omega_k * z0
+            #
+            # harm_end_sum = self._eval_harmonics(theta_end64, harm_midz_coeffs,  # (B, 2)
+            #                                     self.n_harmonics)
+            # harm_start_sum = self._eval_harmonics(theta_start64, harm_dz_coeffs,  # (B, 2)
+            #                                       self.n_harmonics_dz)
+            #
+            # raw = background + harm_end_sum - harm_start_sum  # (B, 2) -- this sign is arbitrary -- can be absorbed by NN
+            harm_midz_sum = self._eval_harmonics(omega_midz64, harm_midz_coeffs, self.n_harmonics)  # (B, 2)
+            harm_dz_sum = self._eval_harmonics(omega_dz64, harm_dz_coeffs, self.n_harmonics_dz)  # (B, 2)
+
+            raw = background + harm_midz_sum + harm_dz_sum  # (B, 2) -- same role as old "raw"
+        else:
+            raw = background # (B, 2)
+
         """
+        Soft-clamp on the "z-space" raw output -- normalized+transformed
         Tuning this parameter is extremely important for not clipping huge vals at small x !!!
-        
+
         If you end up with any amount of clipping in the z-space output, 
         you may need to adjust this parameter. This can manifest in many different signals, including apparent high-
         frequency oscillations in the very large value regions of the output. Use the debug print below when plotting
         the output to check for clipping. You should see zero here.
-        
+
         float32 overflow occurs at sinh(~88.7), so keep this relatively well below 88.7.
         """
         Z_CLAMP = 50.0
-        raw_z = Z_CLAMP * torch.tanh(raw / Z_CLAMP)  # (B, 2), safely bounded, good gradients
+        raw_z = Z_CLAMP * torch.tanh(raw / Z_CLAMP)  # (B, 2)
+
+        """
+        Envelop on output to enforce decay with k_perp -- learnable power law with learnable transition scale
+        """
+        # Physical parameters
+        E = E64.to(raw.dtype)
+        x = x64.to(raw.dtype)
+        k_perp = kp64.to(raw.dtype)
+        mu = x_norm[:, self.IDX_MU] * self.X_std[self.IDX_MU] + self.X_mean[self.IDX_MU]
 
         # Learnable exponent, bounded by P_MIN and P_MAX
         p = self.P_MIN + (self.P_MAX - self.P_MIN) * torch.sigmoid(self.raw_p)  # (2,)
@@ -525,15 +684,37 @@ class RadiationEmulator(nn.Module):
         # z = raw_z + self.head_scale.unsqueeze(0) + log_envelope  # Include head scale effect
 
         # Some debug prints
-        with torch.no_grad():
-            frac_saturated = (raw_z.abs() > 0.95 * Z_CLAMP).float().mean()
-            print(f"  clamp saturation frac: {frac_saturated:.3f}  "
-                  f"K: {(torch.sqrt(K)).mean():.3f}  "
-                  f"k0: {(torch.sqrt(k0_sq)).mean():.3f}  "
-                  f"k0 param: {self.raw_k0_scale}  "
-                  f"p: {p.tolist()}")
+        if self.debug:
+            with torch.no_grad():
+                sat_mask = (raw_z.abs() > 0.95 * Z_CLAMP)  # (B, 2) -- per-head saturation
+                sat_any = sat_mask.any(dim=1)  # (B,)   -- saturated on either head
+
+                x_bins = torch.tensor([0.0, 1e-3, 3e-3, 1e-2, 3e-2, 1e-1, 3e-1, 1.0],
+                                      device=x64.device, dtype=x64.dtype)
+                bin_idx = torch.bucketize(x64.detach(), x_bins)
+
+                print(f"  clamp saturation frac: {sat_any.float().mean():.3f}  "
+                      f"K: {torch.sqrt(K).mean():.3f}  k0: {torch.sqrt(k0_sq).mean():.3f}  "
+                      f"p: {p.tolist()}")
+                for b in range(1, len(x_bins)):
+                    m = bin_idx == b
+                    n = int(m.sum())
+                    if n > 0:
+                        frac0 = sat_mask[m, 0].float().mean().item()
+                        frac1 = sat_mask[m, 1].float().mean().item()
+                        print(f"    x∈[{x_bins[b - 1]:.1e},{x_bins[b]:.1e})  n={n:6d}  "
+                              f"sat(A0)={frac0:.3f}  sat(A1)={frac1:.3f}")
 
         return (z - self.y_mean) / self.y_std
+
+
+def set_debug(model, flag: bool):
+    """
+    Set debug flag in a model object.
+    """
+    m = model.module if isinstance(model, nn.DataParallel) else model
+    m = getattr(m, '_orig_mod', m)  # unwrap torch.compile if present
+    m.debug = flag
 
 # ==============================================================================
 # Training utilities
@@ -653,11 +834,10 @@ def compute_loss(
         phys[:, IDX_K_PERP] = k_perp_uv
 
         # Recompute the k_perp-dependent derived features consistently
-        IDX_X, IDX_E, IDX_Z0 = names.index('x'), names.index('ln(E)'), names.index('ln(z0)')
-        x_p, E_p, z0_p = phys[:, IDX_X], torch.exp(phys[:, IDX_E]), torch.exp(phys[:, IDX_Z0])
+        IDX_X, IDX_E, IDX_Z0 = names.index('ln(x)'), names.index('ln(E)'), names.index('ln(z0)')
+        x_p, E_p, z0_p = torch.exp(phys[:, IDX_X]), torch.exp(phys[:, IDX_E]), torch.exp(phys[:, IDX_Z0])
         mu_p = phys[:, names.index('mu')]
         k_perp_p = torch.exp(phys[:, IDX_K_PERP])
-        DELTA_Z = 0.1 / 0.197327
         omega_k = k_perp_p ** 2 / (2 * x_p * E_p)
         phys[:, names.index('omega_k_dz')] = omega_k * DELTA_Z / 2
         phys[:, names.index('omega_k_midz')] = omega_k * (z0_p + DELTA_Z / 2)
@@ -797,7 +977,7 @@ def save_training_checkpoint(
         'best_val_loss': best_val_loss,
         'patience_counter': patience_counter,
     }, path)
-    print(f"  [checkpoint] Saved training state at epoch {epoch + 1} → {path}")
+    # print(f"  [checkpoint] Saved training state at epoch {epoch + 1} → {path}")
 
 
 def load_training_checkpoint(
@@ -968,6 +1148,8 @@ def train_model(config: TrainingConfig):
         activation=config.activation,
         dropout_p=config.dropout_p,
         transform=config.transform,
+        n_harmonics=config.n_harmonics,
+        n_harmonics_dz=config.n_harmonics_dz,
     ).to(config.device)
 
     # Set normalization values of model
@@ -1108,6 +1290,8 @@ def train_model(config: TrainingConfig):
                             'input_dim': len(dataset.FEATURE_NAMES),
                             'dropout_p': config.dropout_p,
                             'transform': config.transform,
+                            'n_harmonics': config.n_harmonics,
+                            'n_harmonics_dz': config.n_harmonics_dz,
                         },
                         'feature_names': dataset.FEATURE_NAMES,
                         'epoch': epoch,
@@ -1159,7 +1343,9 @@ class RadiationEmulatorInference:
             n_layers=model_config['n_layers'],
             activation=model_config['activation'],
             dropout_p=model_config.get('dropout_p', 0.0),
-            transform = model_config.get('transform', 'arcsinh'),
+            transform=model_config.get('transform', 'arcsinh'),
+            n_harmonics=model_config.get('n_harmonics', 0),
+            n_harmonics_dz=model_config.get('n_harmonics_dz', 0),
         ).to(device)
         self.device = device
 
@@ -1190,6 +1376,7 @@ class RadiationEmulatorInference:
             print(f"Loaded model from {model_file}")
             print(f"  Validation loss: {checkpoint['val_loss']:.4e}")
             print(f"  Trained for {checkpoint['epoch'] + 1} epochs")
+            set_debug(self.model, True)
 
     def predict(
             self,
@@ -1513,6 +1700,8 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=default_config.n_epochs, help="Number of training epochs")
     parser.add_argument("--hidden-dim", type=int, default=default_config.hidden_dim, help="Hidden layer dimension")
     parser.add_argument("--n-layers", type=int, default=default_config.n_layers, help="Number of hidden layers")
+    parser.add_argument("--n-harmonics", type=int, default=default_config.n_harmonics,
+                        help="Number of cos/sin harmonics of the bare oscillation phase per head")
     parser.add_argument("--learning-rate", type=float, default=default_config.learning_rate,
                         help="Initial learning rate")
     parser.add_argument("--find-lr", action="store_true", help="Run LR range test and exit")
@@ -1532,6 +1721,7 @@ if __name__ == "__main__":
         n_epochs=args.epochs,
         hidden_dim=args.hidden_dim,
         n_layers=args.n_layers,
+        n_harmonics=args.n_harmonics,
         learning_rate=args.learning_rate,
         run_lr_finder=args.find_lr,
         transform=args.transform,
