@@ -84,6 +84,8 @@ class TrainingConfig:
     # Physics constraints
     lambda_A0: float = 1.0  # Weight for MSE of A0 head
     lambda_A1: float = 1.0  # Weight for MSE of A1 head
+    lambda_A0_int: float = 1.0  # Weight for integral-importance absolute-error term (A0)
+    lambda_A1_int: float = 1.0  # Weight for integral-importance absolute-error term (A1)
     lambda_uv: float = 0.0  # Weight for UV decay loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
@@ -244,7 +246,7 @@ class RadiationDataset(Dataset):
 
         # Apply mask to cut arrays
         self.X_data = X_raw[ok]
-        del X_raw, raw_cols
+        del X_raw
 
         self.A0_data = A0_raw[ok]
         del A0_raw
@@ -260,6 +262,22 @@ class RadiationDataset(Dataset):
         self.A1_err_data = A1_err[ok]
         del A0_err, A1_err
 
+        """
+        Integral-importance weight: Jacobian from log-uniform sampling in
+        (x, k_perp) to the physical measure (x dk_perp^2), i.e. how much
+        each point contributes to the deployment-grid integral over
+        dx d^2k_perp. 
+        
+        Important to match this to the actual deployment quadrature weights 
+        if the grid isn't log-uniform in both variables.
+        """
+        x_ok = raw_cols['x'][ok]
+        kperp_ok = raw_cols['k_perp'][ok]
+        w_int_raw = (x_ok * kperp_ok ** 2).astype(np.float64)
+        self.w_int_mean = float(w_int_raw.mean())
+        self.w_int_data = (w_int_raw / self.w_int_mean).astype(np.float32)  # normalized to mean 1, for loss-scale stability
+
+        del raw_cols
         del ok
 
         self.n_valid = n_valid
@@ -299,6 +317,21 @@ class RadiationDataset(Dataset):
         self.A0_err_norm_data = (self.A0_err_data * A0_deriv / self.A0_std).astype(np.float32)
         self.A1_err_norm_data = (self.A1_err_data * A1_deriv / self.A1_std).astype(np.float32)
         del self.A0_err_data, self.A1_err_data, A0_deriv, A1_deriv
+
+        # Combined weight for the integral-importance absolute-error loss term:
+        #   (transform-space residual)^2 * A0_intw  ≈  (physical residual)^2 * w_int
+        # i.e. this directly approximates each point's contribution to the
+        # *squared error of the total integral estimate*.
+        self.A0_intw_data = (
+                self.w_int_data.astype(np.float64)
+                * (self.A0_std ** 2)
+                * (self.f0 ** 2 + self.A0_data.astype(np.float64) ** 2)
+        ).astype(np.float32)
+        self.A1_intw_data = (
+                self.w_int_data.astype(np.float64)
+                * (self.A1_std ** 2)
+                * (self.f0 ** 2 + self.A1_data.astype(np.float64) ** 2)
+        ).astype(np.float32)
 
         print(f"  weight_mean={self.weight_mean:.3e}  f0={self.f0:.3e}")
 
@@ -343,6 +376,8 @@ class RadiationDataset(Dataset):
         w_norm = self.w_norm_data[idx]
         A0_err_norm = self.A0_err_norm_data[idx]
         A1_err_norm = self.A1_err_norm_data[idx]
+        A0_intw = self.A0_intw_data[idx]
+        A1_intw = self.A1_intw_data[idx]
 
         return (
             torch.from_numpy(x_norm),
@@ -351,6 +386,8 @@ class RadiationDataset(Dataset):
             torch.tensor(w_norm, dtype=torch.float32),
             torch.tensor(A0_err_norm, dtype=torch.float32),
             torch.tensor(A1_err_norm, dtype=torch.float32),
+            torch.tensor(A0_intw, dtype=torch.float32),
+            torch.tensor(A1_intw, dtype=torch.float32),
         )
 
     # Get a group of points by a list of indices. Uses fancy indexing to avoid loop overhead.
@@ -363,6 +400,8 @@ class RadiationDataset(Dataset):
         w_batch = self.w_norm_data[indices]
         A0_err_batch = self.A0_err_norm_data[indices]
         A1_err_batch = self.A1_err_norm_data[indices]
+        A0_intw_batch = self.A0_intw_data[indices]
+        A1_intw_batch = self.A1_intw_data[indices]
 
         return [
             torch.from_numpy(X_batch),
@@ -371,6 +410,8 @@ class RadiationDataset(Dataset):
             torch.from_numpy(w_batch.copy()),
             torch.from_numpy(A0_err_batch.copy()),
             torch.from_numpy(A1_err_batch.copy()),
+            torch.from_numpy(A0_intw_batch.copy()),
+            torch.from_numpy(A1_intw_batch.copy()),
         ]
 
     ########################
@@ -783,6 +824,8 @@ def compute_loss(
         weights: torch.Tensor,
         A0_err: torch.Tensor,
         A1_err: torch.Tensor,
+        A0_intw: torch.Tensor,
+        A1_intw: torch.Tensor,
         config: TrainingConfig,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
@@ -813,13 +856,23 @@ def compute_loss(
     A0_excess = torch.clamp(torch.abs(NN_A0 - A0_targets) - A0_err, min=0.0)
     A1_excess = torch.clamp(torch.abs(NN_A1 - A1_targets) - A1_err, min=0.0)
 
-    # Quadratur subtraction residual: variance decomposition into (modal error)^2 + (MC error)^2
+    # Quadrature subtraction residual: variance decomposition into (modal error)^2 + (MC error)^2
     # Advantage of having no discontinuity at error level, but not as clean of a signal of what the error means
     # A0_excess = torch.clamp(torch.abs(NN_A0 - A0_targets)**2 - A0_err**2, min=0.0)
     # A1_excess = torch.clamp(torch.abs(NN_A1 - A1_targets)**2 - A1_err**2, min=0.0)
 
     A0_mse = (weights * A0_excess ** 2).mean()
     A1_mse = (weights * A1_excess ** 2).mean()
+
+
+    """
+    Integral importance weighted absolute-error loss
+    """
+    # A0_intw/A1_intw ≈ (integral quadrature weight) * d(physical)/d(z_norm)^2,
+    # so (excess^2 * intw) approximates each point's contribution to the
+    # squared error of the deployment-grid integral estimate.
+    A0_int_abs = (A0_intw * A0_excess ** 2).mean()
+    A1_int_abs = (A1_intw * A1_excess ** 2).mean()
 
     """
     UV decay enforcement loss
@@ -893,12 +946,16 @@ def compute_loss(
     total_loss = (
             config.lambda_A0 * A0_mse
             + config.lambda_A1 * A1_mse
+            + config.lambda_A0_int * A0_int_abs
+            + config.lambda_A1_int * A1_int_abs
             + config.lambda_uv * uv_decay
     )
 
     components = {
         'A0_mse': A0_mse.item(),
         'A1_mse': A1_mse.item(),
+        'A0_int_abs': A0_int_abs.item(),
+        'A1_int_abs': A1_int_abs.item(),
         'uv_decay': uv_decay.item(),
         'total': total_loss.item(),
     }
@@ -919,7 +976,7 @@ def train_epoch(
     n_batches = 0
 
     t0 = time.time()
-    for i, (inputs, A0_targets, A1_targets, weights, A0_err, A1_err) in enumerate(dataloader):
+    for i, (inputs, A0_targets, A1_targets, weights, A0_err, A1_err, A0_intw, A1_intw) in enumerate(dataloader):
         # if i % 10000 == 0 and i != 0:
         #     print(f"  Batch {i}/{len(dataloader)}  [avg {(time.time() - t0)/i:.3f}s/batch]")
 
@@ -933,7 +990,7 @@ def train_epoch(
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, A0_err, A1_err, config)
+        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, A0_err, A1_err, A0_intw, A1_intw, config)
         if not torch.isfinite(loss):
             print("Non-finite loss detected:", components)
             raise FloatingPointError("Non-finite loss")
@@ -965,7 +1022,7 @@ def validate(
     n_batches = 0
 
     with torch.no_grad():
-        for inputs, A0_targets, A1_targets, weights, A0_err, A1_err in dataloader:
+        for inputs, A0_targets, A1_targets, weights, A0_err, A1_err, A0_intw, A1_intw in dataloader:
             # Send tensors to device
             inputs = inputs.to(config.device)
             A0_targets = A0_targets.to(config.device)
@@ -975,7 +1032,7 @@ def validate(
             A1_err = A1_err.to(config.device)
 
             # Compute loss
-            _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, A0_err, A1_err, config)
+            _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, A0_err, A1_err, A0_intw, A1_intw, config)
 
             # Add to running sum of loss and MSE
             total_loss += components['total']
