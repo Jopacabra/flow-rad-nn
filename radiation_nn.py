@@ -238,7 +238,6 @@ class RadiationDataset(Dataset):
                 & np.isfinite(A1_err)
                 & np.all(np.isfinite(X_raw), axis=1)
         )
-        del A0_err, A1_err  # Trash the integration error to save memory
 
         n_valid = int(ok.sum())
         print(f"  {n_raw:,} raw  →  {n_valid:,} valid")
@@ -255,6 +254,12 @@ class RadiationDataset(Dataset):
 
         self.w_data = w_raw[ok]
         del w_raw
+
+        # Keep the MC integration errors -- We will use these to have a noise-floor-dependent loss
+        self.A0_err_data = A0_err[ok]
+        self.A1_err_data = A1_err[ok]
+        del A0_err, A1_err
+
         del ok
 
         self.n_valid = n_valid
@@ -288,6 +293,13 @@ class RadiationDataset(Dataset):
         self.X_norm_data = ((self.X_data - self.X_mean) / self.X_std).astype(np.float32)
         self.w_norm_data = (self.w_data / self.weight_mean).astype(np.float32)
 
+        # Normalize MC integration error
+        A0_deriv = self._transform_deriv(self.A0_data)
+        A1_deriv = self._transform_deriv(self.A1_data)
+        self.A0_err_norm_data = (self.A0_err_data * A0_deriv / self.A0_std).astype(np.float32)
+        self.A1_err_norm_data = (self.A1_err_data * A1_deriv / self.A1_std).astype(np.float32)
+        del self.A0_err_data, self.A1_err_data, A0_deriv, A1_deriv
+
         print(f"  weight_mean={self.weight_mean:.3e}  f0={self.f0:.3e}")
 
     ####################
@@ -299,6 +311,22 @@ class RadiationDataset(Dataset):
         elif self.transform == "log":
             return (np.sign(y / self.f0) * np.log(np.abs(y / self.f0) + self.epsilon)).astype(np.float32)
         return y.astype(np.float32)
+
+    def _transform_deriv(self, y: np.ndarray) -> np.ndarray:
+        """
+        Analytic derivative d[transform(y)]/dy, used to propagate the raw MC
+        integration error (in physical A0/A1 units) into the transformed
+        space the network is trained in, via the delta method:
+            sigma_transformed ≈ |d(transform)/dy| * sigma_y
+        """
+        y64 = y.astype(np.float64)
+        if self.transform == "arcsinh":
+            # d/dy arcsinh(y/f0) = 1 / sqrt(f0^2 + y^2)
+            return (1.0 / np.sqrt(self.f0 ** 2 + y64 ** 2)).astype(np.float32)
+        elif self.transform == "log":
+            # d/dy [sign(y/f0)*log(|y/f0|+eps)] = 1 / (|y| + f0*eps)
+            return (1.0 / (np.abs(y64) + self.f0 * self.epsilon)).astype(np.float32)
+        return np.ones_like(y, dtype=np.float32)
 
     #####################
     # Dataset protocols #
@@ -313,12 +341,16 @@ class RadiationDataset(Dataset):
         A0_norm = self.A0_norm_data[idx]
         A1_norm = self.A1_norm_data[idx]
         w_norm = self.w_norm_data[idx]
+        A0_err_norm = self.A0_err_norm_data[idx]
+        A1_err_norm = self.A1_err_norm_data[idx]
 
         return (
             torch.from_numpy(x_norm),
             torch.tensor(A0_norm, dtype=torch.float32),
             torch.tensor(A1_norm, dtype=torch.float32),
             torch.tensor(w_norm, dtype=torch.float32),
+            torch.tensor(A0_err_norm, dtype=torch.float32),
+            torch.tensor(A1_err_norm, dtype=torch.float32),
         )
 
     # Get a group of points by a list of indices. Uses fancy indexing to avoid loop overhead.
@@ -329,19 +361,21 @@ class RadiationDataset(Dataset):
         A0_batch = self.A0_norm_data[indices]
         A1_batch = self.A1_norm_data[indices]
         w_batch = self.w_norm_data[indices]
+        A0_err_batch = self.A0_err_norm_data[indices]
+        A1_err_batch = self.A1_err_norm_data[indices]
 
-        # Return four tensors — collate_fn receives one "sample" and passes
-        # it straight through without any further stacking.
         return [
             torch.from_numpy(X_batch),
             torch.from_numpy(A0_batch.copy()),
             torch.from_numpy(A1_batch.copy()),
             torch.from_numpy(w_batch.copy()),
+            torch.from_numpy(A0_err_batch.copy()),
+            torch.from_numpy(A1_err_batch.copy()),
         ]
 
-    # ------------------------------------------------------------------
-    # Normalization export (unchanged)
-    # ------------------------------------------------------------------
+    ########################
+    # Normalization export #
+    ########################
     def get_normalization_params(self) -> Dict:
         return {
             'X_mean':        self.X_mean.tolist(),
@@ -747,6 +781,8 @@ def compute_loss(
         A0_targets: torch.Tensor,
         A1_targets: torch.Tensor,
         weights: torch.Tensor,
+        A0_err: torch.Tensor,
+        A1_err: torch.Tensor,
         config: TrainingConfig,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
@@ -771,22 +807,19 @@ def compute_loss(
     NN_A0 = NN_heads[:, 0]
     NN_A1 = NN_heads[:, 1]
 
-    # Notice no transformation of model output -- training for raw model output in transformed and normalized space
-    A0_mse = (weights * (NN_A0 - A0_targets) ** 2).mean()
-    A1_mse = (weights * (NN_A1 - A1_targets) ** 2).mean()
+    # Dead-zone (epsilon-insensitive) residual: zero loss contribution for
+    # any point where |NN - target| is within that point's MC integration
+    # error; only the excess beyond the noise floor is penalized.
+    A0_excess = torch.clamp(torch.abs(NN_A0 - A0_targets) - A0_err, min=0.0)
+    A1_excess = torch.clamp(torch.abs(NN_A1 - A1_targets) - A1_err, min=0.0)
 
-    # accumulate residuals and x per point
-    # A0_res2 = (NN_A0 - A0_targets) ** 2
-    # A1_res2 = (NN_A1 - A1_targets) ** 2
-    # for lo, hi in zip([0], [1]):
-    #     mask = (x_phys >= lo) & (x_phys < hi)
-    #     print(f"x∈[{lo:.1e},{hi:.1e}): A0 frac of loss = {A0_res2[mask].sum() / A0_res2.sum():.3f}")
-    #     print(f"x∈[{lo:.1e},{hi:.1e}): A1 frac of loss = {A1_res2[mask].sum() / A1_res2.sum():.3f}")
+    # Quadratur subtraction residual: variance decomposition into (modal error)^2 + (MC error)^2
+    # Advantage of having no discontinuity at error level, but not as clean of a signal of what the error means
+    # A0_excess = torch.clamp(torch.abs(NN_A0 - A0_targets)**2 - A0_err**2, min=0.0)
+    # A1_excess = torch.clamp(torch.abs(NN_A1 - A1_targets)**2 - A1_err**2, min=0.0)
 
-    # Debug prints
-    # print(f"x: {x_phys}")
-    # print(f"A0: {NN_A0}")
-    # print(f"A1: {NN_A1}")
+    A0_mse = (weights * A0_excess ** 2).mean()
+    A1_mse = (weights * A1_excess ** 2).mean()
 
     """
     UV decay enforcement loss
@@ -886,7 +919,7 @@ def train_epoch(
     n_batches = 0
 
     t0 = time.time()
-    for i, (inputs, A0_targets, A1_targets, weights) in enumerate(dataloader):
+    for i, (inputs, A0_targets, A1_targets, weights, A0_err, A1_err) in enumerate(dataloader):
         # if i % 10000 == 0 and i != 0:
         #     print(f"  Batch {i}/{len(dataloader)}  [avg {(time.time() - t0)/i:.3f}s/batch]")
 
@@ -895,10 +928,12 @@ def train_epoch(
         A0_targets = A0_targets.to(config.device)
         A1_targets = A1_targets.to(config.device)
         weights = weights.to(config.device)
+        A0_err = A0_err.to(config.device)
+        A1_err = A1_err.to(config.device)
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config)
+        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, A0_err, A1_err, config)
         if not torch.isfinite(loss):
             print("Non-finite loss detected:", components)
             raise FloatingPointError("Non-finite loss")
@@ -930,15 +965,17 @@ def validate(
     n_batches = 0
 
     with torch.no_grad():
-        for inputs, A0_targets, A1_targets, weights in dataloader:
+        for inputs, A0_targets, A1_targets, weights, A0_err, A1_err in dataloader:
             # Send tensors to device
             inputs = inputs.to(config.device)
             A0_targets = A0_targets.to(config.device)
             A1_targets = A1_targets.to(config.device)
             weights = weights.to(config.device)
+            A0_err = A0_err.to(config.device)
+            A1_err = A1_err.to(config.device)
 
             # Compute loss
-            _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config)
+            _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, A0_err, A1_err, config)
 
             # Add to running sum of loss and MSE
             total_loss += components['total']
