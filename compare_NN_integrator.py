@@ -31,8 +31,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 ape_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.append(ape_dir)
 
-from integration import integrate_analytic_z_t234_brutemc_t1 as integrate_point
-from radiation_nn import RadiationEmulatorInference
+from integration import integrate_analytic_z_brutemc_t1 as integrate_point
+from radiation_nn import RadiationEmulatorInference, kinematic_domain
 
 # ==============================================================================
 # Defaults
@@ -46,9 +46,8 @@ DEFAULTS = dict(
     mu       = 0.6,
     n_kx    = 30,
     n_ky    = 30,
-    kx_max  = 4.0,
-    ky_max  = 4.0,
-    x_values = [0.01, 0.1],   # fixed x values for the x-slice plots
+    kperp_max  = None,  # Use maximum kinematically allowed kperp
+    x_values = [0.2, 0.5],   # fixed x values for the x-slice plots
 )
 DTAU = 0.1/HBARC
 DEFAULTS["zf"] = DEFAULTS["z0"] + DTAU  # dtau = 0.1 fm
@@ -153,116 +152,9 @@ def compute_nn_grid(
 
 
 # ==============================================================================
-# Plotting
-# ==============================================================================
-def make_comparison_plot(
-    kx_values, ky_values,
-    I_ref, I_err,
-    I_nn,
-    params: dict,
-    output_file: str,
-):
-    """
-    Three-panel density plot:
-      [0] Reference integrator
-      [1] NN emulator
-      [2] Relative residual (NN - Ref) / |Ref|
-    """
-    # Symmetric colour scale based on the reference, ignoring NaNs
-    ref_max = np.nanpercentile(np.abs(I_ref), 98)
-    vmin, vmax = -ref_max, ref_max
-
-    # Relative residual — guard against near-zero reference values
-    with np.errstate(invalid='ignore', divide='ignore'):
-        rel_residual = (I_nn - I_ref) / (np.abs(I_ref) + 1e-30)
-        rel_residual[~np.isfinite(rel_residual)] = np.nan
-
-    res_abs = np.nanpercentile(np.abs(rel_residual), 98)
-
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
-
-    extent = [ky_values[0], ky_values[-1], kx_values[0], kx_values[-1]]
-    imshow_kwargs = dict(
-        origin='lower',
-        aspect='auto',
-        extent=extent,
-        interpolation='nearest',
-    )
-
-    # --- Panel 0: Reference ---
-    im0 = axes[0].imshow(
-        I_ref, cmap='RdBu_r', vmin=vmin, vmax=vmax, **imshow_kwargs
-    )
-    axes[0].set_title('Reference (Vegas integrator)')
-    axes[0].set_xlabel(r'$k_y$ (GeV)')
-    axes[0].set_ylabel(r'$k_x$ (GeV)')
-    fig.colorbar(im0, ax=axes[0], label=r'$I$ (no $C_F$)')
-
-    # Overlay integration error as contour where I_err / |I_ref| > 0.5
-    # so you can see where the reference itself is unreliable
-    with np.errstate(invalid='ignore', divide='ignore'):
-        rel_err = I_err / (np.abs(I_ref) + 1e-30)
-    axes[0].contour(
-        ky_values, kx_values, rel_err,
-        levels=[0.5], colors='yellow', linewidths=1.0, linestyles='--',
-    )
-    axes[0].set_title('Reference (Vegas integrator)'
-                      r'dashed = $\sigma_\mathrm{MC}/|I| > 0.5$')
-
-    # --- Panel 1: NN ---
-    im1 = axes[1].imshow(
-        I_nn, cmap='RdBu_r', vmin=vmin, vmax=vmax, **imshow_kwargs
-    )
-    axes[1].set_title('NN emulator')
-    axes[1].set_xlabel(r'$k_y$ (GeV)')
-    axes[1].set_ylabel(r'$k_x$ (GeV)')
-    fig.colorbar(im1, ax=axes[1], label=r'$I$ (no $C_F$)')
-
-    # --- Panel 2: Relative residual ---
-    # im2 = axes[2].imshow(
-    #     rel_residual, cmap='coolwarm', vmin=-res_abs, vmax=res_abs, **imshow_kwargs
-    # )
-    vmax = np.amax([1, np.amax(np.abs(rel_residual))])
-    im2 = axes[2].imshow(
-        rel_residual, cmap='coolwarm', vmin=-vmax, vmax=vmax, **imshow_kwargs
-    )
-    axes[2].set_title(r'Relative residual $(I_\mathrm{NN} - I_\mathrm{ref})/|I_\mathrm{ref}|$')
-    axes[2].set_xlabel(r'$k_y$ (GeV)')
-    axes[2].set_ylabel(r'$k_x$ (GeV)')
-    fig.colorbar(im2, ax=axes[2], label='Relative residual')
-
-    # Shared title with parameter values
-    param_str = (
-        f"$x={params['x']:.2f}$, "
-        f"$E={params['E']:.1f}$ GeV, "
-        f"$z_0={params['z0']:.1f}$ GeV^-1, "
-        f"$z_f={params['zf']:.1f}$ GeV^-1, "
-        f"$u_\\perp={params['u_perp']:.2f}$, "
-        f"$mu={params['mu']:.3f}$ GeV, "
-    )
-    fig.suptitle(param_str, fontsize=11, y=1.01)
-
-    # Summary statistics in console
-    valid = np.isfinite(I_ref) & np.isfinite(I_nn)
-    if valid.sum() > 0:
-        mae = np.mean(np.abs(I_nn[valid] - I_ref[valid]))
-        mre = np.nanmedian(np.abs(rel_residual[valid]))
-        print(f"\n  MAE:            {mae:.4e}")
-        print(f"  Median |rel|:   {mre:.3f}  ({mre*100:.1f}%)")
-        print(f"  Points with |rel| > 0.5:  "
-              f"{(np.abs(rel_residual[valid]) > 0.5).sum()} / {valid.sum()}")
-
-    plt.tight_layout()
-    plt.savefig(output_file, dpi=150, bbox_inches='tight')
-    print(f"\n  Plot saved to: {output_file}")
-    plt.show()
-
-
-# ==============================================================================
 # Combined multi-row plot
 # ==============================================================================
 def make_combined_plot(
-    kx_values, ky_values,
     rows: list,          # list of (params, I_ref, I_err, I_nn)
     output_file: str,
 ):
@@ -288,28 +180,48 @@ def make_combined_plot(
         squeeze=False,
     )
 
-    mirror = True
-    if mirror:
-        extent = [(-1)*ky_values[-1], ky_values[-1], kx_values[0], kx_values[-1]]
-    else:
+    for row_idx, (params, kx_values, ky_values, I_ref, I_err, I_nn, kperp_min, kperp_max) in enumerate(rows):
+        def _add_kperp_circles(ax, kperp_min, kperp_max, extent):
+            """
+            Overlay thin, black dashed circles of radius kperp_min and kperp_max
+            (centered at the origin, kx=0, ky=0) onto ax, but only if the circle
+            is actually visible within the axes' current extent.
+            """
+            x0, x1, y0, y1 = extent
+            # Farthest distance from the origin reached anywhere in the plot box
+            max_radius = np.hypot(max(abs(x0), abs(x1)), max(abs(y0), abs(y1)))
+            # Closest distance from the origin to the plot box (0 if origin is inside)
+            min_radius = 0.0
+            if x0 > 0 or x1 < 0:
+                min_radius = min(abs(x0), abs(x1))
+            if y0 > 0 or y1 < 0:
+                min_radius = np.hypot(min_radius, min(abs(y0), abs(y1)))
+
+            ls = ['-', '--']  # minimum gets solid line, maximum gets dashed line
+            colors = ["black", "green"]
+            for i, r in enumerate([kperp_min, kperp_max]):
+                if r is not None and np.isfinite(r) and min_radius <= r <= max_radius:
+                    circle = plt.Circle(
+                        (0, 0), r,
+                        edgecolor=colors[i], facecolor='none',
+                        linewidth=0.8, linestyle=ls[i], zorder=5,
+                    )
+                    ax.add_patch(circle)
+
+        # Compute extent
         extent = [ky_values[0], ky_values[-1], kx_values[0], kx_values[-1]]
-    imshow_kwargs = dict(
-        origin='lower',
-        aspect='equal',
-        extent=extent,
-        interpolation='nearest',
-    )
+        print(extent)
+        imshow_kwargs = dict(
+            origin='lower',
+            aspect='equal',
+            extent=extent,
+            interpolation='nearest',
+        )
 
-    for row_idx, (params, I_ref, I_err, I_nn) in enumerate(rows):
-        if mirror:
-            flip_ax = 1
-            I_ref = np.concat((np.flip(I_ref, axis=flip_ax), I_ref), axis=flip_ax)
-            I_err = np.concat((np.flip(I_err, axis=flip_ax), I_err), axis=flip_ax)
-            I_nn = np.concat((np.flip(I_nn, axis=flip_ax), I_nn), axis=flip_ax)
-
+        # label axes
         ax_ref, ax_nn, ax_res = axes[row_idx]
 
-        # Per-row colour scale
+        # Per-row color scale
         ref_max = np.nanpercentile(np.abs(I_ref), 98)
         vmin, vmax = -ref_max, ref_max
 
@@ -324,16 +236,8 @@ def make_combined_plot(
         with np.errstate(invalid='ignore', divide='ignore'):
             rel_err = I_err / (np.abs(I_ref) + 1e-30)
 
-        if mirror:
-            flip_ax = 0
-            rel_err = np.concat((np.flip(rel_err, axis=flip_ax), rel_err))
-            plot_kx = np.concat((np.flip(kx_values, axis=flip_ax), kx_values))
-            plot_ky = np.concat((np.flip(ky_values, axis=flip_ax), ky_values))
-        else:
-            plot_kx = kx_values
-            plot_ky = ky_values
         ax_ref.contour(
-            plot_ky, plot_ky, rel_err,
+            kx_values, ky_values, rel_err,
             levels=[0.5], colors='yellow', linewidths=1.0, linestyles='--',
         )
         ax_ref.set_title('Reference (Vegas integrator)\n'
@@ -362,9 +266,13 @@ def make_combined_plot(
         ax_res.set_ylabel(r'$k_x$ (GeV)')
         fig.colorbar(im2, ax=ax_res, label='Relative residual')
 
+        # Plot a thin, black dashed circle at kperp_min and kperp_max, if they are on the plots
+        for ax in (ax_ref, ax_nn, ax_res):
+            _add_kperp_circles(ax, kperp_min, kperp_max, extent)
+
         # Row label on the left spine
         ax_ref.set_ylabel(
-            f"$x={params['x']:.2f}$, " + '\n\n' + r'$k_x$ (GeV)',
+            f"$x={params['x']:.3f}$, " + '\n\n' + r'$k_x$ (GeV)',
             fontsize=9,
         )
 
@@ -400,15 +308,13 @@ def main():
     parser = argparse.ArgumentParser(
         description='Compare NN emulator vs Vegas integrator on a (kx, ky) grid.'
     )
-    parser.add_argument('--x',       type=float, default=DEFAULTS['x'],      help='Momentum fraction x')
     parser.add_argument('--E',       type=float, default=DEFAULTS['E'],      help='Parton energy (GeV)')
     parser.add_argument('--z0',      type=float, default=DEFAULTS['z0'],     help='Initial longitudinal position (invGeV)')
     parser.add_argument('--u-perp',  type=float, default=DEFAULTS['u_perp'], help='Transverse flow magnitude')
     parser.add_argument('--mu',       type=float, default=DEFAULTS['mu'],    help='Debye mass (GeV)')
     parser.add_argument('--n-kx',    type=int,   default=DEFAULTS['n_kx'],   help='Number of kx grid points')
     parser.add_argument('--n-ky',    type=int,   default=DEFAULTS['n_ky'],   help='Number of ky grid points (ky >= 0)')
-    parser.add_argument('--kx-max',  type=float, default=DEFAULTS['kx_max'], help='kx grid range [-kx_max, kx_max] (GeV)')
-    parser.add_argument('--ky-max',  type=float, default=DEFAULTS['ky_max'], help='ky grid range [0, ky_max] (GeV)')
+    parser.add_argument('--kperp-max',  type=float, default=None, help='kperp grid range [-kx_max, kx_max] (GeV)')
     parser.add_argument('--workers', type=int,   default=4,                  help='Parallel workers for reference computation')
     parser.add_argument('--x-values', type=float, nargs='+',
                         default=DEFAULTS['x_values'],
@@ -419,8 +325,7 @@ def main():
     parser.add_argument('--output',  type=str,   default='kxky_comparison.png')
     args = parser.parse_args()
 
-    params = dict(
-        x=args.x, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
+    params = dict(E=args.E, z0=args.z0, zf=args.z0 + DTAU,
         u_perp=args.u_perp, mu=args.mu,
     )
 
@@ -429,57 +334,42 @@ def main():
     print("=" * 70)
     for k, v in params.items():
         print(f"  {k:8s} = {v}")
-    print(f"  kx grid: {args.n_kx} points in [{-args.kx_max:.1f}, {args.kx_max:.1f}] GeV")
-    print(f"  ky grid: {args.n_ky} points in [0, {args.ky_max:.1f}] GeV")
+    print(f"  kx grid: {args.n_kx} points")
+    print(f"  ky grid: {args.n_ky} points")
     print()
 
-    # Build grids
-    # ky >= 0 only (training data is for ky >= 0; mirroring is done at save time)
-    kx_values = np.linspace(-args.kx_max, args.kx_max, args.n_kx)
-    ky_values = np.linspace(0.0, args.ky_max, args.n_ky)
-
-    # --- Reference ---
-    print("Step 1: Computing reference (Vegas integrator)")
-    I_ref, I_err = compute_reference_grid(
-        x=args.x, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
-        u_perp=args.u_perp, mu=args.mu,
-        kx_values=kx_values,
-        ky_values=ky_values,
-        n_workers=args.workers,
-    )
-
-    # --- NN ---
-    print("\nStep 2: Loading NN emulator and predicting")
+    # Load NN radiation emulator
     emulator = RadiationEmulatorInference(
         model_file=args.model_file,
         device='cpu',
     )
-    t0 = time.time()
-    I_nn = compute_nn_grid(
-        emulator=emulator,
-        x=args.x, E=args.E, z0=args.z0,
-        u_perp=args.u_perp, mu=args.mu,
-        kx_values=kx_values,
-        ky_values=ky_values,
-    )
-    print(f"  NN Prediction max: {np.amax(I_nn)}")
-    print(f"  NN Prediction min: {np.amin(I_nn)}")
-    print(f"  NN Prediction mean: {np.mean(I_nn)}")
-    print(f"  NN Prediction nanmean: {np.nanmean(I_nn)}")
-    print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms "
-          f"for {args.n_kx * args.n_ky} points")
-
-    # Accumulate rows: start with the primary (--x) row
-    plot_rows = [(params, I_ref, I_err, I_nn)]
 
     # --- x-slice rows ---
+    x_min, x_max, kperp_min, _, _ = kinematic_domain(0, args.E, args.mu)
+    eps = 0.1
+    args.x_values.insert(0, x_min + eps)  # add minimum x
+    args.x_values.append(x_max - eps)  # add maximum x
+    plot_rows = []
     if args.x_values:
         print("\n" + "=" * 70)
         print(f"x-SLICE COMPARISONS: {args.x_values}")
         print("=" * 70)
         for x_val in args.x_values:
             print(f"\n--- x = {x_val} ---")
+            _, _, _, kperp_max_sq, _ = kinematic_domain(x_val, args.E, args.mu)
+            kperp_max = np.sqrt(kperp_max_sq)
+            print(f"kperp_min = {kperp_min:.1f} GeV, kperp_max = {kperp_max:.1f} GeV")
             x_params = dict(params, x=x_val)
+
+            # Build grids
+            if args.kperp_max is None:
+                kx_values = np.linspace(-kperp_max, kperp_max, args.n_kx)
+                ky_values = np.linspace(0.0, kperp_max, args.n_ky//2)
+            else:
+                kx_values = np.linspace(-args.kperp_max, args.kperp_max, args.n_kx)
+                ky_values = np.linspace(0.0, args.kperp_max, args.n_ky//2)
+            print(kx_values)
+            print(ky_values)
 
             print("  Computing reference grid...")
             I_ref_x, I_err_x = compute_reference_grid(
@@ -499,17 +389,30 @@ def main():
                 kx_values=kx_values,
                 ky_values=ky_values,
             )
-            print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms")
+            print(f"  NN Prediction max: {np.amax(I_nn_x)}")
+            print(f"  NN Prediction min: {np.amin(I_nn_x)}")
+            print(f"  NN Prediction mean: {np.mean(I_nn_x)}")
+            print(f"  NN Prediction nanmean: {np.nanmean(I_nn_x)}")
+            print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms "
+                  f"for {args.n_kx * args.n_ky} points")
 
-            plot_rows.append((x_params, I_ref_x, I_err_x, I_nn_x))
+            # Mirror grids
+            flip_ax = 1
+            I_ref_x = np.concatenate((np.flip(I_ref_x, axis=flip_ax), I_ref_x), axis=flip_ax)
+            I_err_x = np.concatenate((np.flip(I_err_x, axis=flip_ax), I_err_x), axis=flip_ax)
+            I_nn_x = np.concatenate((np.flip(I_nn_x, axis=flip_ax), I_nn_x), axis=flip_ax)
+
+            # Mirror ky coordinates
+            flip_ax = 0
+            plot_ky = np.concatenate((-1*np.flip(ky_values, axis=flip_ax), ky_values))
+
+            plot_rows.append((x_params, kx_values, plot_ky, I_ref_x, I_err_x, I_nn_x, kperp_min, kperp_max))
 
     # --- Combined plot ---
     print("\nGenerating combined comparison plot...")
     make_combined_plot(
-        kx_values=kx_values,
-        ky_values=ky_values,
         rows=plot_rows,
-        output_file=args.output,
+        output_file=args.output
     )
 
 
