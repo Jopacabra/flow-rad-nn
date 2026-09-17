@@ -178,6 +178,7 @@ def make_combined_plot(
         n_rows, 3,
         figsize=(16, 5 * n_rows),
         squeeze=False,
+        constrained_layout=True,
     )
 
     for row_idx, (params, kx_values, ky_values, I_ref, I_err, I_nn, kperp_min, kperp_max) in enumerate(rows):
@@ -240,31 +241,34 @@ def make_combined_plot(
             kx_values, ky_values, rel_err,
             levels=[0.5], colors='yellow', linewidths=1.0, linestyles='--',
         )
-        ax_ref.set_title('Reference (Vegas integrator)\n'
-                         r'dashed = $\sigma_\mathrm{MC}/|I| > 0.5$')
-        ax_ref.set_xlabel(r'$k_y$ (GeV)')
-        ax_ref.set_ylabel(r'$k_x$ (GeV)')
-        fig.colorbar(im0, ax=ax_ref, label=r'$I$ (no $C_F$)')
+        fig.colorbar(im0, ax=ax_ref)
 
         # --- NN panel ---
         im1 = ax_nn.imshow(
             I_nn, cmap='RdBu_r', vmin=vmin, vmax=vmax, **imshow_kwargs
         )
-        ax_nn.set_title('NN emulator')
-        ax_nn.set_xlabel(r'$k_y$ (GeV)')
-        ax_nn.set_ylabel(r'$k_x$ (GeV)')
-        fig.colorbar(im1, ax=ax_nn, label=r'$I$ (no $C_F$)')
+        fig.colorbar(im1, ax=ax_nn)
 
         # --- Residual panel ---
         im2 = ax_res.imshow(
             rel_residual, cmap='coolwarm', vmin=-2, vmax=2, **imshow_kwargs
         )
-        ax_res.set_title(
-            r'Relative residual $(I_\mathrm{NN} - I_\mathrm{ref})/|I_\mathrm{ref}|$'
-        )
-        ax_res.set_xlabel(r'$k_y$ (GeV)')
-        ax_res.set_ylabel(r'$k_x$ (GeV)')
         fig.colorbar(im2, ax=ax_res, label='Relative residual')
+
+        if row_idx == 0:
+            ax_ref.set_title('Reference (Vegas integrator)\n'
+                             r'dashed = $\sigma_\mathrm{MC}/|I| > 0.5$')
+            ax_nn.set_title('NN emulator')
+            ax_res.set_title(
+                r'Relative residual $(I_\mathrm{NN} - I_\mathrm{ref})/|I_\mathrm{ref}|$'
+            )
+        if row_idx == n_rows - 1:
+            ax_ref.set_xlabel(r'$k_y$ (GeV)')
+            ax_nn.set_xlabel(r'$k_y$ (GeV)')
+            ax_res.set_xlabel(r'$k_y$ (GeV)')
+
+        # Axis label only on the leftmost column
+        ax_ref.set_ylabel(r'$k_x$ (GeV)')
 
         # Plot a thin, black dashed circle at kperp_min and kperp_max, if they are on the plots
         for ax in (ax_ref, ax_nn, ax_res):
@@ -295,7 +299,6 @@ def make_combined_plot(
         f"$mu={params['mu']:.3f}$ GeV, "
     )
     fig.suptitle(param_str, fontsize=9)
-    plt.tight_layout()
     plt.savefig(output_file, dpi=150, bbox_inches='tight')
     print(f"\n  Combined plot saved to: {output_file}")
     plt.show()
