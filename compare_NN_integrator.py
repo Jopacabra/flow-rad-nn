@@ -32,6 +32,7 @@ ape_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.append(ape_dir)
 
 from integration import integrate_analytic_z_brutemc_t1 as integrate_point
+from integration import precompute_t234_qintegrals, compute_t234_harmonics_grid
 from radiation_nn import RadiationEmulatorInference, kinematic_domain
 
 # ==============================================================================
@@ -65,6 +66,57 @@ def _integrate_one(args):
 
 
 def compute_reference_grid(
+    x, E, z0, zf, u_perp, mu,
+    kx_values: np.ndarray,
+    ky_values: np.ndarray,
+    n_workers: int = 4,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the Vegas reference on the full (kx, ky) grid in parallel.
+
+    Returns
+    -------
+    I_ref : ndarray, shape (n_kx, n_ky)
+    I_err : ndarray, shape (n_kx, n_ky)
+    """
+    n_kx = len(kx_values)
+    n_ky = len(ky_values)
+    n_total = n_kx * n_ky
+
+    I_ref = np.full((n_kx, n_ky), np.nan)
+    I_err = np.full((n_kx, n_ky), np.nan)
+
+    # Build task list
+    tasks = [
+        (ikx, iky, x, kx_values[ikx], ky_values[iky], E, mu, u_perp, z0, zf)
+        for ikx in range(n_kx)
+        for iky in range(n_ky)
+    ]
+
+    print(f"  Computing {n_total} reference points on {n_workers} workers...")
+    t0 = time.time()
+    completed = 0
+
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_integrate_one, task): task for task in tasks}
+        for future in as_completed(futures):
+            ikx, iky, mean, sdev = future.result()
+            I_ref[ikx, iky] = mean
+            I_err[ikx, iky] = sdev
+            completed += 1
+            if completed % max(1, n_total // 10) == 0:
+                elapsed = time.time() - t0
+                eta = elapsed / completed * (n_total - completed)
+                print(f"    {completed}/{n_total} done "
+                      f"({elapsed:.0f}s elapsed, ~{eta:.0f}s remaining)")
+
+    dt = time.time() - t0
+    print(f"  Reference grid complete in {dt:.1f}s "
+          f"({dt / n_total:.2f}s per point)")
+    return I_ref, I_err
+
+
+def compute_t234_grid(
     x, E, z0, zf, u_perp, mu,
     kx_values: np.ndarray,
     ky_values: np.ndarray,
@@ -326,6 +378,7 @@ def main():
     parser.add_argument('--model-file',
                         type=str, default='data/radiation_emulator.pt')
     parser.add_argument('--output',  type=str,   default='kxky_comparison.png')
+    parser.add_argument("--full", action="store_true", help="Compute complete spectra, including t2, t3, & t4")
     args = parser.parse_args()
 
     params = dict(E=args.E, z0=args.z0, zf=args.z0 + DTAU,
@@ -398,6 +451,43 @@ def main():
             print(f"  NN Prediction nanmean: {np.nanmean(I_nn_x)}")
             print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms "
                   f"for {args.n_kx * args.n_ky} points")
+
+            # If full grids are desired, add grids computed for t2, t3, and t4 to NN and ref.
+            if args.full:
+                # Evaluation grid in kx, ky
+                kx_grid, ky_grid = np.meshgrid(kx_values, ky_values, indexing='ij')
+
+                # Relabeled evaluation grid in k_perp, phi
+                k_perp_grid = np.sqrt(kx_grid ** 2 + ky_grid ** 2).astype(np.float32)
+                phi_grid = np.arctan2(ky_grid, kx_grid).astype(np.float32)
+                print(k_perp_grid.shape)
+                print(phi_grid.shape)
+                print(I_nn_x.shape)
+                # n_pts = k_perp_grid.size
+
+                # Precompute qintegrals
+                q_max = np.sqrt(3 * args.E * args.mu)
+                qints = precompute_t234_qintegrals(args.E, args.mu, args.u_perp, q_max)
+
+                # Batched numerical integrator call for the remaining points, summing to collapse x axis
+                A0_234, A1_234, A2_234 = compute_t234_harmonics_grid(
+                    [x_val], k_perp_grid, args.E, args.mu, args.u_perp, args.z0, args.z0 + DTAU, qints=qints
+                )
+                print(A0_234.shape)
+                A0_234, A1_234, A2_234 = np.sum(A0_234, axis=0), np.sum(A1_234, axis=0), np.sum(A2_234, axis=0)
+
+                print(A0_234.shape)
+
+                # Reconstruct full angular dependence via broadcasting -- shape (n_kperp, n_phi)
+                cos_phi = np.cos(phi_grid)
+                cos_2phi = np.cos(2 * phi_grid)
+                I_t234 = A0_234 + A1_234 * cos_phi + A2_234 * cos_2phi
+
+                print(I_t234.shape)
+
+                # Sum with the t1 grid
+                I_ref_x = I_ref_x + I_t234
+                I_nn_x = I_nn_x + I_t234
 
             # Mirror grids
             flip_ax = 1
