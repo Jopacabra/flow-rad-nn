@@ -483,7 +483,6 @@ def integrate_analytic_z_brutemc_t1(x, k_perp, k_phi, E, mu, u_perp, z0, zf, ada
     with analytic/elliptic solutions for t2, t3, t4.
     """
     _t1_only_obj.set_params(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
-    q_lim = _t1_only_obj.q_lim
 
     if NITN_WARMUP: _INTEG_2D_T1(_t1_only_integrand, nitn=NITN_WARMUP, neval=NEVAL, adapt=adapt)
     t1_result = _INTEG_2D_T1(_t1_only_integrand, nitn=NITN, neval=NEVAL, adapt=adapt)
@@ -592,9 +591,144 @@ def integrate_harmonics(x, k_perp, E, mu, u_perp, z0, zf):
                                      _k4, lkllul, _halflkllul2, sin_z_integral, cos_z_integral)
 
 
-#################################
-# Full Spectrum Grid Integrator #
-#################################
+def precompute_t234_qintegrals(E, mu, u_perp, q_max=None):
+    """
+    Compute the three q-integrals needed for t2, t3, t4's harmonic amplitudes.
+    These depend ONLY on (E, mu, u_perp) -- NOT on x or k_perp -- so they
+    should be computed exactly once per (E, mu, u_perp) combination, never
+    inside a grid loop.
+
+    Returns
+    -------
+    dict with keys 't2_qint', 't3_qint', 't4_qint', 'q_max'
+    """
+    if q_max is None:
+        q_max = np.sqrt(3.0 * E * mu)
+
+    mu2 = mu ** 2
+    qmax2 = q_max ** 2
+    qmax4 = q_max ** 4
+    qmax2_mu2 = qmax2 + mu2
+    uu = u_perp ** 2
+
+    # --- t2: fully analytic ---
+    t2_qint = t2_analytic_qint(qmax4, qmax2, mu2, qmax2_mu2)
+
+    # --- t3: 32-pt Gauss-Legendre over elliptic-integral integrand ---
+    n_gl = 32
+    x_lg, w_lg = np.polynomial.legendre.leggauss(n_gl)
+    q_nodes = 0.5 * q_max * (x_lg + 1.0)
+    jac_gl = 0.5 * q_max
+    t3_qint = jac_gl * np.dot(t3_integrand_radial(q_nodes, mu, u_perp), w_lg)
+
+    # --- t4: closed-form elliptic-Pi expression ---
+    t4_qint = t4_elliptic_qint(uu, mu, u_perp, q_max)
+
+    return {"t2_qint": t2_qint, "t3_qint": t3_qint, "t4_qint": t4_qint, "q_max": q_max}
+
+
+def compute_t234_harmonics_grid(x_values, k_perp_values, E, mu, u_perp, z0, zf,
+                                 qints=None):
+    """
+    Vectorized, loop-free evaluation of the EXACT (non-t1) harmonic
+    amplitudes A0, A1, A2 over a full (x, k_perp) grid, for fixed
+    E, mu, u_perp, z0, zf.
+
+    Only t1 needs the network / VEGAS -- this function is pure numpy and
+    should take microseconds even for large grids.
+
+    Parameters
+    ----------
+    x_values : ndarray, shape (N_x,)
+    k_perp_values : ndarray, shape (N_k,)
+    E, mu, u_perp, z0, zf : float
+    qints : dict, optional
+        Pre-computed output of `precompute_t234_qintegrals`. Pass this in if
+        you're calling this function repeatedly for the same (E, mu, u_perp)
+        (e.g. across many events) to avoid re-deriving the scalars.
+
+    Returns
+    -------
+    A0, A1, A2 : ndarray, shape (N_x, N_k)
+        A0 = A0_T3 + A0_T4
+        A1 = A1_T2
+        A2 = A2_T4
+    """
+    x_values = np.asarray(x_values, dtype=np.float64)
+    k_perp_values = np.asarray(k_perp_values, dtype=np.float64)
+
+    deltaz = zf - z0
+    uu = u_perp ** 2
+
+    if qints is None:
+        qints = precompute_t234_qintegrals(E, mu, u_perp)
+    t2_qint, t3_qint, t4_qint = qints["t2_qint"], qints["t3_qint"], qints["t4_qint"]
+
+    # ---- broadcast grid quantities: (N_x,1) x (1,N_k) -> (N_x, N_k) ----
+    x = x_values[:, None]
+    k_perp = k_perp_values[None, :]
+
+    kk = k_perp ** 2
+    k4 = kk ** 2
+    lkllul = k_perp * u_perp          # k . u  (phi-independent amplitude piece)
+    halflkllul2 = 0.5 * lkllul ** 2
+
+    omega_k = kk / (2.0 * x * E)
+    phase = omega_k * (z0 + deltaz / 2.0)
+    sinc_arg = omega_k * deltaz / (2.0 * np.pi)
+    sinc_val = np.sinc(sinc_arg)                       # vectorized, safe at omega_k -> 0
+
+    sin_z_integral = sinc_val * np.sin(phase) * deltaz
+    cos_z_integral = (1.0 - sinc_val * np.cos(phase)) * deltaz
+
+    # ---- Term 2: A1 only ----
+    t2_pref = (1.0 / (x * E)) * (lkllul / kk)
+    A1_T2 = t2_pref * t2_qint * cos_z_integral
+
+    # ---- Term 3: A0 only ----
+    t3_pref = 1.0 / (2.0 * kk * x * E)
+    A0_T3 = t3_pref * t3_qint * sin_z_integral
+
+    # ---- Term 4: A0 and A2 ----
+    t4_pref_A0 = (1.0 / (x * E)) * ((kk * (1.0 - uu) + halflkllul2) / k4)
+    t4_pref_A2 = (1.0 / (x * E)) * (halflkllul2 / k4)
+    A0_T4 = t4_qint * t4_pref_A0 * sin_z_integral
+    A2_T4 = t4_qint * t4_pref_A2 * sin_z_integral
+
+    A0 = A0_T3 + A0_T4
+    A1 = A1_T2
+    A2 = A2_T4
+
+    return A0, A1, A2
+
+
+def assemble_full_harmonics_grid(A0_T1, A1_T1, x_values, k_perp_values,
+                                  E, mu, u_perp, z0, zf, qints=None):
+    """
+    A0_T1, A1_T1 : ndarray, shape (N_x, N_k)
+        The t1-only harmonics -- from VEGAS (`_direct_compute_harmonics`'s
+        two-angle trick) during data generation, or from the NN's two output
+        heads at inference time.
+
+    Returns
+    -------
+    A0, A1, A2 : ndarray, shape (N_x, N_k)   -- totals
+    """
+    A0_234, A1_234, A2_234 = compute_t234_harmonics_grid(
+        x_values, k_perp_values, E, mu, u_perp, z0, zf, qints=qints
+    )
+    return A0_T1 + A0_234, A1_T1 + A1_234, A2_234
+
+
+def reconstruct_I_grid(A0, A1, A2, k_phi_values):
+    """A0 + A1*cos(phi) + A2*cos(2*phi), shape (N_x, N_k, N_phi)."""
+    cos_phi = np.cos(k_phi_values)[None, None, :]
+    cos_2phi = np.cos(2 * k_phi_values)[None, None, :]
+    return A0[:, :, None] + A1[:, :, None] * cos_phi + A2[:, :, None] * cos_2phi
+
+##################################
+# Full Spectrum Grid Integrators #
+##################################
 def get_grid_harmonics(N_x, N_k_perp, N_k_phi, E, mu, u_perp, z0, zf):
     """
     Integrate a full grid in x, k_perp, k_phi using brute force MC method w/ VEGAS+ for t1,
@@ -750,6 +884,35 @@ def get_grid_explicit(N_x, N_k_perp, N_k_phi, E, mu, u_perp, z0, zf,
     return x_grid_out, k_perp_grid_out, k_phi_grid_out, N_grid
 
 
+def get_grid_harmonics_fast(N_x, N_k_perp, N_k_phi, E, mu, u_perp, z0, zf):
+    q_max = np.sqrt(3 * E * mu)
+    x_min, x_max = mu / E, 1 - mu / E
+    x_values = np.logspace(np.log10(x_min), np.log10(x_max), N_x)
+    k_perp_values = np.linspace(mu, 5.0, N_k_perp)
+    k_phi_values = np.linspace(0, 2 * np.pi, N_k_phi, endpoint=False)
+
+    qints = precompute_t234_qintegrals(E, mu, u_perp, q_max)
+
+    # Only t1 needs the loop + VEGAS
+    A0_T1 = np.empty((N_x, N_k_perp))
+    A1_T1 = np.empty((N_x, N_k_perp))
+    for ix, x in enumerate(x_values):
+        for ik, k_perp in enumerate(k_perp_values):
+            _t1_only_obj.set_params(x, k_perp, 0, E, mu, u_perp, z0, zf)
+            r_A0A1 = _INTEG_2D_T1(_t1_only_integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT_GRIDS)
+            _t1_only_obj.set_params(x, k_perp, np.pi / 2, E, mu, u_perp, z0, zf)
+            r_A0 = _INTEG_2D_T1(_t1_only_integrand, nitn=NITN, neval=NEVAL, adapt=MCADAPT_GRIDS)
+            A0_T1[ix, ik] = r_A0.mean
+            A1_T1[ix, ik] = r_A0A1.mean - r_A0.mean
+
+    A0, A1, A2 = assemble_full_harmonics_grid(
+        A0_T1, A1_T1, x_values, k_perp_values, E, mu, u_perp, z0, zf, qints=qints
+    )
+    N_grid = reconstruct_I_grid(A0, A1, A2, k_phi_values)
+
+    x_grid, k_perp_grid, k_phi_grid = np.meshgrid(x_values, k_perp_values, k_phi_values, indexing='ij')
+    return x_grid, k_perp_grid, k_phi_grid, N_grid
+
 ############################
 # Method Benchmarking Code #
 ############################
@@ -882,6 +1045,8 @@ def run_grid_benchmark(N_x=10, N_k_perp=10, N_k_phi=16, seed=0,
 
     methods = {
         "harmonic decomposition": lambda: get_grid_harmonics(
+            N_x, N_k_perp, N_k_phi, E, mu, u_perp, z0, zf),
+        "vectorized harmonic decomposition": lambda: get_grid_harmonics_fast(
             N_x, N_k_perp, N_k_phi, E, mu, u_perp, z0, zf),
         "explicit: t1(MC)+a/e t234, analytic z": lambda: get_grid_explicit(
             N_x, N_k_perp, N_k_phi, E, mu, u_perp, z0, zf,
