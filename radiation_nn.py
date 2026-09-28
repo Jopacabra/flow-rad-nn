@@ -149,9 +149,42 @@ def compute_input_features(x: np.ndarray, k_perp: np.ndarray, E: np.ndarray, z0:
     return input_dict
 
 
-# ==============================================================================
-# Dataset
-# ==============================================================================
+################################
+# Kinematic Regime of Interest #
+################################
+def kinematic_domain(x, E, mu):
+    """
+    Single source for the physically valid (x, k_perp) domain.
+    Edit ONLY here if cuts change. Used identically by:
+      - RadiationEmulator.forward() [UV envelope anchor]
+      - compute_loss() [UV-decay sampling region]
+      - RadiationDataset._scan_file() [training-data validity check]
+      - RadiationEmulatorInference.compute_dNdxd2k_grid() [deployment masking]
+
+    Returns
+    -------
+    x_min, x_max     : kinematic bounds on x
+    kperp_min        : mu (broadcast to x's shape)
+    kperp_max_sq     : min(x,1-x)^2 * E^2 - mu^2   (physically meaningful only where valid)
+    valid            : bool mask -- True iff a nonempty k_perp window exists
+    """
+    x_min = mu / E
+    x_max = 1.0 - x_min
+    kperp_min = mu
+    kperp_min_sq = kperp_min ** 2
+    try:
+        kperp_max_sq = torch.minimum(x**2, (1 - x)**2) * E**2 - mu**2
+        kperp_max_sq = torch.maximum(kperp_min_sq, kperp_max_sq)
+    except TypeError:
+        kperp_max_sq = np.minimum(x ** 2, (1 - x) ** 2) * E ** 2 - mu ** 2
+        kperp_max_sq = np.maximum(kperp_min_sq, kperp_max_sq)
+    valid = (E > mu) & (x > x_min) & (x < x_max) & (kperp_max_sq > 0) & (kperp_max_sq > kperp_min_sq)
+    return x_min, x_max, kperp_min, kperp_max_sq, valid
+
+
+###########
+# Dataset #
+###########
 class RadiationDataset(Dataset):
     """
     All valid data is loaded into memory once at construction.
@@ -240,6 +273,23 @@ class RadiationDataset(Dataset):
                 & np.isfinite(A1_err)
                 & np.all(np.isfinite(X_raw), axis=1)
         )
+
+        # Mask off any points outside the kinematic bounds
+        print("  Filtering kinematic ranges ...")
+        x_min, x_max, kperp_min, kperp_max_sq, valid_np = kinematic_domain(
+            raw_cols['x'], raw_cols['E'], raw_cols['mu']
+        )
+        kperp_ok_domain = (
+                valid_np
+                & (raw_cols['k_perp'] >= kperp_min)
+                & (raw_cols['k_perp'] ** 2 <= kperp_max_sq)
+        )
+        x_ok_domain = (
+                valid_np
+                & (raw_cols['x'] >= x_min)
+                & (raw_cols['x'] <= x_max)
+        )
+        ok = ok & kperp_ok_domain & x_ok_domain
 
         n_valid = int(ok.sum())
         print(f"  {n_raw:,} raw  →  {n_valid:,} valid")
@@ -737,22 +787,20 @@ class RadiationEmulator(nn.Module):
         k_perp = kp64.to(raw.dtype)
         mu = x_norm[:, self.IDX_MU] * self.X_std[self.IDX_MU] + self.X_mean[self.IDX_MU]
 
+        # Kinematic cuts
+        x_min, x_max, kperp_min, kperp_max_sq, valid = kinematic_domain(x, E, mu)  # Kinematic cuts
+
         # Learnable exponent, bounded by P_MIN and P_MAX
         p = self.P_MIN + (self.P_MAX - self.P_MIN) * torch.sigmoid(self.raw_p)  # (2,)
 
-        # Learnable transition scale -- anchored comfortably above ((Min[x^2, (1-x)^2]  * E^2) - mu^2),
-        # near the physical UV threshold -- at which the envelope really starts to squeeze.
-        # K = kperp_max^2 in GeV^2. Clamp for safety.
-        K = (torch.minimum(x.unsqueeze(-1) ** 2, (1 - x.unsqueeze(-1)) ** 2) * E.unsqueeze(-1) ** 2) - mu.unsqueeze(
-            -1) ** 2
-        K = K.clamp(min=1e-6)
+        # Learnable transition scale margin factor for envelope
+        margin = 1.0 + torch.nn.functional.softplus(self.raw_k0_scale)  # >= 1
 
-        # k0_sq is k0^2 in GeV^2 -- anchored comfortably above kperp_max^2 by the learnable (>=1) factor
-        k0_sq = K * torch.nn.functional.softplus(self.raw_k0_scale)  # (B, 2), units GeV^2
+        # Clamp kperp_max_sq -- Valid points have kperp_max_sq > mu^2 > 0, so only for stray extrapolation queries.
+        kperp_max_sq_safe = kperp_max_sq.clamp(min=mu ** 2 * 1e-3)
 
-        # Should be dimensionless: k_perp^2 [GeV^2] / k0_sq [GeV^2]
-        log_ratio_sq = torch.log1p(k_perp.unsqueeze(-1) ** 2 / k0_sq)
-        log_envelope = -0.5 * p * log_ratio_sq
+        k0_sq = kperp_max_sq_safe.unsqueeze(-1) * margin  # Actual transition scale
+        log_envelope = -0.5 * p * torch.log1p(k_perp.unsqueeze(-1) ** 2 / k0_sq)  # UV decay envelope
 
         # Additive combination in z-space
         z = raw_z + log_envelope  # No head scale effect -- quick comparison preferred no head scaling
@@ -769,7 +817,7 @@ class RadiationEmulator(nn.Module):
                 bin_idx = torch.bucketize(x64.detach(), x_bins)
 
                 print(f"  clamp saturation frac: {sat_any.float().mean():.3f}  "
-                      f"K: {torch.sqrt(K).mean():.3f}  k0: {torch.sqrt(k0_sq).mean():.3f}  "
+                      f"k0: {torch.sqrt(k0_sq).mean():.3f}  "
                       f"p: {p.tolist()}")
                 for b in range(1, len(x_bins)):
                     m = bin_idx == b
@@ -882,7 +930,6 @@ def compute_loss(
     """
     if config.lambda_uv > 0.0:
         max_frac = 0.05
-        rng = np.random.default_rng()
         n_uv_samples = 64
 
         # Get shape and device of inputs
@@ -902,19 +949,11 @@ def compute_loss(
         E_std = model.X_std[IDX_E].to(device)
         energy_params = np.pow(10, (uv_params[:, IDX_E] * E_std + E_mean).cpu().numpy())
 
-        # Sample k_perp log-uniformly in the UV region, depending on energy of sample point
-        log_k = []
-        for i in np.arange(0, len(energy_params)):
-            # 2 * log(energy) = log(energy^2) -- Use minimum of uv_kt_threshold to avoid penalizing structure at low pT
-            log_lo = np.amax([math.log(max_frac) + 2 * math.log(energy_params[i]),
-                               math.log(config.uv_kt_threshold)])
-            log_hi = 2 * math.log(energy_params[i])
-            if log_lo < log_hi:
-                log_k.append(rng.uniform(log_lo, log_hi))
-            else:
-                log_k.append(log_lo)
-        log_k = torch.tensor(log_k, device=device)
-        k_perp_uv = torch.exp(log_k)
+        # Sample k_perp in [kperp_max, kperp_max * (1 + margin_frac)] -- just past the edge of the valid domain
+        x_min, x_max, kperp_min, kperp_max_sq, valid = kinematic_domain(x_p, E_p, mu_p)
+        kperp_max = torch.sqrt(kperp_max_sq.clamp(min=0))
+        k_perp_uv = kperp_max * (1.0 + margin_frac * torch.rand_like(kperp_max))
+        log_k = torch.log(k_perp_uv)
 
         # Overwrite k_perp in physical space
         phys[:, IDX_K_PERP] = k_perp_uv
@@ -941,6 +980,12 @@ def compute_loss(
         uv_decay = (log_weight.unsqueeze(1) * uv_heads ** 2).mean()
     else:
         uv_decay = torch.tensor(0.0, device=inputs.device)
+
+    # # Proximity to k_perp boundary
+    # s = (k_perp ** 2 / kperp_max_sq.clamp(min=1e-12)).clamp(0, 1)
+    # edge_mask = s > 0.8
+    # components['A0_mse_edge'] = (
+    #             weights[edge_mask] * A0_excess[edge_mask] ** 2).mean().item() if edge_mask.any() else float('nan')
 
     # Total loss
     total_loss = (
@@ -1594,16 +1639,9 @@ class RadiationEmulatorInference:
         # Perform kinematic cuts on the 2D (k_perp, x) grid -- the cut is
         # phi-independent, so evaluating it here (instead of on the full 3D
         # grid) avoids redundant sqrt/compare work across the phi axis.
-        x_min = mu / E
-        x_max = 1.0 - mu / E
-        kperp_min = mu
-        kperp_max_sq = (E ** 2) * np.minimum(x_grid2d ** 2, (1.0 - x_grid2d) ** 2) - mu ** 2
+        x_min, x_max, kperp_min, kperp_max_sq, valid_2d = kinematic_domain(x_grid2d, E, mu)
         kperp_max = np.sqrt(np.clip(kperp_max_sq, 0.0, None))
-
-        valid_2d = (
-                (x_grid2d > x_min) & (x_grid2d < x_max) &
-                (kperp_grid2d > kperp_min) & (kperp_grid2d < kperp_max)
-        )  # shape (n_kperp, n_x), broadcasts over the phi axis below
+        valid_2d = valid_2d & (kperp_grid2d > kperp_min) & (kperp_grid2d < kperp_max)
 
         I_nn *= valid_2d[:, None, :]
 
