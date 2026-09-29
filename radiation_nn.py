@@ -1,14 +1,23 @@
 """
 radiation_nn.py
 
-Trains a neural network emulator to replicate the leading term of the medium-induced radiation intensity distribution
+Trains a neural network emulator to replicate the leading term of the medium-induced radiation number distribution
 from a fast probe in a transversely flowing quark gluon plasma using precomputed training data.
 
-The transformations and normalization are specialized to reproduce a huge dynamic range of intensity values while
-keeping weights small. The model architecture incorporates a physics-informed UV power law envelope that sets in
-at large k_perp.
+Specifically, the model outputs the two fourier harmonics A0 and A1 of the leading term. Broadcasting A0 + A1 cos(phi)
+recovers the leading term of
 
-Values at small x are many orders of magnitude larger than those at large x.
+(1/CR) * (1/E) * (1/rho0) * (1/g^6) * (2 (2pi)^3) * dN/(dx d^2k_perp)
+
+The deployment function is `compute_dNdxd2k_grid`, which applies numerical integrators for the three sub-eikonal terms
+and sums them with the broadcasted NN result.
+
+The transformations and normalization are specialized to reproduce the huge dynamic range of values while
+keeping weights small. The model architecture incorporates a physics-informed UV power law envelope that sets in
+at a learnable large k_perp.
+
+Because emissions are dominated by the small x regime, values for small x are many orders of magnitude larger than those
+at large x. Similarly, values scale with the energy and the
 
 Features:
 - Loads training data from HDF5 file
@@ -16,7 +25,7 @@ Features:
 - Normalizes input targets to zero mean and unit variance, then transforms input targets
 - Trains NN, enforcing some physics constraints via architecture and loss terms
 - Saves trained model for deployment
-- Provides inference methods to predict radiation intensity distribution from model file
+- Provides inference methods to predict radiation distributions from model file
 
 Usage:
     python radiation_nn.py                    # Train the model
@@ -189,17 +198,9 @@ class RadiationDataset(Dataset):
     """
     All valid data is loaded into memory once at construction.
 
-    Design
-    ------
     All HDF5 I/O happens in __init__ via _scan_file. After construction, no
     disk access occurs. __getitem__ is a pure array index + lightweight
-    normalization — essentially free compared to HDF5 scalar reads.
-
-    Memory layout
-    -------------
-    self.X_data : np.ndarray, shape (N_valid, 9), float32   -- input features
-    self.y_data : np.ndarray, shape (N_valid,),   float32   -- raw intensity
-    self.w_data : np.ndarray, shape (N_valid,),   float32   -- importance weights
+    normalization.
     """
     # Get the NN input feature names and number of features
     FEATURE_NAMES = list(
@@ -512,7 +513,7 @@ class RadiationEmulator(nn.Module):
     """
     RadiationEmulator architecture
     ------------------------------
-    Two-head MLP (A0, A1) predicting the radiation intensity harmonics in a
+    Two-head MLP (A0, A1) predicting the harmonics of the target distribution in a
     transformed, normalized "z-space". Each head is decomposed as:
 
         z_head = clamp( background + S_end - S_start ) + log_envelope(k_perp)
@@ -555,7 +556,7 @@ class RadiationEmulator(nn.Module):
        truncated series to track the true envelope.
 
     3. Z-space soft clamp (tanh, scale Z_CLAMP): prevents float32 sinh overflow
-       at huge dynamic range (small-x intensities are many decades above
+       at huge dynamic range (small-x outputs are many decades above
        large-x). CAUTION: if raw pre-clamp values approach Z_CLAMP, tanh
        saturation clips the oscillatory carrier and injects spurious
        high-frequency distortion harmonics -- check `frac_saturated` (binned by
@@ -775,7 +776,7 @@ class RadiationEmulator(nn.Module):
 
         float32 overflow occurs at sinh(~88.7), so keep this relatively well below 88.7.
         """
-        Z_CLAMP = 80.0
+        Z_CLAMP = 88.5
         raw_z = Z_CLAMP * torch.tanh(raw / Z_CLAMP)  # (B, 2)
 
         """
@@ -1528,7 +1529,7 @@ class RadiationEmulatorInference:
             mu: np.ndarray,
     ) -> np.ndarray:
         """
-        Physical-facing entry point -- returns the combined scalar intensity
+        Physical-facing entry point -- returns the combined scalar output
         """
         A0, A1 = self.predict_harmonics(x, k_perp, E, z0, u_perp, mu)
         predictions = A0 + A1 * np.cos(phi)
@@ -1542,11 +1543,9 @@ class RadiationEmulatorInference:
             z0: np.ndarray,
             u_perp: np.ndarray,
             mu: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Returns physical (A0, A1, A2) harmonic amplitudes for the given
-        (x, k_perp, ...) points — no phi dependence, so callers can evaluate
-        this on a much coarser grid than the full 3D (kx, ky, kz) grid.
+        Returns physical (A0, A1) harmonic amplitudes for the given (x, k_perp, ...) points
         """
         inputs = np.column_stack(
             list(compute_input_features(
@@ -1581,7 +1580,7 @@ class RadiationEmulatorInference:
         Returns
         -------
         np.ndarray
-            Predicted radiation intensity
+            NN output for the given inputs
         """
         return self.predict(
             x=inputs['x'],
@@ -1593,6 +1592,121 @@ class RadiationEmulatorInference:
             mu=inputs['mu'],
         )
 
+    def _predict_harmonics_masked(
+            self,
+            x_flat: np.ndarray,
+            kperp_flat: np.ndarray,
+            E: float,
+            z0: float,
+            u_perp: float,
+            mu: float,
+            mask: bool=True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Single source of truth for the physical (A0, A1) harmonics as a
+        function of (x, k_perp), for one fixed (E, z0, u_perp, mu) event.
+
+        Every entry point below ultimately funnels its query points
+        through here -- this is the *only* place the network is ever
+        called from deployment code. Callers are responsible for having
+        already removed any duplicate (x, k_perp) pairs before calling
+        this -- it queries the network once per element, unconditionally.
+
+        Applies the kinematic-domain mask (zeroing invalid points) and
+        converts the raw NN harmonics into the dN/(dx d^2k_perp)
+        normalization (divides by E*x). Still needs the Casimir factor
+        applied upstream.
+
+        Parameters
+        ----------
+        x_flat, kperp_flat : 1D np.ndarray, same length
+        E, z0, u_perp, mu : float
+            Fixed physical parameters for this event.
+
+        Returns
+        -------
+        A0, A1 : 1D np.ndarray, same length as x_flat
+        """
+        x_flat = np.asarray(x_flat)
+        kperp_flat = np.asarray(kperp_flat)
+        n = x_flat.size
+
+        A0, A1 = self.predict_harmonics(
+            x=x_flat,
+            k_perp=kperp_flat,
+            E=np.full(n, E, dtype=np.float64),
+            z0=np.full(n, z0, dtype=np.float64),
+            u_perp=np.full(n, u_perp, dtype=np.float64),
+            mu=np.full(n, mu, dtype=np.float64),
+        )
+
+        if mask:
+            # Kinematic cuts -- scalar E/mu broadcast fine against the x_flat array
+            x_min, x_max, kperp_min, kperp_max_sq, valid = kinematic_domain(x_flat, E, mu)
+            kperp_max = np.sqrt(np.clip(kperp_max_sq, 0.0, None))
+            valid = valid & (kperp_flat > kperp_min) & (kperp_flat < kperp_max)
+
+            A0 = np.where(valid, A0, 0.0)
+            A1 = np.where(valid, A1, 0.0)
+
+        return A0, A1
+
+    def _predict_harmonics_dedup(
+            self,
+            x_flat: np.ndarray,
+            kperp_flat: np.ndarray,
+            E: float,
+            z0: float,
+            u_perp: float,
+            mu: float,
+            mask: bool=True,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Same contract as `_predict_harmonics_masked`, but for the case
+        where degeneracy in (x, k_perp) is expected yet *not* known to
+        follow any particular axis structure. Collapses to the unique
+        (x, k_perp) pairs (wherever they occur in the input), queries
+        the network only on those, then scatters the result back out to
+        the original (possibly duplicated) ordering via the inverse index.
+        """
+        x_flat = np.asarray(x_flat)
+        kperp_flat = np.asarray(kperp_flat)
+
+        pairs = np.column_stack([x_flat, kperp_flat])
+        uniq_pairs, inverse = np.unique(pairs, axis=0, return_inverse=True)
+
+        A0_u, A1_u = self._predict_harmonics_masked(
+            uniq_pairs[:, 0], uniq_pairs[:, 1], E, z0, u_perp, mu, mask=mask
+        )
+        # np.unique's return_inverse can be shape (N,1) depending on numpy version -- flatten defensively
+        inverse = np.asarray(inverse).reshape(-1)
+        return A0_u[inverse], A1_u[inverse]
+
+    @staticmethod
+    def _detect_phi_axis(x_grid3d: np.ndarray, kperp_grid3d: np.ndarray, phi_grid3d: np.ndarray) -> int:
+        """
+        Identify the unique axis along which x_grid3d and kperp_grid3d
+        are constant (i.e. repeated) while phi_grid3d is free to vary.
+        Raises ValueError if zero or more than one axis qualifies --
+        in that case, pass `phi_axis` explicitly instead of relying on
+        auto-detection.
+        """
+        candidates = []
+        for axis in range(x_grid3d.ndim):
+            x_const = np.allclose(np.ptp(x_grid3d, axis=axis), 0.0)
+            k_const = np.allclose(np.ptp(kperp_grid3d, axis=axis), 0.0)
+            if x_const and k_const:
+                candidates.append(axis)
+
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Could not uniquely auto-detect the phi axis (candidates: "
+                f"{candidates}). x_grid3d/kperp_grid3d must be constant "
+                f"along exactly one axis; pass phi_axis explicitly."
+            )
+        return candidates[0]
+
+    # Generate a grid from flat (x, k_perp, phi) lists
     def compute_dNdxd2k_grid(self,
                              E: float,
                              z0: float,
@@ -1601,55 +1715,174 @@ class RadiationEmulatorInference:
                              x_values: np.ndarray,
                              k_perp_values: np.ndarray,
                              phi_values: np.ndarray,
-                             ) -> (np.ndarray):
+                             mask: bool=True,
+                             ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
         """
-        Computes a complete grid of (1/CR) dN/(dx d^2k_perp) shaped as (k_perp, phi, x).
+        Computes a complete grid of NN outputs, with broadcasting harmonics
+        over phi points, shaped as (k_perp, phi, x).
 
-        Note that this is actually differential in (dx d^2k_perp), not (dx d|k_perp|, dphi).
-        Apply the Jacobian later when you need it!
+        Note that this is actually differential in (dx d^2k_perp), not
+        (dx d|k_perp|, dphi)! It is simply plotted against a grid in k_perp
+        and phi coordinates. Apply the Jacobian later when you need it!
 
-        The network is evaluated only on the 2D (k_perp, x) grid; phi dependence
-        is reconstructed analytically via A0 + A1*cos(phi) + A2*cos(2*phi).
+        The network is evaluated only on the 2D (k_perp, x) outer-product
+        grid -- every (k_perp, x) pair here is unique by construction, so
+        no dedup bookkeeping is needed -- phi dependence is reconstructed
+        analytically from the fourier harmonics in phi.
 
-        Points outside the kinematic region mu/E <= x <= 1 - mu/E and
-        mu <= k_perp <= sqrt(E^2 * min(x^2, (1-x)^2) - mu^2) are set to zero.
+        Points outside the kinematic region are set to zero (handled by
+        `_predict_harmonics_masked`).
+
+        Returns
+        -------
+        N_nn, kperp_grid3d, phi_grid3d, x_grid3d : np.ndarray, all shape (n_kperp, n_phi, n_x)
+            The full 3D meshgrid (equivalent to what you'd get from
+            np.meshgrid(k_perp_values, phi_values, x_values, indexing='ij'))
+            alongside the computed spectrum, for drop-in parity with
+            entry points B/C.
         """
-        # create a 2D meshgrid in the only two variables the network needs
+        x_values = np.asarray(x_values)
+        k_perp_values = np.asarray(k_perp_values)
+        phi_values = np.asarray(phi_values)
+
+        # 2D outer-product grid in the only two variables the network needs --
+        # every pair here is unique, so we query the network exactly once per pair.
         kperp_grid2d, x_grid2d = np.meshgrid(k_perp_values, x_values, indexing='ij')  # (n_kperp, n_x)
 
-        # Build input grid once
-        n_pts = x_grid2d.size
-        grid_inputs = np.column_stack([
-            x_grid2d.ravel(), kperp_grid2d.ravel(),
-            np.full(n_pts, E), np.full(n_pts, z0),
-            np.full(n_pts, u_perp), np.full(n_pts, T), np.full(n_pts, g),
-        ]).astype(np.float32)
-
-        # Single batched network call over the (k_perp, x) grid -- no phi dependence yet
-        A_flat = self.predict_harmonics_raw(grid_inputs)  # (n_pts, 3)
-        A0_2d = A_flat[:, 0].reshape(x_grid2d.shape)
-        A1_2d = A_flat[:, 1].reshape(x_grid2d.shape)
-        A2_2d = A_flat[:, 2].reshape(x_grid2d.shape)
+        A0_flat, A1_flat = self._predict_harmonics_masked(
+            x_grid2d.ravel(), kperp_grid2d.ravel(), E, z0, u_perp, mu, mask=mask
+        )
+        A0_2d = A0_flat.reshape(x_grid2d.shape)
+        A1_2d = A1_flat.reshape(x_grid2d.shape)
 
         # Reconstruct full angular dependence via broadcasting -- shape (n_kperp, n_phi, n_x)
         cos_phi = np.cos(phi_values)[None, :, None]
-        cos_2phi = np.cos(2 * phi_values)[None, :, None]
-        I_nn = A0_2d[:, None, :] + A1_2d[:, None, :] * cos_phi + A2_2d[:, None, :] * cos_2phi
+        N_nn = A0_2d[:, None, :] + A1_2d[:, None, :] * cos_phi
 
-        # Perform kinematic cuts on the 2D (k_perp, x) grid -- the cut is
-        # phi-independent, so evaluating it here (instead of on the full 3D
-        # grid) avoids redundant sqrt/compare work across the phi axis.
-        x_min, x_max, kperp_min, kperp_max_sq, valid_2d = kinematic_domain(x_grid2d, E, mu)
-        kperp_max = np.sqrt(np.clip(kperp_max_sq, 0.0, None))
-        valid_2d = valid_2d & (kperp_grid2d > kperp_min) & (kperp_grid2d < kperp_max)
-
-        I_nn *= valid_2d[:, None, :]
-
-        # Compute dN/dxd^2k_perp by dividing out energy of each grid point
-        N_nn = I_nn / (E * x_grid2d[:, None, :])  # Still needs casimir factor
+        # Build the equivalent full 3D meshgrid for return -- cheap compared to
+        # the network evaluation we just avoided doing on it directly.
+        kperp_grid3d, phi_grid3d, x_grid3d = np.meshgrid(
+            k_perp_values, phi_values, x_values, indexing='ij'
+        )
 
         # Returned grid is (k_perp, phi, x), differential in x and d^2k_perp
-        return N_nn
+        return N_nn, kperp_grid3d, phi_grid3d, x_grid3d
+
+    # Generate a grid from a 3D meshgrid, x & k_perp constant along phi axis
+    def compute_dNdxd2k_grid_phi_mesh(self,
+                                      E: float,
+                                      z0: float,
+                                      u_perp: float,
+                                      mu: float,
+                                      x_grid3d: np.ndarray,
+                                      k_perp_grid3d: np.ndarray,
+                                      phi_grid3d: np.ndarray,
+                                      phi_axis: Optional[int] = None,
+                                      mask: bool=True,
+                                      ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
+        """
+        Same physical output as `compute_dNdxd2k_grid`, but takes an
+        already-built 3D meshgrid (e.g. from np.meshgrid(..., indexing='ij'))
+        in which x_grid3d and k_perp_grid3d are constant along one axis
+        (the "phi axis") while phi_grid3d varies only along that axis.
+
+        Exploits this structure by collapsing the phi axis to recover the
+        2D (k_perp, x) slice, querying the network once per unique
+        (k_perp, x) node (never once per phi!), and broadcasting the
+        harmonic reconstruction back out over phi.
+
+        Parameters
+        ----------
+        x_grid3d, k_perp_grid3d, phi_grid3d : np.ndarray, same shape
+        phi_axis : int, optional
+            Axis index along which phi varies (x, k_perp constant). If
+            None, auto-detected from the constancy of x_grid3d/k_perp_grid3d.
+
+        Returns
+        -------
+        N_nn, x_grid3d, k_perp_grid3d, phi_grid3d : np.ndarray, same shape as inputs
+            The input grids are passed straight back through (unmodified),
+            alongside the computed spectrum, for a consistent return
+            signature across all three entry points.
+        """
+        x_grid3d = np.asarray(x_grid3d)
+        k_perp_grid3d = np.asarray(k_perp_grid3d)
+        phi_grid3d = np.asarray(phi_grid3d)
+
+        if phi_axis is None:
+            phi_axis = self._detect_phi_axis(x_grid3d, k_perp_grid3d, phi_grid3d)
+
+        # Collapse the phi axis -- x, k_perp are constant there, so any single
+        # index along it gives the representative 2D slice.
+        slicer = [slice(None)] * x_grid3d.ndim
+        slicer[phi_axis] = 0
+        slicer = tuple(slicer)
+
+        x_slice = x_grid3d[slicer]         # shape with phi_axis removed... actually keeps ndim, size 1 there
+        kperp_slice = k_perp_grid3d[slicer]
+
+        A0_flat, A1_flat = self._predict_harmonics_masked(
+            x_slice.ravel(), kperp_slice.ravel(), E, z0, u_perp, mu, mask=mask
+        )
+        A0_slice = A0_flat.reshape(x_slice.shape)
+        A1_slice = A1_flat.reshape(x_slice.shape)
+
+        # Re-insert a length-1 phi axis so broadcasting against phi_grid3d works
+        A0_slice = np.expand_dims(A0_slice, axis=phi_axis)
+        A1_slice = np.expand_dims(A1_slice, axis=phi_axis)
+
+        N_nn = A0_slice + A1_slice * np.cos(phi_grid3d)
+        return N_nn, k_perp_grid3d, phi_grid3d, x_grid3d
+
+    # Generate a grid for an arbitrary 3D meshgrid, no guaranteed degeneracy
+    def compute_dNdxd2k_grid_arbitrary(self,
+                                       E: float,
+                                       z0: float,
+                                       u_perp: float,
+                                       mu: float,
+                                       x_grid3d: np.ndarray,
+                                       k_perp_grid3d: np.ndarray,
+                                       phi_grid3d: np.ndarray,
+                                       mask: bool=True,
+                                       ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
+        """
+        Same physical output as `compute_dNdxd2k_grid`, for a fully
+        arbitrary 3D meshgrid of (x, k_perp, phi) values -- no structural
+        degeneracy is assumed (x and k_perp need not repeat along any
+        particular axis).
+
+        Still avoids querying the network twice on the same physical
+        (x, k_perp) point: repeated pairs -- wherever they happen to occur
+        in the grid -- are collapsed via `np.unique` before evaluation,
+        and the result is scattered back out to the full grid shape.
+        If your grid has structured degeneracy (x, k_perp constant along
+        one axis), prefer `compute_dNdxd2k_grid_phi_mesh` instead -- it
+        skips the sort/unique overhead entirely.
+
+        Parameters
+        ----------
+        x_grid3d, k_perp_grid3d, phi_grid3d : np.ndarray, same shape
+
+        Returns
+        -------
+        N_nn, x_grid3d, k_perp_grid3d, phi_grid3d : np.ndarray, same shape as inputs
+            The input grids are passed straight back through (unmodified),
+            alongside the computed spectrum, for a consistent return
+            signature across all three entry points.
+        """
+        x_grid3d = np.asarray(x_grid3d)
+        k_perp_grid3d = np.asarray(k_perp_grid3d)
+        phi_grid3d = np.asarray(phi_grid3d)
+        shape = x_grid3d.shape
+
+        A0_flat, A1_flat = self._predict_harmonics_dedup(
+            x_grid3d.ravel(), k_perp_grid3d.ravel(), E, z0, u_perp, mu, mask=mask
+        )
+        A0 = A0_flat.reshape(shape)
+        A1 = A1_flat.reshape(shape)
+
+        N_nn = A0 + A1 * np.cos(phi_grid3d)
+        return N_nn, k_perp_grid3d, phi_grid3d, x_grid3d
 
 
 # ==============================================================================
