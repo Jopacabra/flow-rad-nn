@@ -31,7 +31,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 ape_dir = str(Path(__file__).resolve().parent.parent)
 sys.path.append(ape_dir)
 
-from integration import integrate_analytic_z_brutemc_t1 as integrate_point
+from integration import integrate_analytic_z_brutemc_t1 as integrate_point_t1
+from integration import integrate_analytic_z_brutemc_t1234 as integrate_point_all
 from integration import precompute_t234_qintegrals, compute_t234_harmonics_grid
 from radiation_nn import RadiationEmulatorInference, kinematic_domain
 
@@ -56,10 +57,16 @@ DEFAULTS["zf"] = DEFAULTS["z0"] + DTAU  # dtau = 0.1 fm
 # ==============================================================================
 # Reference computation
 # ==============================================================================
-def _integrate_one(args):
+def _integrate_one_all(args):
     """Top-level wrapper required for ProcessPoolExecutor pickling."""
     ikperp, iphi, x, k_perp, k_phi, E, mu, u_perp, z0, zf = args
-    mean, sdev = integrate_point(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+    mean, sdev = integrate_point_all(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
+    return ikperp, iphi, mean, sdev
+
+def _integrate_one_t1(args):
+    """Top-level wrapper required for ProcessPoolExecutor pickling."""
+    ikperp, iphi, x, k_perp, k_phi, E, mu, u_perp, z0, zf = args
+    mean, sdev = integrate_point_t1(x, k_perp, k_phi, E, mu, u_perp, z0, zf)
     return ikperp, iphi, mean, sdev
 
 
@@ -68,6 +75,7 @@ def compute_reference_grid(
     kperp_values: np.ndarray,
     kphi_values: np.ndarray,
     n_workers: int = 4,
+    fullbmc = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
     Compute the Vegas reference on the full (k_perp, k_phi) grid in parallel.
@@ -96,7 +104,10 @@ def compute_reference_grid(
     completed = 0
 
     with ProcessPoolExecutor(max_workers=n_workers) as pool:
-        futures = {pool.submit(_integrate_one, task): task for task in tasks}
+        if fullbmc:
+            futures = {pool.submit(_integrate_one_all, task): task for task in tasks}
+        else:
+            futures = {pool.submit(_integrate_one_t1, task): task for task in tasks}
         for future in as_completed(futures):
             ikperp, iphi, mean, sdev = future.result()
             I_ref[ikperp, iphi] = mean
@@ -122,6 +133,7 @@ def compute_nn_grid(
     x, E, z0, u_perp, mu,
     kperp_values: np.ndarray,
     kphi_values: np.ndarray,
+    full: bool=True  # Whether or not to add the numerically integrated section of the spectrum.
 ) -> np.ndarray:
     """
     Evaluate the NN emulator on the full (k_perp, k_phi) grid in one batched call.
@@ -130,21 +142,24 @@ def compute_nn_grid(
     -------
     I_nn : ndarray, shape (n_kperp, n_kphi)
     """
-    kperp_grid, kphi_grid = np.meshgrid(kperp_values, kphi_values, indexing='ij')
+    kperp_grid, kphi_grid, x_grid = np.meshgrid(kperp_values, kphi_values, np.array([x]), indexing='ij')
     kperp_grid = kperp_grid.astype(np.float32)
     kphi_grid = kphi_grid.astype(np.float32)
-    n_pts = kperp_grid.size
+    x_grid = x_grid.astype(np.float32)
 
-    I_nn_flat = emulator.predict(
-        x      = np.full(n_pts, x),
-        k_perp = kperp_grid.ravel(),
-        phi    = kphi_grid.ravel(),
-        E      = np.full(n_pts, E),
-        z0     = np.full(n_pts, z0),
-        u_perp = np.full(n_pts, u_perp),
-        mu     = np.full(n_pts, mu),
-    )
-    return I_nn_flat.reshape(len(kperp_values), len(kphi_values))
+    I_nn, _, _, _ = emulator.compute_dNdxd2k_grid_phi_mesh(
+                                      E=E,
+                                      z0=z0,
+                                      u_perp=u_perp,
+                                      mu=mu,
+                                      x_grid3d=x_grid,
+                                      k_perp_grid3d=kperp_grid,
+                                      phi_grid3d=kphi_grid,
+                                      phi_axis=1,
+                                      mask=False,
+                                      t234=full,
+                                      )
+    return I_nn[:,:,0]
 
 
 # ==============================================================================
@@ -247,6 +262,7 @@ def make_combined_plot(
             _add_kperp_circle(ax, kperp_max, 'green', '--')
             ax.set_ylim(0, kperp_max)
             # ax.set_axis_off()
+            ax.set_xticks([])
 
         # Console statistics
         valid = np.isfinite(I_ref) & np.isfinite(I_nn)
@@ -300,6 +316,8 @@ def main():
                         type=str, default='data/radiation_emulator.pt')
     parser.add_argument('--output', type=str, default='kperp_kphi_comparison.png')
     parser.add_argument("--full", action="store_true", help="Compute complete spectra, including t2, t3, & t4")
+    parser.add_argument("--fullbmc", action="store_true", help="Compute complete spectra, including t2, t3, & t4. "
+                                                               "Use brute force VEGAS+ on the full integrand.")
     args = parser.parse_args()
 
     params = dict(E=args.E, z0=args.z0, zf=args.z0 + DTAU,
@@ -353,6 +371,7 @@ def main():
                 kperp_values=kperp_values,
                 kphi_values=kphi_values,
                 n_workers=args.workers,
+                fullbmc=args.fullbmc,
             )
 
             print("  Computing NN grid...")
@@ -363,6 +382,7 @@ def main():
                 u_perp=args.u_perp, mu=args.mu,
                 kperp_values=kperp_values,
                 kphi_values=kphi_values,
+                full=True if args.full or args.fullbmc else False,
             )
             print(f"  NN Prediction max: {np.amax(I_nn_x)}")
             print(f"  NN Prediction min: {np.amin(I_nn_x)}")
@@ -393,7 +413,6 @@ def main():
 
                 # Sum with the t1 grid
                 I_ref_x = I_ref_x + I_t234
-                I_nn_x = I_nn_x + I_t234
 
             plot_rows.append((x_params, kperp_values, kphi_values, I_ref_x, I_err_x, I_nn_x, kperp_min, kperp_max))
 
