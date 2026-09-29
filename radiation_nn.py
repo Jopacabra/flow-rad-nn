@@ -48,6 +48,7 @@ import signal
 import os
 import time
 from pathlib import Path
+import integration
 
 # Set use of float32 for matmuls to improve performance. Trial feature -- may impact accuracy, depending on problem.
 torch.set_float32_matmul_precision('high')
@@ -1518,7 +1519,7 @@ class RadiationEmulatorInference:
             print(f"  Trained for {checkpoint['epoch'] + 1} epochs")
             set_debug(self.model, True)
 
-    def predict(
+    def _predict(
             self,
             x: np.ndarray,
             k_perp: np.ndarray,
@@ -1529,13 +1530,13 @@ class RadiationEmulatorInference:
             mu: np.ndarray,
     ) -> np.ndarray:
         """
-        Physical-facing entry point -- returns the combined scalar output
+        Returns the combined scalar output, with harmonics combined for the given phi
         """
-        A0, A1 = self.predict_harmonics(x, k_perp, E, z0, u_perp, mu)
+        A0, A1 = self._predict_harmonics(x, k_perp, E, z0, u_perp, mu)
         predictions = A0 + A1 * np.cos(phi)
         return predictions
 
-    def predict_harmonics(
+    def _predict_harmonics(
             self,
             x: np.ndarray,
             k_perp: np.ndarray,
@@ -1552,10 +1553,10 @@ class RadiationEmulatorInference:
                 x=x, k_perp=k_perp, E=E, z0=z0, u_perp=u_perp, mu=mu).values()
                                  )).astype(np.float32, order='C', copy=False
         )
-        A_heads = self.predict_harmonics_raw(inputs)
+        A_heads = self._predict_harmonics_raw(inputs)
         return A_heads[:, 0], A_heads[:, 1]
 
-    def predict_harmonics_raw(self, inputs: np.ndarray) -> np.ndarray:
+    def _predict_harmonics_raw(self, inputs: np.ndarray) -> np.ndarray:
         inputs_tensor = torch.from_numpy(np.asarray(inputs, dtype=np.float32)).to(self.device)
 
         # Normalize using the model's own buffers -- guaranteed in sync with training
@@ -1568,7 +1569,7 @@ class RadiationEmulatorInference:
         A_heads = (self.model.f0 * phys_over_f0).cpu().numpy()
         return A_heads
 
-    def predict_dict(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
+    def _predict_dict(self, inputs: Dict[str, np.ndarray]) -> np.ndarray:
         """
         Predict from a dictionary of inputs.
 
@@ -1582,7 +1583,7 @@ class RadiationEmulatorInference:
         np.ndarray
             NN output for the given inputs
         """
-        return self.predict(
+        return self._predict(
             x=inputs['x'],
             k_perp=inputs['k_perp'],
             phi=inputs['phi'],
@@ -1601,7 +1602,8 @@ class RadiationEmulatorInference:
             u_perp: float,
             mu: float,
             mask: bool=True,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+            t234: bool=True,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Single source of truth for the physical (A0, A1) harmonics as a
         function of (x, k_perp), for one fixed (E, z0, u_perp, mu) event.
@@ -1631,7 +1633,7 @@ class RadiationEmulatorInference:
         kperp_flat = np.asarray(kperp_flat)
         n = x_flat.size
 
-        A0, A1 = self.predict_harmonics(
+        A0, A1 = self._predict_harmonics(
             x=x_flat,
             k_perp=kperp_flat,
             E=np.full(n, E, dtype=np.float64),
@@ -1639,6 +1641,24 @@ class RadiationEmulatorInference:
             u_perp=np.full(n, u_perp, dtype=np.float64),
             mu=np.full(n, mu, dtype=np.float64),
         )
+
+        A2 = np.zeros_like(A0)
+
+        if t234:
+            # Add the numerical integration results for terms 2, 3, & 4
+
+            # Precompute qintegrals
+            q_max = np.sqrt(3 * E * mu)
+            qints = integration.precompute_t234_qintegrals(E, mu, u_perp, q_max)
+
+            # Batched numerical integrator call for the remaining points, summing to collapse x axis
+            A0_234, A1_234, A2_234 = integration.compute_t234_harmonics_array(
+                x_flat, kperp_flat, E, mu, u_perp, z0, z0 + DELTA_Z, qints=qints
+            )  # Shape (n_points)
+
+            A0 = A0 + A0_234
+            A1 = A1 + A1_234
+            A2 = A2 + A2_234
 
         if mask:
             # Kinematic cuts -- scalar E/mu broadcast fine against the x_flat array
@@ -1648,8 +1668,9 @@ class RadiationEmulatorInference:
 
             A0 = np.where(valid, A0, 0.0)
             A1 = np.where(valid, A1, 0.0)
+            A2 = np.where(valid, A2, 0.0)
 
-        return A0, A1
+        return A0, A1, A2
 
     def _predict_harmonics_dedup(
             self,
@@ -1660,7 +1681,8 @@ class RadiationEmulatorInference:
             u_perp: float,
             mu: float,
             mask: bool=True,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+            t234: bool=True,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Same contract as `_predict_harmonics_masked`, but for the case
         where degeneracy in (x, k_perp) is expected yet *not* known to
@@ -1675,12 +1697,12 @@ class RadiationEmulatorInference:
         pairs = np.column_stack([x_flat, kperp_flat])
         uniq_pairs, inverse = np.unique(pairs, axis=0, return_inverse=True)
 
-        A0_u, A1_u = self._predict_harmonics_masked(
-            uniq_pairs[:, 0], uniq_pairs[:, 1], E, z0, u_perp, mu, mask=mask
+        A0_u, A1_u, A2_u = self._predict_harmonics_masked(
+            uniq_pairs[:, 0], uniq_pairs[:, 1], E, z0, u_perp, mu, mask=mask, t234=t234
         )
         # np.unique's return_inverse can be shape (N,1) depending on numpy version -- flatten defensively
         inverse = np.asarray(inverse).reshape(-1)
-        return A0_u[inverse], A1_u[inverse]
+        return A0_u[inverse], A1_u[inverse], A2_u[inverse]
 
     @staticmethod
     def _detect_phi_axis(x_grid3d: np.ndarray, kperp_grid3d: np.ndarray, phi_grid3d: np.ndarray) -> int:
@@ -1716,6 +1738,7 @@ class RadiationEmulatorInference:
                              k_perp_values: np.ndarray,
                              phi_values: np.ndarray,
                              mask: bool=True,
+                             t234: bool=True,
                              ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
         """
         Computes a complete grid of NN outputs, with broadcasting harmonics
@@ -1749,15 +1772,17 @@ class RadiationEmulatorInference:
         # every pair here is unique, so we query the network exactly once per pair.
         kperp_grid2d, x_grid2d = np.meshgrid(k_perp_values, x_values, indexing='ij')  # (n_kperp, n_x)
 
-        A0_flat, A1_flat = self._predict_harmonics_masked(
-            x_grid2d.ravel(), kperp_grid2d.ravel(), E, z0, u_perp, mu, mask=mask
+        A0_flat, A1_flat, A2_flat = self._predict_harmonics_masked(
+            x_grid2d.ravel(), kperp_grid2d.ravel(), E, z0, u_perp, mu, mask=mask, t234=t234
         )
         A0_2d = A0_flat.reshape(x_grid2d.shape)
         A1_2d = A1_flat.reshape(x_grid2d.shape)
+        A2_2d = A2_flat.reshape(x_grid2d.shape)
 
         # Reconstruct full angular dependence via broadcasting -- shape (n_kperp, n_phi, n_x)
         cos_phi = np.cos(phi_values)[None, :, None]
-        N_nn = A0_2d[:, None, :] + A1_2d[:, None, :] * cos_phi
+        cos_2phi = np.cos(2*phi_values)[None, :, None]
+        N_nn = A0_2d[:, None, :] + A1_2d[:, None, :] * cos_phi + A2_2d[:, None, :] * cos_2phi
 
         # Build the equivalent full 3D meshgrid for return -- cheap compared to
         # the network evaluation we just avoided doing on it directly.
@@ -1779,6 +1804,7 @@ class RadiationEmulatorInference:
                                       phi_grid3d: np.ndarray,
                                       phi_axis: Optional[int] = None,
                                       mask: bool=True,
+                                      t234: bool=True,
                                       ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
         """
         Same physical output as `compute_dNdxd2k_grid`, but takes an
@@ -1821,17 +1847,19 @@ class RadiationEmulatorInference:
         x_slice = x_grid3d[slicer]         # shape with phi_axis removed... actually keeps ndim, size 1 there
         kperp_slice = k_perp_grid3d[slicer]
 
-        A0_flat, A1_flat = self._predict_harmonics_masked(
-            x_slice.ravel(), kperp_slice.ravel(), E, z0, u_perp, mu, mask=mask
+        A0_flat, A1_flat, A2_flat = self._predict_harmonics_masked(
+            x_slice.ravel(), kperp_slice.ravel(), E, z0, u_perp, mu, mask=mask, t234=t234
         )
         A0_slice = A0_flat.reshape(x_slice.shape)
         A1_slice = A1_flat.reshape(x_slice.shape)
+        A2_slice = A2_flat.reshape(x_slice.shape)
 
         # Re-insert a length-1 phi axis so broadcasting against phi_grid3d works
         A0_slice = np.expand_dims(A0_slice, axis=phi_axis)
         A1_slice = np.expand_dims(A1_slice, axis=phi_axis)
+        A2_slice = np.expand_dims(A2_slice, axis=phi_axis)
 
-        N_nn = A0_slice + A1_slice * np.cos(phi_grid3d)
+        N_nn = A0_slice + A1_slice * np.cos(phi_grid3d) + A2_slice * np.cos(2 * phi_grid3d)
         return N_nn, k_perp_grid3d, phi_grid3d, x_grid3d
 
     # Generate a grid for an arbitrary 3D meshgrid, no guaranteed degeneracy
@@ -1844,6 +1872,7 @@ class RadiationEmulatorInference:
                                        k_perp_grid3d: np.ndarray,
                                        phi_grid3d: np.ndarray,
                                        mask: bool=True,
+                                       t234: bool=True,
                                        ) -> (np.ndarray, np.ndarray, np.ndarray, np.ndarray):
         """
         Same physical output as `compute_dNdxd2k_grid`, for a fully
@@ -1875,13 +1904,14 @@ class RadiationEmulatorInference:
         phi_grid3d = np.asarray(phi_grid3d)
         shape = x_grid3d.shape
 
-        A0_flat, A1_flat = self._predict_harmonics_dedup(
-            x_grid3d.ravel(), k_perp_grid3d.ravel(), E, z0, u_perp, mu, mask=mask
+        A0_flat, A1_flat, A2_flat = self._predict_harmonics_dedup(
+            x_grid3d.ravel(), k_perp_grid3d.ravel(), E, z0, u_perp, mu, mask=mask, t234=t234
         )
         A0 = A0_flat.reshape(shape)
         A1 = A1_flat.reshape(shape)
+        A2 = A2_flat.reshape(shape)
 
-        N_nn = A0 + A1 * np.cos(phi_grid3d)
+        N_nn = A0 + A1 * np.cos(phi_grid3d) + A2 * np.cos(2 * phi_grid3d)
         return N_nn, k_perp_grid3d, phi_grid3d, x_grid3d
 
 

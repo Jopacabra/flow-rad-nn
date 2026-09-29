@@ -25,7 +25,7 @@ MCADAPT = True  # Whether to do grid adaptation -- negligible overhead, helps ac
 # NITN_WARMUP = 0  # Iterations for the MC integrators during "warmup"
 # NITN = 3  # Number of iterations for actual integration
 # NEVAL = 10000  # Number of evaluations for integration
-# MCADAPT = False  # Whether to do grid adaptation -- negligible overhead, helps accuracy
+# MCADAPT = True  # Whether to do grid adaptation -- negligible overhead, helps accuracy
 
 MCADAPT_GRIDS = False  # Whether to do grid adaptation evaluating on a grid -- Outliers ruin the grid!
 
@@ -625,6 +625,81 @@ def precompute_t234_qintegrals(E, mu, u_perp, q_max=None):
     t4_qint = t4_elliptic_qint(uu, mu, u_perp, q_max)
 
     return {"t2_qint": t2_qint, "t3_qint": t3_qint, "t4_qint": t4_qint, "q_max": q_max}
+
+
+def compute_t234_harmonics_array(x_values, k_perp_values, E, mu, u_perp, z0, zf,
+                                 qints=None):
+    """
+    Vectorized, loop-free evaluation of the EXACT (non-t1) harmonic
+    amplitudes A0, A1, A2 over a full (x, k_perp) grid, for fixed
+    E, mu, u_perp, z0, zf.
+
+    Only t1 needs the network / VEGAS -- this function is pure numpy and
+    should take microseconds even for large grids.
+
+    Parameters
+    ----------
+    x_values : ndarray, shape (N_x,)
+    k_perp_values : ndarray, shape (N_k,)
+    E, mu, u_perp, z0, zf : float
+    qints : dict, optional
+        Pre-computed output of `precompute_t234_qintegrals`. Pass this in if
+        you're calling this function repeatedly for the same (E, mu, u_perp)
+        (e.g. across many events) to avoid re-deriving the scalars.
+
+    Returns
+    -------
+    A0, A1, A2 : ndarray, shape (N_x, N_k)
+        A0 = A0_T3 + A0_T4
+        A1 = A1_T2
+        A2 = A2_T4
+    """
+    x_values = np.asarray(x_values, dtype=np.float64)
+    k_perp_values = np.asarray(k_perp_values, dtype=np.float64)
+
+    deltaz = zf - z0
+    uu = u_perp ** 2
+
+    if qints is None:
+        qints = precompute_t234_qintegrals(E, mu, u_perp)
+    t2_qint, t3_qint, t4_qint = qints["t2_qint"], qints["t3_qint"], qints["t4_qint"]
+
+    # Don't broadcast grid quantities: keep single list of paired values
+    x = x_values
+    k_perp = k_perp_values
+
+    kk = k_perp ** 2
+    k4 = kk ** 2
+    lkllul = k_perp * u_perp          # k . u  (phi-independent amplitude piece)
+    halflkllul2 = 0.5 * lkllul ** 2
+
+    omega_k = kk / (2.0 * x * E)
+    phase = omega_k * (z0 + deltaz / 2.0)
+    sinc_arg = omega_k * deltaz / (2.0 * np.pi)
+    sinc_val = np.sinc(sinc_arg)                       # vectorized, safe at omega_k -> 0
+
+    sin_z_integral = sinc_val * np.sin(phase) * deltaz
+    cos_z_integral = (1.0 - sinc_val * np.cos(phase)) * deltaz
+
+    # ---- Term 2: A1 only ----
+    t2_pref = (1.0 / (x * E)) * (lkllul / kk)
+    A1_T2 = t2_pref * t2_qint * cos_z_integral
+
+    # ---- Term 3: A0 only ----
+    t3_pref = 1.0 / (2.0 * kk * x * E)
+    A0_T3 = t3_pref * t3_qint * sin_z_integral
+
+    # ---- Term 4: A0 and A2 ----
+    t4_pref_A0 = (1.0 / (x * E)) * ((kk * (1.0 - uu) + halflkllul2) / k4)
+    t4_pref_A2 = (1.0 / (x * E)) * (halflkllul2 / k4)
+    A0_T4 = t4_qint * t4_pref_A0 * sin_z_integral
+    A2_T4 = t4_qint * t4_pref_A2 * sin_z_integral
+
+    A0 = A0_T3 + A0_T4
+    A1 = A1_T2
+    A2 = A2_T4
+
+    return A0, A1, A2
 
 
 def compute_t234_harmonics_grid(x_values, k_perp_values, E, mu, u_perp, z0, zf,

@@ -100,7 +100,7 @@ def diagnose_model(
 
     # Load model and predict
     emulator = RadiationEmulatorInference(model_file, normalization_file, device="cpu")
-    y_pred = emulator.predict_dict(X_sub)
+    y_pred = emulator._predict_dict(X_sub)
 
     # === Plot 1: Predicted vs True ===
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))
