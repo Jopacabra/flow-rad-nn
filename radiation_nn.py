@@ -96,7 +96,6 @@ class TrainingConfig:
     lambda_A1: float = 1.0  # Weight for MSE of A1 head
     lambda_A0_int: float = 1.0  # Weight for integral-importance absolute-error term (A0)
     lambda_A1_int: float = 1.0  # Weight for integral-importance absolute-error term (A1)
-    lambda_uv: float = 0.0  # Weight for UV decay loss term
     # UV threshold: only penalise points where kt^2 > uv_kt2_threshold (in GeV^2).
     # Should be set comfortably above mu_D^2 ~ g^2 T^2 ~ (2*GeV)^2*(0.3GeV)^2 ~ 0.36 GeV^2.
     # A safe default is 10.0 GeV^2 (kperp > ~3.16 GeV).
@@ -924,70 +923,6 @@ def compute_loss(
     A0_int_abs = (A0_intw * A0_excess ** 2).mean()
     A1_int_abs = (A1_intw * A1_excess ** 2).mean()
 
-    """
-    UV decay enforcement loss
-
-    Enforces each harmonic head -> 0 as k_perp -> inf. Applied per-head since
-    every harmonic amplitude should vanish independently in the UV.
-    """
-    if config.lambda_uv > 0.0:
-        max_frac = 0.05
-        n_uv_samples = 64
-
-        # Get shape and device of inputs
-        B = inputs.shape[0]
-        device = inputs.device
-
-        # Tile the other 7 parameters from random rows of the training batch
-        idx = torch.randint(0, B, (n_uv_samples,), device=device)
-        uv_params = inputs[idx].clone()  # (n_uv_samples, 7)
-
-        # Unnormalize the whole row back to physical space
-        X_mean = model.X_mean.to(device)
-        X_std = model.X_std.to(device)
-        phys = uv_params * X_std + X_mean  # (n_uv_samples, n_features), physical units
-
-        E_mean = model.X_mean[IDX_E].to(device)
-        E_std = model.X_std[IDX_E].to(device)
-        energy_params = np.pow(10, (uv_params[:, IDX_E] * E_std + E_mean).cpu().numpy())
-
-        # Sample k_perp in [kperp_max, kperp_max * (1 + margin_frac)] -- just past the edge of the valid domain
-        x_min, x_max, kperp_min, kperp_max_sq, valid = kinematic_domain(x_p, E_p, mu_p)
-        kperp_max = torch.sqrt(kperp_max_sq.clamp(min=0))
-        k_perp_uv = kperp_max * (1.0 + margin_frac * torch.rand_like(kperp_max))
-        log_k = torch.log(k_perp_uv)
-
-        # Overwrite k_perp in physical space
-        phys[:, IDX_K_PERP] = k_perp_uv
-
-        # Recompute the k_perp-dependent derived features consistently
-        IDX_X, IDX_E, IDX_Z0 = names.index('ln(x)'), names.index('ln(E)'), names.index('ln(z0)')
-        x_p, E_p, z0_p = torch.exp(phys[:, IDX_X]), torch.exp(phys[:, IDX_E]), torch.exp(phys[:, IDX_Z0])
-        mu_p = phys[:, names.index('mu')]
-        k_perp_p = torch.exp(phys[:, IDX_K_PERP])
-        omega_k = k_perp_p ** 2 / (2 * x_p * E_p)
-        phys[:, names.index('omega_k_dz')] = omega_k * DELTA_Z / 2
-        phys[:, names.index('omega_k_midz')] = omega_k * (z0_p + DELTA_Z / 2)
-        phys[:, names.index('omega_width')] = mu_p ** 2 * DELTA_Z / (2 * x_p * E_p)
-
-        # Re-normalize before feeding to the model
-        uv_params = (phys - X_mean) / X_std
-        uv_heads = model(uv_params) # shape (n_uv_samples, 3)
-
-        # Use log weight to penalize nonzero result at larger k_perp values more
-        log_esqr = torch.tensor(math.log(max_frac) + 2 * np.log(energy_params), device=device)
-        log_weight = 2 * log_k - 2 * log_esqr
-
-        # Penalize all three heads
-        uv_decay = (log_weight.unsqueeze(1) * uv_heads ** 2).mean()
-    else:
-        uv_decay = torch.tensor(0.0, device=inputs.device)
-
-    # # Proximity to k_perp boundary
-    # s = (k_perp ** 2 / kperp_max_sq.clamp(min=1e-12)).clamp(0, 1)
-    # edge_mask = s > 0.8
-    # components['A0_mse_edge'] = (
-    #             weights[edge_mask] * A0_excess[edge_mask] ** 2).mean().item() if edge_mask.any() else float('nan')
 
     # Total loss
     total_loss = (
@@ -995,7 +930,6 @@ def compute_loss(
             + config.lambda_A1 * A1_mse
             + config.lambda_A0_int * A0_int_abs
             + config.lambda_A1_int * A1_int_abs
-            + config.lambda_uv * uv_decay
     )
 
     components = {
@@ -1003,7 +937,6 @@ def compute_loss(
         'A1_mse': A1_mse.item(),
         'A0_int_abs': A0_int_abs.item(),
         'A1_int_abs': A1_int_abs.item(),
-        'uv_decay': uv_decay.item(),
         'total': total_loss.item(),
     }
 
@@ -1624,6 +1557,10 @@ class RadiationEmulatorInference:
         x_flat, kperp_flat : 1D np.ndarray, same length
         E, z0, u_perp, mu : float
             Fixed physical parameters for this event.
+        mask : bool
+            Whether or not to set points outside kinematic bounds to zero
+        t234 : bool
+            Whether or not to add the numerical integration results for terms 2, 3, & 4.
 
         Returns
         -------
@@ -1749,12 +1686,11 @@ class RadiationEmulatorInference:
         and phi coordinates. Apply the Jacobian later when you need it!
 
         The network is evaluated only on the 2D (k_perp, x) outer-product
-        grid -- every (k_perp, x) pair here is unique by construction, so
-        no dedup bookkeeping is needed -- phi dependence is reconstructed
-        analytically from the fourier harmonics in phi.
+        grid -- every (k_perp, x) pair here is unique by construction,
+        phi dependence is reconstructed analytically from the fourier harmonics in phi.
 
-        Points outside the kinematic region are set to zero (handled by
-        `_predict_harmonics_masked`).
+        Points outside the kinematic region are set to zero when mask is true
+        (handled by `_predict_harmonics_masked`).
 
         Returns
         -------
@@ -1812,10 +1748,8 @@ class RadiationEmulatorInference:
         in which x_grid3d and k_perp_grid3d are constant along one axis
         (the "phi axis") while phi_grid3d varies only along that axis.
 
-        Exploits this structure by collapsing the phi axis to recover the
-        2D (k_perp, x) slice, querying the network once per unique
-        (k_perp, x) node (never once per phi!), and broadcasting the
-        harmonic reconstruction back out over phi.
+        Collapses the phi axis to recover the 2D (k_perp, x) slice, querying the network once per unique
+        (k_perp, x) node, and broadcasting the harmonic reconstruction back out over phi.
 
         Parameters
         ----------
