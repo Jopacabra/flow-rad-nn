@@ -967,6 +967,8 @@ def train_epoch(
         weights = weights.to(config.device)
         A0_err = A0_err.to(config.device)
         A1_err = A1_err.to(config.device)
+        A0_intw = A0_intw.to(config.device)
+        A1_intw = A1_intw.to(config.device)
 
         # Compute loss and step optimizer
         optimizer.zero_grad()
@@ -1010,6 +1012,8 @@ def validate(
             weights = weights.to(config.device)
             A0_err = A0_err.to(config.device)
             A1_err = A1_err.to(config.device)
+            A0_intw = A0_intw.to(config.device)
+            A1_intw = A1_intw.to(config.device)
 
             # Compute loss
             _, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, A0_err, A1_err, A0_intw, A1_intw, config)
