@@ -1861,12 +1861,11 @@ def find_learning_rate(
         dataloader: DataLoader,
         optimizer: torch.optim.Optimizer,
         config: TrainingConfig,
-        normalization: Normalization,
-        start_lr: float = 1e-4,    # narrower range start
-        end_lr: float = 1e-1,      # narrower range end
-        n_steps: int = 150,        # far more steps for resolution
-        smoothing: float = 0.9,   # heavy EMA, standard for LR finders
-        diverge_threshold: float = 4.0,  # stop if loss exceeds this × best
+        start_lr: float = 1e-4,
+        end_lr: float = 1e-1,
+        n_steps: int = 150,
+        smoothing: float = 0.9,
+        diverge_threshold: float = 4.0,
 ) -> Tuple[list, list, list]:
     """
     Learning rate range test (Smith 2015).
@@ -1907,25 +1906,32 @@ def find_learning_rate(
 
     for step in range(n_steps):
         try:
-            inputs, A0_targets, A1_targets, weights = next(data_iter)
+            inputs, A0_targets, A1_targets, weights, A0_err, A1_err, A0_intw, A1_intw = next(data_iter)
         except StopIteration:
             data_iter = iter(dataloader)
-            inputs, A0_targets, A1_targets, weights = next(data_iter)
+            inputs, A0_targets, A1_targets, weights, A0_err, A1_err, A0_intw, A1_intw = next(data_iter)
 
-        inputs  = inputs.to(config.device)
+        inputs = inputs.to(config.device)
         A0_targets = A0_targets.to(config.device)
         A1_targets = A1_targets.to(config.device)
         weights = weights.to(config.device)
+        A0_err = A0_err.to(config.device)
+        A1_err = A1_err.to(config.device)
+        A0_intw = A0_intw.to(config.device)
+        A1_intw = A1_intw.to(config.device)
 
         optimizer.zero_grad()
-        loss, components = compute_loss(model, inputs, A0_targets, A1_targets, weights, config, normalization)
+        loss, components = compute_loss(
+            model, inputs, A0_targets, A1_targets, weights,
+            A0_err, A1_err, A0_intw, A1_intw, config
+        )
         if not torch.isfinite(loss):
             print("Non-finite loss detected:", components)
             raise FloatingPointError("Non-finite loss")
         loss.backward()
         optimizer.step()
 
-        raw_loss = components['mse']
+        raw_loss = components['A0_mse'] + components['A1_mse']  # Raw summed losses of harmonics
 
         # Bias-corrected EMA — prevents the first few steps from being
         # artificially low just because smoothed_loss started at zero.
