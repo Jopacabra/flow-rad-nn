@@ -194,7 +194,7 @@ def make_combined_plot(
             return
         theta_full = np.linspace(-np.pi, np.pi, 200)
         ax.plot(theta_full, np.full_like(theta_full, r),
-                color=color, linewidth=0.8, linestyle=ls, zorder=5)
+                color=color, linewidth=2, linestyle=ls, zorder=5)
 
     for row_idx, (params, kperp_values, kphi_values, I_ref, I_err, I_nn, kperp_min, kperp_max) in enumerate(rows):
         ax_ref, ax_nn, ax_res = axes[row_idx]
@@ -260,7 +260,7 @@ def make_combined_plot(
             ax.tick_params(labelsize=7)
             _add_kperp_circle(ax, kperp_min, 'black', '-')
             _add_kperp_circle(ax, kperp_max, 'green', '--')
-            ax.set_ylim(0, kperp_max)
+            ax.set_ylim(0, 1.01*kperp_max)
             # ax.set_axis_off()
             ax.set_xticks([])
 
@@ -342,7 +342,7 @@ def main():
     # --- x-slice rows ---
     # Only used to establish the global x-domain bounds for the eps-padded endpoints
     x_min, x_max, _, _, _ = kinematic_domain(0, args.E, args.mu)
-    eps = 0.1
+    eps = 1e-2
     args.x_values.insert(0, x_min + eps)  # add minimum x
     args.x_values.append(x_max - eps)  # add maximum x
     plot_rows = []
