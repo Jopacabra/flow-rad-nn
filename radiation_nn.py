@@ -170,24 +170,31 @@ def kinematic_domain(x, E, mu):
       - RadiationDataset._scan_file() [training-data validity check]
       - RadiationEmulatorInference.compute_dNdxd2k_grid() [deployment masking]
 
+    x_min, x_max : kinematic bounds on x -- the TRUE bounds for which a
+                   non-empty k_perp window exists (kperp_max > kperp_min),
+                   i.e. min(x,1-x) > sqrt(2)*mu/E.
+
     Returns
     -------
-    x_min, x_max     : kinematic bounds on x
+    x_min, x_max     : kinematic bounds on x, including constraint that kperp_min_sq > kperp_max_sq
     kperp_min        : mu (broadcast to x's shape)
     kperp_max_sq     : min(x,1-x)^2 * E^2 - mu^2   (physically meaningful only where valid)
     valid            : bool mask -- True iff a nonempty k_perp window exists
     """
-    x_min = mu / E
+    # x_min = mu / ( 2 * E)  # Actual kinematic bound from plasmon energy
+    x_min = np.sqrt(2) * mu / E  # Final boundary set by kperp_min < kperp_max
     x_max = 1.0 - x_min
     kperp_min = mu
     kperp_min_sq = kperp_min ** 2
     try:
-        kperp_max_sq = torch.minimum(x**2, (1 - x)**2) * E**2 - mu**2
+        kperp_max_sq = torch.minimum(x ** 2, (1 - x) ** 2) * E ** 2 - mu ** 2
         kperp_max_sq = torch.maximum(kperp_min_sq, kperp_max_sq)
     except TypeError:
         kperp_max_sq = np.minimum(x ** 2, (1 - x) ** 2) * E ** 2 - mu ** 2
         kperp_max_sq = np.maximum(kperp_min_sq, kperp_max_sq)
-    valid = (E > mu) & (x > x_min) & (x < x_max) & (kperp_max_sq > 0) & (kperp_max_sq > kperp_min_sq)
+
+    # Re-enforcing at the level of the cut that kperp_max > kperp_min
+    valid = (E > mu) & (x > x_min) & (x < x_max) & (kperp_max_sq > kperp_min_sq)
     return x_min, x_max, kperp_min, kperp_max_sq, valid
 
 
