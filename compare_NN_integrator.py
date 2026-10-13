@@ -14,7 +14,7 @@ Usage:
     python compare_NN_integrator.py
 
     # Custom parameters
-    python compare_NN_integrator.py --x 0.2 --E 50.0 --z0 0.0 \
+    python compare_NN_integrator.py --x 0.2 --E 50.0 --z0 0.0 --zf 1.0 \
         --u-perp 0.3 --mu 0.3 --n-kperp 25 --n-kphi 48 \
         --kperp-max 4.0 --output kperpkphi_comparison.png
 """
@@ -162,6 +162,38 @@ def compute_nn_grid(
     return I_nn[:,:,0]
 
 
+def compute_nn_grid_summed(
+    emulator: RadiationEmulatorInference,
+    x, E, z0, n_dtau, u_perp, mu,
+    kperp_values: np.ndarray,
+    kphi_values: np.ndarray,
+    full: bool = True,
+) -> np.ndarray:
+    """
+    Evaluate the NN emulator repeatedly, starting from z0, z0+DTAU, ...,
+    z0 + n_dtau*DTAU, and sum the resulting grids.
+
+    This mirrors propagating the parton through `n_dtau` (+1) successive
+    DTAU-sized steps, each contributing its own emission probability.
+    """
+    I_nn_total = None
+    for i_step in range(n_dtau):
+        z0_step = z0 + i_step * DTAU
+        I_nn_step = compute_nn_grid(
+            emulator=emulator,
+            x=x, E=E, z0=z0_step,
+            u_perp=u_perp, mu=mu,
+            kperp_values=kperp_values,
+            kphi_values=kphi_values,
+            full=full,
+        )
+        if I_nn_total is None:
+            I_nn_total = I_nn_step.copy()
+        else:
+            I_nn_total += I_nn_step
+    return I_nn_total
+
+
 # ==============================================================================
 # Combined multi-row polar plot
 # ==============================================================================
@@ -297,6 +329,9 @@ def main():
     )
     parser.add_argument('--E', type=float, default=DEFAULTS['E'], help='Parton energy (GeV)')
     parser.add_argument('--z0', type=float, default=DEFAULTS['z0'], help='Initial longitudinal position (invGeV)')
+    parser.add_argument('--zf', type=float, default=DEFAULTS['zf'],
+                        help='Final longitudinal position (invGeV); will be rounded to the nearest '
+                             'integer multiple N_DTAU of DTAU above z0')
     parser.add_argument('--u-perp', type=float, default=DEFAULTS['u_perp'], help='Transverse flow magnitude')
     parser.add_argument('--mu', type=float, default=DEFAULTS['mu'], help='Debye mass (GeV)')
     parser.add_argument('--n-kperp', type=int, default=DEFAULTS['n_kperp'],
@@ -320,7 +355,16 @@ def main():
                                                                "Use brute force VEGAS+ on the full integrand.")
     args = parser.parse_args()
 
-    params = dict(E=args.E, z0=args.z0, zf=args.z0 + DTAU,
+    # --- Round zf to the nearest integer multiple N_DTAU of DTAU above z0 ---
+    n_dtau = int(round((args.zf - args.z0) / DTAU))
+    if n_dtau < 1:
+        print(f"  Warning: requested zf={args.zf} rounds to N_DTAU={n_dtau} (<1); clamping to N_DTAU=1")
+        n_dtau = 1
+    zf_rounded = args.z0 + n_dtau * DTAU
+    print(f"  Requested zf = {args.zf:.4f} invGeV -> rounded to zf = {zf_rounded:.4f} invGeV "
+          f"(N_DTAU = {n_dtau}, DTAU = {DTAU:.4f} invGeV)")
+
+    params = dict(E=args.E, z0=args.z0, zf=zf_rounded,
                   u_perp=args.u_perp, mu=args.mu,
                   )
 
@@ -366,7 +410,7 @@ def main():
 
             print("  Computing reference grid...")
             I_ref_x, I_err_x = compute_reference_grid(
-                x=x_val, E=args.E, z0=args.z0, zf=args.z0 + DTAU,
+                x=x_val, E=args.E, z0=args.z0, zf=zf_rounded,
                 u_perp=args.u_perp, mu=args.mu,
                 kperp_values=kperp_values,
                 kphi_values=kphi_values,
@@ -376,9 +420,9 @@ def main():
 
             print("  Computing NN grid...")
             t0 = time.time()
-            I_nn_x = compute_nn_grid(
+            I_nn_x = compute_nn_grid_summed(
                 emulator=emulator,
-                x=x_val, E=args.E, z0=args.z0,
+                x=x_val, E=args.E, z0=args.z0, n_dtau=n_dtau,
                 u_perp=args.u_perp, mu=args.mu,
                 kperp_values=kperp_values,
                 kphi_values=kphi_values,
@@ -388,7 +432,7 @@ def main():
             print(f"  NN Prediction min: {np.amin(I_nn_x)}")
             print(f"  NN Prediction mean: {np.mean(I_nn_x)}")
             print(f"  NN Prediction nanmean: {np.nanmean(I_nn_x)}")
-            print(f"  NN prediction: {(time.time() - t0) * 1000:.1f} ms "
+            print(f"  NN prediction ({n_dtau + 1} calls summed): {(time.time() - t0) * 1000:.1f} ms "
                   f"for {args.n_kperp * args.n_kphi} points")
 
             # If full grids are desired, add grids computed for t2, t3, and t4 to NN and ref.
@@ -402,7 +446,7 @@ def main():
 
                 # Batched numerical integrator call for the remaining points, summing to collapse x axis
                 A0_234, A1_234, A2_234 = compute_t234_harmonics_grid(
-                    [x_val], Kperp_grid, args.E, args.mu, args.u_perp, args.z0, args.z0 + DTAU, qints=qints
+                    [x_val], Kperp_grid, args.E, args.mu, args.u_perp, args.z0, zf_rounded, qints=qints
                 )
                 A0_234, A1_234, A2_234 = np.sum(A0_234, axis=0), np.sum(A1_234, axis=0), np.sum(A2_234, axis=0)
 
