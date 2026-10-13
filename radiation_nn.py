@@ -169,32 +169,68 @@ def kinematic_domain(x, E, mu):
       - compute_loss() [UV-decay sampling region]
       - RadiationDataset._scan_file() [training-data validity check]
       - RadiationEmulatorInference.compute_dNdxd2k_grid() [deployment masking]
+      - Deployment logic to determine where to call the NN (via `valid`)
 
-    x_min, x_max : kinematic bounds on x -- the TRUE bounds for which a
-                   non-empty k_perp window exists (kperp_max > kperp_min),
-                   i.e. min(x,1-x) > sqrt(2)*mu/E.
+    x, E, mu may independently be python floats, numpy arrays, or torch
+    tensors. If any one of them is a torch.Tensor, all
+    computation is done in torch, on that tensor's device/dtype (priority:
+    x > E > mu if more than one is a tensor). Otherwise everything is done
+    in numpy.
 
     Returns
     -------
-    x_min, x_max     : kinematic bounds on x, including constraint that kperp_min_sq > kperp_max_sq
-    kperp_min        : mu (broadcast to x's shape)
-    kperp_max_sq     : min(x,1-x)^2 * E^2 - mu^2   (physically meaningful only where valid)
+    x_min, x_max     : kinematic bounds on x, including constraint that
+                        kperp_min_sq > kperp_max_sq
+    kperp_min        : mu, broadcast to the common (x, E, mu) shape
+    kperp_max_sq     : min(x,1-x)^2 * E^2 - mu^2 (meaningful only where valid)
     valid            : bool mask -- True iff a nonempty k_perp window exists
     """
-    # x_min = mu / ( 2 * E)  # Actual kinematic bound from plasmon energy
-    x_min = np.sqrt(2) * mu / E  # Final boundary set by kperp_min < kperp_max
-    x_max = 1.0 - x_min
-    kperp_min = mu
-    kperp_min_sq = kperp_min ** 2
-    try:
-        kperp_max_sq = torch.minimum(x ** 2, (1 - x) ** 2) * E ** 2 - mu ** 2
-        kperp_max_sq = torch.maximum(kperp_min_sq, kperp_max_sq)
-    except TypeError:
-        kperp_max_sq = np.minimum(x ** 2, (1 - x) ** 2) * E ** 2 - mu ** 2
-        kperp_max_sq = np.maximum(kperp_min_sq, kperp_max_sq)
+    # Decide whether to use torch or numpy, based on if any inputs are torch tensors
+    tensors = [a for a in (x, E, mu) if isinstance(a, torch.Tensor)]
+    use_torch = len(tensors) > 0
 
-    # Re-enforcing at the level of the cut that kperp_max > kperp_min
+    if use_torch:
+        # Priority order x > E > mu for picking the reference dtype/device,
+        # so gradients / device placement follow the "primary" variable.
+        ref = next(a for a in (x, E, mu) if isinstance(a, torch.Tensor))
+        x = torch.as_tensor(x, dtype=ref.dtype, device=ref.device)
+        E = torch.as_tensor(E, dtype=ref.dtype, device=ref.device)
+        mu = torch.as_tensor(mu, dtype=ref.dtype, device=ref.device)
+        minimum, maximum = torch.minimum, torch.maximum
+        ones_like = torch.ones_like
+    else:
+        x = np.asarray(x, dtype=float)
+        E = np.asarray(E, dtype=float)
+        mu = np.asarray(mu, dtype=float)
+        minimum, maximum = np.minimum, np.maximum
+        ones_like = np.ones_like
+
+    sqrt2 = 2.0 ** 0.5  # plain python float broadcasts fine in both backends
+
+    # Kinematic bounds on x
+    # x_min = mu / (2 * E)  # true minimum plasmon-frequency bound
+    x_min = sqrt2 * mu / E  # Practically, the tighter bound is kperp_min < kperp_max
+    x_max = 1.0 - x_min
+
+    # k_perp window
+    kperp_min_sq = mu ** 2
+    kperp_max_sq = minimum(x ** 2, (1 - x) ** 2) * E ** 2 - mu ** 2
+    kperp_max_sq = maximum(kperp_min_sq, kperp_max_sq)
+
+    # Broadcast kperp_min to the common shape of (x, E, mu)
+    # since x_min/x_max/kperp_max_sq already reflect that full broadcast.
+    kperp_min = mu * ones_like(kperp_max_sq)
+
+    # Validity mask
     valid = (E > mu) & (x > x_min) & (x < x_max) & (kperp_max_sq > kperp_min_sq)
+
+    if isinstance(valid, bool):  # Return scalars if we have a single value.
+        x_min = float(x_min.item())
+        x_max = float(x_max.item())
+        kperp_min = float(kperp_min.item())
+        kperp_max_sq = float(kperp_max_sq.item())
+        valid = bool(valid)
+
     return x_min, x_max, kperp_min, kperp_max_sq, valid
 
 
