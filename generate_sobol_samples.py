@@ -56,7 +56,7 @@ DTAU_GEV = 0.1 / HBARC
 # Parameter space #
 ###################
 # Independent (unconditioned) ranges
-MU_RANGE     = (0.3, 1.4)     # mu    (GeV)
+MU_RANGE     = (0.15, 1.6)     # mu    (GeV)
 Z0_RANGE     = (0.0, 50.0)    # z0    (1/GeV)
 UPERP_RANGE  = (0.0, 0.999)    # u_perp (unitless)
 
